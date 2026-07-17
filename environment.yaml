@@ -1,0 +1,20 @@
+name: NISR_Seawall
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11.15
+  - pip=24.2
+  - numpy=1.26.4
+  - scipy=1.12.0
+  - matplotlib=3.8.4
+  - scikit-learn=1.5.0
+  - pillow=10.4.0
+  - trimesh=4.4.9
+  - pytorch=2.5.1
+  - pytorch-cuda=12.4
+  - pip:
+      - opencv-python==4.10.0.84
+      - open3d=0.18.0
