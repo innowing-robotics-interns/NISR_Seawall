@@ -107,7 +107,7 @@ def normal_consistency_loss(Q, uv, P_data, N_data):
     n_target = N_data[nn_idx]
 
     cos = torch.sum(n_surf * n_target, dim=-1)
-    return (1.0 - cos.abs()).mean()
+    return (1.0 - cos).mean()
 
 
 def chamfer_1d(pts_a, pts_b):

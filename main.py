@@ -33,6 +33,13 @@ except ImportError:
     o3d = None
 
 
+def _format_checkpoint_label(epoch: int) -> str:
+    """Format checkpoint epoch labels such as 1000 -> 1k."""
+    if epoch >= 1000 and epoch % 1000 == 0:
+        return f"{epoch // 1000}k"
+    return str(epoch)
+
+
 # Multi-patch training.
 def train_multi_patch(pts3n: np.ndarray,
                       n_patches: int = 4,
@@ -55,6 +62,8 @@ def train_multi_patch(pts3n: np.ndarray,
                       log_every: int = 200,
                       save_patch_vis: bool = True,
                       vis_dir: str = None,
+                      checkpoint_every: int = 1000,
+                      checkpoint_payload: dict = None,
                       output_psr_mesh_path: str = None,
                       normals: np.ndarray = None,
                       reg_every: int = 1,
@@ -199,6 +208,53 @@ def train_multi_patch(pts3n: np.ndarray,
     print(f"{'─'*60}")
     t0 = time.time()
 
+    checkpoint_dir = vis_dir if vis_dir is not None else os.getcwd()
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    def _save_epoch_checkpoint(epoch: int):
+        if checkpoint_every <= 0 or epoch % checkpoint_every != 0:
+            return
+
+        epoch_tag = _format_checkpoint_label(epoch)
+        epoch_ckpt_path = os.path.join(checkpoint_dir, f'checkpoint_{epoch_tag}.pt')
+        payload = {
+            'mode': 'multi_patch',
+            'epoch': epoch,
+            'F_state': F.state_dict(),
+            'G_state': G.state_dict(),
+            'args': (checkpoint_payload or {}).get('args', {
+                'n_patches': n_patches,
+                'd_features': d_features,
+                'epochs': epochs,
+                'M': M,
+                'M_per_patch': M_per_patch,
+                'W': W,
+                'D': D,
+                'L': L,
+                'L_inv': L_inv,
+                'lr': lr,
+                'mu': mu,
+                'gamma': gamma,
+                'lam': lam,
+                'lam2': lam2,
+                'lambda_bcd': lambda_bcd,
+                'beta': beta,
+                'device': device,
+                'log_every': log_every,
+                'save_patch_vis': save_patch_vis,
+                'reg_every': reg_every,
+            }),
+            'grid_dims': (n_rows, n_cols),
+            'history': history,
+        }
+        if checkpoint_payload is not None:
+            for key in ('normalization', 'input_file', 'result_dir'):
+                if key in checkpoint_payload:
+                    payload[key] = checkpoint_payload[key]
+
+        torch.save(payload, epoch_ckpt_path)
+        print(f"    Checkpoint → {epoch_ckpt_path}")
+
     zero = torch.tensor(0.0, device=device)
 
 
@@ -272,7 +328,7 @@ def train_multi_patch(pts3n: np.ndarray,
                 n_target = torch.gather(
                     tgt_nrm, 1, nn_idx.unsqueeze(-1).expand(-1, -1, 3))
                 cos = torch.sum(n_surf * n_target, dim=-1)
-                normal_loss = (1.0 - cos.abs()).mean()
+                normal_loss = (1.0 - cos).mean()
             else:
                 normal_loss = zero
         else:
@@ -309,6 +365,8 @@ def train_multi_patch(pts3n: np.ndarray,
                   f"Normal={float(normal_loss):.5f}  "
                   f"Total={float(loss):.5f}  "
                   f"[{elapsed:.1f}s]")
+
+            _save_epoch_checkpoint(epoch)
 
     print(f"{'─'*60}\n")
     return F, G, history, assignments
@@ -404,7 +462,7 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
             ]).mean()
 
             if lam_jac > 0:
-                t_u, t_v = surface_jacobian(pred, uv_flat)
+                t_u, t_v = surface_jacobian(pred, uv_flat, "arap")
                 jac_loss = tangent_loss_from_jac(t_u, t_v)
                 plane_loss = plane_loss + lam_jac * jac_loss
         else:
@@ -486,13 +544,15 @@ def main():
     parser.add_argument('--reg_every', type=int, default=1,
                         help='[Multi-patch] Compute tangent+normal losses every N '
                              'epochs (2-5 speeds training with little quality loss)')
+    parser.add_argument('--checkpoint_every', type=int, default=500,
+                        help='[Multi-patch] Save an intermediate checkpoint every N epochs')
     parser.add_argument('--pretrain_init', action='store_true', default=False,
                         help='Run multi-patch flat-sheet initialization pretraining only')
     parser.add_argument('--pretrain_then_train', action='store_true', default=False,
                         help='Run flat-sheet pretraining first, then continue with multi-patch training in one command')
     parser.add_argument('--pretrain_epochs', type=int, default=2000,
                         help='Epochs for flat-sheet initialization pretraining')
-    parser.add_argument('--pretrain_loss', type=str, default='mse', choices=['mse','cd','l1'],
+    parser.add_argument('--pretrain_loss', type=str, default='l1', choices=['mse','cd','l1'],
                         help='Pointwise loss for flat-sheet initialization pretraining')
 
     args = parser.parse_args()
@@ -631,6 +691,17 @@ def main():
             log_every=args.log_every,
             save_patch_vis=args.save_patch_vis,
             vis_dir=result_dir,
+            checkpoint_every=args.checkpoint_every,
+            checkpoint_payload={
+                'args': vars(args),
+                'normalization': {
+                    'center': meta['center'].tolist() if hasattr(meta['center'], 'tolist')
+                              else list(meta['center']),
+                    'scale': float(meta['scale']),
+                },
+                'input_file': input_file_name,
+                'result_dir': result_dir,
+            },
             output_psr_mesh_path=psr_ply_path,
             normals=normals,
             reg_every=args.reg_every,

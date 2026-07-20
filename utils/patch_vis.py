@@ -4,6 +4,7 @@
 import os
 import argparse
 import importlib.util
+import glob
 import numpy as np
 import torch
 import trimesh
@@ -133,7 +134,7 @@ def _make_double_sided(verts, uv, faces):
 # Export functions
 def export_checkerboard_patches(F, meta, save_dir, texture_path,
                                  resolution=100, device='cuda',
-                                 epoch='final', name=None,
+                                 epoch='10k', name=None,
                                  texture_pattern="Slide5.jpg", n_images=1,
                                  unnormalize=True, debug_uv_png=True,
                                  export_ply=True, double_sided=True):
@@ -327,12 +328,28 @@ def _load_model_from_checkpoint(ckpt_path, device, model_path=None):
     return F, meta, args
 
 
+def _resolve_checkpoint_paths(ckpt_path):
+    """Return a sorted list of checkpoint files from a file or directory."""
+    ckpt_path = os.path.abspath(ckpt_path)
+    if os.path.isdir(ckpt_path):
+        candidates = glob.glob(os.path.join(ckpt_path, 'checkpoint*.pt'))
+
+        def _sort_key(path):
+            stem = os.path.splitext(os.path.basename(path))[0]
+            suffix = stem.replace('checkpoint_', '')
+            digits = ''.join(ch for ch in suffix if ch.isdigit())
+            return (0, int(digits)) if digits else (1, stem)
+
+        return sorted(candidates, key=_sort_key)
+    return [ckpt_path]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Export checkerboard-textured per-patch meshes from a '
                    'trained multi-patch checkpoint.')
     parser.add_argument('--ckpt', type=str, required=True,
-                        help='Path to checkpoint.pt saved by main.py (multi_patch mode)')
+                        help='Path to checkpoint.pt saved by main.py, or a directory containing checkpoint*.pt files')
     parser.add_argument('--texture_path', type=str,
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'texture'),
                         help='Path to a SINGLE checkerboard image (used for every '
@@ -364,20 +381,35 @@ def main():
                             'e.g. /media/.../NISR_Seawall/model/model.py')
     args = parser.parse_args()
 
-    F, meta, _ = _load_model_from_checkpoint(args.ckpt, args.device, args.model_path)
-    print(f"  Loaded model: {F.n_rows}x{F.n_cols} = {F.n_patches} patches")
+    ckpt_paths = _resolve_checkpoint_paths(args.ckpt)
+    if not ckpt_paths:
+        raise FileNotFoundError(f"No checkpoint files found at: {args.ckpt}")
 
-    export_checkerboard_patches(
-        F, meta,
-        save_dir=args.out_dir,
-        texture_path=args.texture_path,
-        resolution=args.resolution,
-        device=args.device,
-        n_images=args.n_images,
-        unnormalize=not args.no_unnormalize,
-        export_ply=not args.no_ply,
-        double_sided=not args.single_sided,
-    )
+    if len(ckpt_paths) > 1:
+        print(f"  Found {len(ckpt_paths)} checkpoint files in {os.path.abspath(args.ckpt)}")
+
+    for ckpt_path in ckpt_paths:
+        ckpt_name = os.path.splitext(os.path.basename(ckpt_path))[0]
+        export_dir = os.path.join(args.out_dir, ckpt_name)
+
+        F, meta, _ = _load_model_from_checkpoint(ckpt_path, args.device, args.model_path)
+        print(f"  Loaded model: {F.n_rows}x{F.n_cols} = {F.n_patches} patches")
+        print(f"  Exporting checkpoint {ckpt_name} → {export_dir}")
+
+        export_checkerboard_patches(
+            F, meta,
+            save_dir=export_dir,
+            texture_path=args.texture_path,
+            resolution=args.resolution,
+            device=args.device,
+            epoch=ckpt_name,
+            name=ckpt_name,
+            n_images=args.n_images,
+            unnormalize=not args.no_unnormalize,
+            export_ply=not args.no_ply,
+            double_sided=not args.single_sided,
+        )
+
     print(f"\n  Done. Textured patches → {args.out_dir}")
 
 
