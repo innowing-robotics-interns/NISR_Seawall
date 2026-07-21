@@ -1,7 +1,52 @@
 #!/usr/bin/env python3
 # losses.py
 
+import math
 import torch
+
+
+def mu_warmup_schedule(epoch: int, warmup_epochs: int, mu_target: float,
+                       schedule: str = 'cosine',
+                       delay_epochs: int = 300) -> float:
+    """
+    Compute the effective mu value based on a warmup schedule with an optional
+    initial delay phase where μ stays at exactly 0.
+    """
+    if mu_target <= 0:
+        return mu_target
+
+    # Phase 1: delay — mu stays at zero
+    if epoch <= delay_epochs:
+        return 0.0
+
+    # Shift epoch so the ramp phase starts at epoch 1 relative to itself
+    ramp_epoch = epoch - delay_epochs
+
+    # Phase 2: warmup ramp
+    if warmup_epochs <= 0:
+        return mu_target
+
+    if ramp_epoch >= warmup_epochs:
+        return mu_target
+
+    t = ramp_epoch / warmup_epochs  # t ∈ (0, 1)
+
+    if schedule == 'linear':
+        factor = t
+    elif schedule == 'cosine':
+        factor = 0.5 * (1.0 - math.cos(math.pi * t))
+    elif schedule == 'exponential':
+        # 1 - exp(-k*t); k=5 means ~99.3% at t=1
+        factor = 1.0 - math.exp(-5.0 * t)
+    elif schedule == 'sigmoid':
+        # Shifted sigmoid: smooth S-curve from ~0 to ~1 over t∈[0,1]
+        x = 12.0 * (t - 0.5)  # map t∈[0,1] → x∈[-6,6]
+        factor = 1.0 / (1.0 + math.exp(-x))
+    else:
+        raise ValueError(f"Unknown warmup schedule: {schedule}. "
+                         f"Use 'linear', 'cosine', 'exponential', or 'sigmoid'.")
+
+    return mu_target * factor
 
 
 def chamfer_distance(P: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
@@ -74,7 +119,7 @@ def tangent_loss_from_jac(t_u, t_v, mode='arap', eps=1e-4):
     collapse = torch.relu(eps - S).pow(2).sum(dim=-1).mean()
 
     if mode == 'arap':
-        energy = ((S - 1.0) ** 2).sum(dim=-1).mean()
+        energy = ((S - 0.25) ** 2).sum(dim=-1).mean()
     elif mode == 'arap_si':
         s_mean = S.mean(dim=-1, keepdim=True).detach()
         energy = ((S - s_mean) ** 2).sum(dim=-1).mean()

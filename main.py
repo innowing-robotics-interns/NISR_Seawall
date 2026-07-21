@@ -21,6 +21,7 @@ import utils.utils as utils
 from model.losses import (boundary_chamfer_loss, chamfer_1d,
                                        chamfer_distance,
                                        chamfer_distance_chunked,
+                                       mu_warmup_schedule,
                                        normal_consistency_loss,
                                              surface_jacobian,
                                              tangent_fold_loss,
@@ -45,6 +46,9 @@ def train_multi_patch(pts3n: np.ndarray,
                       L_inv: int = 4,
                       lr: float = 1e-3,
                       mu: float = 0.5,
+                      mu_warmup_epochs: int = 0,
+                      mu_warmup_delay: int = 0,
+                      schedule: str = 'cosine',
                       gamma: float = 1.0,
                       lam: float = 1.0,
                       lam2: float = 1.0,
@@ -188,7 +192,7 @@ def train_multi_patch(pts3n: np.ndarray,
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
 
     history = {'cd': [], 'cycle': [], 'param': [], 'tangent': [], 'normal': [],
-               'total': [], 'epoch': []}
+               'mu_eff': [], 'total': [], 'epoch': []}
 
     print(f"\n{'─'*60}")
     print(f"  Multi-Patch Feature Complex Training (VECTORIZED)")
@@ -196,6 +200,9 @@ def train_multi_patch(pts3n: np.ndarray,
     print(f"  d_features={d_features}  W={W}  D={D}  L(fwd/global-UV)={L}  L_inv={L_inv}  β={beta}")
     print(f"  M_per_patch={M_per_patch}  batch/step={K*M_per_patch}  reg_every={reg_every}")
     print(f"  μ={mu}  γ={gamma}  λ₁={lam}  λ₂={lam2}")
+    if mu_warmup_epochs > 0 and mu > 0:
+        print(f"  μ warmup: {mu_warmup_schedule} ramp over {mu_warmup_epochs} epochs "
+              f"(0.0 → {mu})")
     print(f"  Epochs={epochs}  lr={lr}  device={device}")
     print(f"{'─'*60}")
     t0 = time.time()
@@ -303,13 +310,13 @@ def train_multi_patch(pts3n: np.ndarray,
 
         # Loss 4 and 5: tangent and normal regularization.
         do_reg = (mu > 0 or gamma > 0) and (epoch % reg_every == 0)
+        mu_eff = mu_warmup_schedule(epoch, mu_warmup_epochs, mu,
+                                    schedule=schedule, delay_epochs=mu_warmup_delay) if mu > 0 else 0.0
         if do_reg:
             t_u, t_v = surface_jacobian(Q_flat, uv_flat)
 
             if mu > 0:
-                t_u_global = t_u * F.n_rows
-                t_v_global = t_v * F.n_cols 
-                tangent_loss = tangent_loss_from_jac(t_u_global, t_v_global)
+                tangent_loss = tangent_loss_from_jac(t_u, t_v)
             else:
                 tangent_loss = torch.zeros((), device=Q.device, dtype=Q.dtype)
 
@@ -333,7 +340,7 @@ def train_multi_patch(pts3n: np.ndarray,
         loss = (cd_loss
                 + lam * cycle_loss
                 + lam2 * param_loss
-                + mu * tangent_loss
+                + mu_eff * tangent_loss
                 + gamma * normal_loss)
         loss.backward()
 
@@ -348,16 +355,19 @@ def train_multi_patch(pts3n: np.ndarray,
             history['param'].append(float(param_loss))
             history['tangent'].append(float(tangent_loss))
             history['normal'].append(float(normal_loss))
+            history['mu_eff'].append(float(mu_eff))
             history['total'].append(float(loss))
 
             elapsed = time.time() - t0
+            mu_str = f"  μ_eff={float(mu_eff):.4f}" if (mu_warmup_epochs > 0 and mu > 0) else ""
             print(f"  Epoch {epoch:5d}/{epochs}  |  "
                   f"CD={float(cd_loss):.5f}  "
                   f"Cycle={float(cycle_loss):.5f}  "
                   f"Param={float(param_loss):.5f}  "
                   f"Tangent={float(tangent_loss):.5f}  "
                   f"Normal={float(normal_loss):.5f}  "
-                  f"Total={float(loss):.5f}  "
+                  f"Total={float(loss):.5f}"
+                  f"{mu_str}  "
                   f"[{elapsed:.1f}s]")
 
             _save_epoch_checkpoint(epoch)
@@ -513,6 +523,12 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--beta', type=float, default=100, help='Softplus beta')
     parser.add_argument('--mu', type=float, default=0.5, help='Tangent loss weight')
+    parser.add_argument('--mu_warmup_epochs', type=int, default=0,
+                        help='Epochs over which to ramp up μ from 0 to its target '
+                             'value (0 = no warmup, use μ immediately)')
+    parser.add_argument('--schedule', type=str, default='cosine',
+                        choices=['linear', 'cosine', 'exponential', 'sigmoid'],
+                        help='Warmup ramp shape for μ (default: cosine)')
     parser.add_argument('--gamma', type=float, default=0, help='Normal loss weight')
     parser.add_argument('--lam', type=float, default=1.0, help='Cycle-consistency weight λ₁')
     parser.add_argument('--lam2', type=float, default=1.0, help='Inverse-cycle weight λ₂')
@@ -548,6 +564,8 @@ def main():
                         help='Epochs for flat-sheet initialization pretraining')
     parser.add_argument('--pretrain_loss', type=str, default='l1', choices=['mse','cd','l1'],
                         help='Pointwise loss for flat-sheet initialization pretraining')
+    parser.add_argument('--mu_warmup_delay', type=int, default=0,
+                        help='Epochs to delay μ warmup (μ=0) before ramping up')
 
     args = parser.parse_args()
 
@@ -676,6 +694,9 @@ def main():
             L_inv=args.L_inv,
             lr=args.lr,
             mu=args.mu,
+            mu_warmup_epochs=args.mu_warmup_epochs,
+            mu_warmup_delay=args.mu_warmup_delay,
+            schedule=args.schedule,
             gamma=args.gamma,
             lam=args.lam,
             lam2=args.lam2,
