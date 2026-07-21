@@ -9,3 +9,4 @@ utils/vis_obj.py
 *.ply
 *.obj
 *.json
+run.sh
