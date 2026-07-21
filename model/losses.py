@@ -100,20 +100,25 @@ def tangent_loss_from_jac(t_u, t_v, mode='arap', eps=1e-4, scale_invariant=True)
     """
     Compute Jacobian-based tangent regularization with optional scale normalization.
     """
-    # 1. OPTIONAL: Normalize the scale of the Jacobian vectors per-sample/patch
-    if scale_invariant:
-        # Calculate the local patch scale (Frobenius norm of the Jacobian)
-        # This represents the average "stretch" factor of this specific point
-        local_scale = torch.sqrt((t_u ** 2).sum(dim=-1) + (t_v ** 2).sum(dim=-1) + 1e-8)
+    # # 1. OPTIONAL: Normalize the scale of the Jacobian vectors per-sample/patch
+    # if scale_invariant:
+    #     # Calculate the local patch scale (Frobenius norm of the Jacobian)
+    #     # This represents the average "stretch" factor of this specific point
+    #     local_scale = torch.sqrt((t_u ** 2).sum(dim=-1) + (t_v ** 2).sum(dim=-1) + 1e-8)
         
-        # Keep dimensions aligned for broadcasting [batch, 1]
-        local_scale = local_scale.unsqueeze(-1) 
+    #     # Keep dimensions aligned for broadcasting [batch, 1]
+    #     local_scale = local_scale.unsqueeze(-1) 
         
-        # Normalize vectors so the local metric scale is 1.0
-        t_u = t_u / local_scale
-        t_v = t_v / local_scale
+    #     # Normalize vectors so the local metric scale is 1.0
+    #     t_u = t_u / local_scale
+    #     t_v = t_v / local_scale
 
     J = torch.stack([t_u, t_v], dim=2)
+
+    ## dirichlet
+    ### \int_S(||df/du||^2 + ||df/dv||^2)
+
+    # e_dirichlet = 1.0*torch.mean(0.5*torch.sum(J ** 2, dim=1))
 
     if mode == 'conformal_fff':
         E = (t_u * t_u).sum(dim=-1)
