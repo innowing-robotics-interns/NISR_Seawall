@@ -96,26 +96,37 @@ def surface_jacobian(Q, uv):
     return t_u, t_v
 
 
-def tangent_loss_from_jac(t_u, t_v, mode='arap', eps=1e-4):
+def tangent_loss_from_jac(t_u, t_v, mode='arap', eps=1e-4, scale_invariant=True):
     """
-    Compute Jacobian-based tangent regularization.
+    Compute Jacobian-based tangent regularization with optional scale normalization.
     """
+    # 1. OPTIONAL: Normalize the scale of the Jacobian vectors per-sample/patch
+    if scale_invariant:
+        # Calculate the local patch scale (Frobenius norm of the Jacobian)
+        # This represents the average "stretch" factor of this specific point
+        local_scale = torch.sqrt((t_u ** 2).sum(dim=-1) + (t_v ** 2).sum(dim=-1) + 1e-8)
+        
+        # Keep dimensions aligned for broadcasting [batch, 1]
+        local_scale = local_scale.unsqueeze(-1) 
+        
+        # Normalize vectors so the local metric scale is 1.0
+        t_u = t_u / local_scale
+        t_v = t_v / local_scale
+
     J = torch.stack([t_u, t_v], dim=2)
 
     if mode == 'conformal_fff':
-        # First fundamental form entries avoid SVD entirely.
         E = (t_u * t_u).sum(dim=-1)
         G = (t_v * t_v).sum(dim=-1)
         Fd = (t_u * t_v).sum(dim=-1)
         energy = ((E - G) ** 2 + 4.0 * Fd ** 2).mean()
-        # Collapse guard from the local area term.
         area2 = torch.clamp(E * G - Fd ** 2, min=0.0)
         collapse = torch.relu(eps ** 2 - area2).mean()
         return energy + collapse
 
-    # Use singular values only. Singular vectors are not needed.
     S = torch.linalg.svdvals(J)
 
+    # If scaled to 1, a hardcoded eps (like 1e-4) is now safe and universally meaningful
     collapse = torch.relu(eps - S).pow(2).sum(dim=-1).mean()
 
     if mode == 'arap':

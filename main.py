@@ -187,12 +187,17 @@ def train_multi_patch(pts3n: np.ndarray,
     print(f"    Shared decoder (+ global-UV PE, L={L}): {n_params_F - n_vertex:,}")
     print(f"  G encoder params (L_inv={L_inv}): {n_params_G:,}")
     print(f"  Total unique params: {n_params_F + n_params_G:,}")
+    print("  F parameter breakdown:")
+    for name, param in F.named_parameters():
+        print(f"    {name:<40} shape={tuple(param.shape)} "
+              f"requires_grad={param.requires_grad}")
 
     opt = torch.optim.Adam(list(F.parameters()) + list(G.parameters()), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
 
     history = {'cd': [], 'cycle': [], 'param': [], 'tangent': [], 'normal': [],
-               'mu_eff': [], 'total': [], 'epoch': []}
+               'total': [], 'epoch': []}
+    
 
     print(f"\n{'─'*60}")
     print(f"  Multi-Patch Feature Complex Training (VECTORIZED)")
@@ -255,6 +260,7 @@ def train_multi_patch(pts3n: np.ndarray,
         print(f"    Checkpoint → {epoch_ckpt_path}")
 
     zero = torch.tensor(0.0, device=device)
+    vertex_features_init = F.complex.vertex_features.detach().clone()
 
 
     # Optimize the forward and inverse maps.
@@ -369,6 +375,16 @@ def train_multi_patch(pts3n: np.ndarray,
                   f"Total={float(loss):.5f}"
                   f"{mu_str}  "
                   f"[{elapsed:.1f}s]")
+            vf = F.complex.vertex_features
+            vf_delta = (vf.detach() - vertex_features_init).norm().item()
+            vf_grad = (vf.grad.norm().item() if vf.grad is not None else 0.0)
+            vf_first = vf.detach()[:, 0].cpu().tolist()
+            print(f"    vertex_features: mean={vf.detach().mean().item():.6f} "
+                f"std={vf.detach().std().item():.6f} "
+                f"grad_norm={vf_grad:.6e} "
+                f"delta_from_init={vf_delta:.6e}")
+            print("    vertex_features[:, 0]="
+                + ", ".join(f"v{i}={val:.6f}" for i, val in enumerate(vf_first)))
 
             _save_epoch_checkpoint(epoch)
 
@@ -554,7 +570,7 @@ def main():
     parser.add_argument('--reg_every', type=int, default=1,
                         help='[Multi-patch] Compute tangent+normal losses every N '
                              'epochs (2-5 speeds training with little quality loss)')
-    parser.add_argument('--checkpoint_every', type=int, default=500,
+    parser.add_argument('--checkpoint_every', type=int, default=50,
                         help='[Multi-patch] Save an intermediate checkpoint every N epochs')
     parser.add_argument('--pretrain_init', action='store_true', default=False,
                         help='Run multi-patch flat-sheet initialization pretraining only')

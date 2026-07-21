@@ -148,10 +148,21 @@ class FeatureComplex(nn.Module):
         u = uv[:, 0:1]
         v = uv[:, 1:2]
 
+        # Force u, v = 0 for debugging interpolation.
+        # u = torch.zeros_like(u)
+        # v = torch.zeros_like(v)
+
         features = ((1 - u) * (1 - v) * z00 +
                     (1 - u) * v * z01 +
                     u * (1 - v) * z10 +
                     u * v * z11)
+        
+        # print("Feature Result: ", features[0])
+        # print("Check interpolation z00: ", z00[0])
+        # print("Check interpolation z01: ", z01[0])
+        # print("Check interpolation z10: ", z10[0])
+        # print("Check interpolation z11: ", z11[0])
+
         return features
 
 
