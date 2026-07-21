@@ -3,9 +3,9 @@
 # SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # cd "$SCRIPT_DIR"
 
-FILE="noisy_data_1_normals.xyz"
+FILE="noisy_data_4_normals.xyz"
 INPUT_FILE="data/${FILE}"
-OUTPUT_DIR="logs/log_fixed_norm/${FILE%.*}_init_PCA_mu0.1_1patch_inv_gamma0.25"
+OUTPUT_DIR="logs/log_fixed_norm/${FILE%.*}_init_PCA_mu0.1_4patches_gamma0.2"
 
 python main.py \
     --multi_patch \
@@ -13,7 +13,7 @@ python main.py \
     --result_dir ${OUTPUT_DIR} \
     --pretrain_epochs 2000 \
     --epochs 5000 \
-    --n_patches 1 \
+    --n_patches 4 \
     --d_features 88 \
     --M_per_patch 8192 \
     --W 512 \
@@ -24,11 +24,12 @@ python main.py \
     --L 0 \
     --beta 100 \
     --mu 0.1 \
-    --gamma 0.25 \
-    --lam 0.4 \
-    --lam2 0.4 \
-    --log_every 200 \
+    --gamma 0.23 \
+    --lam 0 \
+    --lam2 0 \
+    --log_every 100 \
     --pretrain_loss l1 \
+    --checkpoint_every 500 \
 
 # python main.py \
 #     --file ${INPUT_FILE} \

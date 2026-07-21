@@ -32,14 +32,6 @@ try:
 except ImportError:
     o3d = None
 
-
-def _format_checkpoint_label(epoch: int) -> str:
-    """Format checkpoint epoch labels such as 1000 -> 1k."""
-    if epoch >= 1000 and epoch % 1000 == 0:
-        return f"{epoch // 1000}k"
-    return str(epoch)
-
-
 # Multi-patch training.
 def train_multi_patch(pts3n: np.ndarray,
                       n_patches: int = 4,
@@ -215,7 +207,7 @@ def train_multi_patch(pts3n: np.ndarray,
         if checkpoint_every <= 0 or epoch % checkpoint_every != 0:
             return
 
-        epoch_tag = _format_checkpoint_label(epoch)
+        epoch_tag = f'{epoch}'
         epoch_ckpt_path = os.path.join(checkpoint_dir, f'checkpoint_{epoch_tag}.pt')
         payload = {
             'mode': 'multi_patch',
@@ -315,7 +307,9 @@ def train_multi_patch(pts3n: np.ndarray,
             t_u, t_v = surface_jacobian(Q_flat, uv_flat)
 
             if mu > 0:
-                tangent_loss = tangent_loss_from_jac(t_u, t_v)
+                t_u_global = t_u * F.n_rows
+                t_v_global = t_v * F.n_cols 
+                tangent_loss = tangent_loss_from_jac(t_u_global, t_v_global)
             else:
                 tangent_loss = torch.zeros((), device=Q.device, dtype=Q.dtype)
 
