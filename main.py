@@ -196,7 +196,7 @@ def train_multi_patch(pts3n: np.ndarray,
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
 
     history = {'cd': [], 'cycle': [], 'param': [], 'tangent': [], 'normal': [],
-               'total': [], 'epoch': []}
+               'mu_eff': [], 'total': [], 'epoch': []}
     
 
     print(f"\n{'─'*60}")
@@ -321,7 +321,7 @@ def train_multi_patch(pts3n: np.ndarray,
         if do_reg:
             t_u, t_v = surface_jacobian(Q_flat, uv_flat)
 
-            if mu > 0:
+            if mu_eff > 0:
                 tangent_loss = tangent_loss_from_jac(t_u, t_v)
             else:
                 tangent_loss = torch.zeros((), device=Q.device, dtype=Q.dtype)
@@ -375,16 +375,16 @@ def train_multi_patch(pts3n: np.ndarray,
                   f"Total={float(loss):.5f}"
                   f"{mu_str}  "
                   f"[{elapsed:.1f}s]")
-            vf = F.complex.vertex_features
-            vf_delta = (vf.detach() - vertex_features_init).norm().item()
-            vf_grad = (vf.grad.norm().item() if vf.grad is not None else 0.0)
-            vf_first = vf.detach()[:, 0].cpu().tolist()
-            print(f"    vertex_features: mean={vf.detach().mean().item():.6f} "
-                f"std={vf.detach().std().item():.6f} "
-                f"grad_norm={vf_grad:.6e} "
-                f"delta_from_init={vf_delta:.6e}")
-            print("    vertex_features[:, 0]="
-                + ", ".join(f"v{i}={val:.6f}" for i, val in enumerate(vf_first)))
+            # vf = F.complex.vertex_features
+            # vf_delta = (vf.detach() - vertex_features_init).norm().item()
+            # vf_grad = (vf.grad.norm().item() if vf.grad is not None else 0.0)
+            # vf_first = vf.detach()[:, 0].cpu().tolist()
+            # print(f"    vertex_features: mean={vf.detach().mean().item():.6f} "
+            #     f"std={vf.detach().std().item():.6f} "
+            #     f"grad_norm={vf_grad:.6e} "
+            #     f"delta_from_init={vf_delta:.6e}")
+            # print("    vertex_features[:, 0]="
+            #     + ", ".join(f"v{i}={val:.6f}" for i, val in enumerate(vf_first)))
 
             _save_epoch_checkpoint(epoch)
 
