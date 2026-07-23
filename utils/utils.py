@@ -390,7 +390,7 @@ def sample_surface_grid(F, resolution=1000, device='cuda'):
 
 
 @torch.no_grad()
-def sample_multi_patch_grid(F, resolution=100, device='cuda'):
+def sample_multi_patch_grid(F, resolution=100, device='cuda', active_patch_ids=None):
     """
     Sample ALL patches of a MultiPatchForwardMap on regular UV grids.
     
@@ -405,17 +405,26 @@ def sample_multi_patch_grid(F, resolution=100, device='cuda'):
         F: MultiPatchForwardMap model (eval mode)
         resolution: per-patch UV grid resolution
         device: computation device
+        active_patch_ids: optional iterable of patch indices to sample. If None,
+            all patches are sampled.
     
     Returns:
         all_verts: (total_verts, 3) combined vertex array
         all_faces: (total_faces, 3) combined face index array
     """
-    n_patches = F.n_patches
+    if active_patch_ids is None:
+        patch_ids = list(range(F.n_patches))
+    else:
+        patch_ids = [int(patch_idx) for patch_idx in active_patch_ids]
+
+    if len(patch_ids) == 0:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.int32)
+
     all_verts = []
     all_faces = []
     vertex_offset = 0
 
-    for patch_idx in range(n_patches):
+    for patch_idx in patch_ids:
         # Generate UV grid for this patch
         u = torch.linspace(0, 1, resolution, device=device)
         v = torch.linspace(0, 1, resolution, device=device)
@@ -611,7 +620,7 @@ def visualise(F, G, pts3n, history, out_path, resolution=80, device='cuda'):
 
 @torch.no_grad()
 def visualise_multi_patch(F, pts3n, assignments, history, out_path,
-                          resolution=80, device='cuda'):
+                          resolution=80, device='cuda', active_patch_ids=None):
     """
     6-panel figure for multi-patch feature complex mode:
       [0] Input point cloud colored by patch assignment
@@ -629,17 +638,23 @@ def visualise_multi_patch(F, pts3n, assignments, history, out_path,
         out_path: path to save the figure
         resolution: per-patch UV grid resolution for visualization
         device: computation device
+        active_patch_ids: optional iterable of patch indices to visualize and export.
     """
     device_model = next(F.parameters()).device
     P_np = pts3n
-    n_patches = F.n_patches
+    if active_patch_ids is None:
+        patch_ids = list(range(F.n_patches))
+    else:
+        patch_ids = [int(patch_idx) for patch_idx in active_patch_ids]
+
+    n_patches = max(len(patch_ids), 1)
     n_rows = F.n_rows
     n_cols = F.n_cols
 
     # ── Sample each patch on its UV grid ──────────────────────────────────────
     # Store per-patch surface grids for individual plotting
     patch_surfaces = []  # list of (X, Y, Z) arrays, each (res, res)
-    for patch_idx in range(n_patches):
+    for patch_idx in patch_ids:
         u = torch.linspace(0, 1, resolution, device=device_model)
         v = torch.linspace(0, 1, resolution, device=device_model)
         grid_u, grid_v = torch.meshgrid(u, v, indexing='ij')
@@ -746,7 +761,8 @@ def visualise_multi_patch(F, pts3n, assignments, history, out_path,
     ax5.set_title("⑥ Training Loss", fontsize=10, pad=8)
     ax5.grid(True, alpha=0.3)
 
-    fig.suptitle(f"Feature Complex Sheet Fitting  ·  {n_rows}×{n_cols} = {n_patches} patches  ·  "
+    fig.suptitle(f"Feature Complex Sheet Fitting  ·  {n_rows}×{n_cols} grid  ·  "
+                 f"active patches: {len(patch_ids)}  ·  "
                  f"shared vertices guarantee C0 continuity",
                  fontsize=13, fontweight='bold', y=0.97)
     fig.savefig(out_path, dpi=150, facecolor='white', bbox_inches='tight')
@@ -754,7 +770,9 @@ def visualise_multi_patch(F, pts3n, assignments, history, out_path,
     print(f"    PNG → {out_path}")
 
     # ── Also produce the combined mesh for export ─────────────────────────────
-    verts, faces = sample_multi_patch_grid(F, resolution, device_model)
+    verts, faces = sample_multi_patch_grid(
+        F, resolution, device_model, active_patch_ids=patch_ids
+    )
     return verts, faces
 
 

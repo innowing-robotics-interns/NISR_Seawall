@@ -389,7 +389,7 @@ def train_multi_patch(pts3n: np.ndarray,
             _save_epoch_checkpoint(epoch)
 
     print(f"{'─'*60}\n")
-    return F, G, history, assignments
+    return F, G, history, assignments, active_ids
 
 
 def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
@@ -669,7 +669,12 @@ def main():
             for k, v in F_model.state_dict().items()
         }
 
-        verts, faces = utils.sample_multi_patch_grid(F_model, resolution=args.mesh_res, device=args.device)
+        verts, faces = utils.sample_multi_patch_grid(
+            F_model,
+            resolution=args.mesh_res,
+            device=args.device,
+            active_patch_ids=list(range(F_model.n_patches)),
+        )
         utils.export_ply(verts, faces, init_ply_path)
 
         torch.save({
@@ -697,7 +702,7 @@ def main():
         print(f"{'='*60}")
 
     if args.multi_patch:
-        F_model, G_model, history, assignments = train_multi_patch(
+        F_model, G_model, history, assignments, active_ids = train_multi_patch(
             pts3n,
             n_patches=args.n_patches,
             d_features=args.d_features,
@@ -748,7 +753,8 @@ def main():
 
         verts, faces = utils.visualise_multi_patch(
             F_model, pts3n, assignments, history, out_path=result_png,
-            resolution=args.mesh_res, device=args.device
+            resolution=args.mesh_res, device=args.device,
+            active_patch_ids=active_ids,
         )
 
         torch.save({
@@ -759,6 +765,7 @@ def main():
             'pretrain_history': pretrain_history,
             'history': history,
             'assignments': assignments.tolist(),
+            'active_patch_ids': active_ids,
             'grid_dims': (F_model.n_rows, F_model.n_cols),
             'normalization': {
                 'center': meta['center'].tolist() if hasattr(meta['center'], 'tolist')

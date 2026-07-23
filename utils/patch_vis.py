@@ -137,7 +137,8 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
                                  epoch='10k', name=None,
                                  texture_pattern="Slide5.jpg", n_images=1,
                                  unnormalize=True, debug_uv_png=True,
-                                 export_ply=True, double_sided=True):
+                                 export_ply=True, double_sided=True,
+                                 active_patch_ids=None):
     """
     Export checkerboard-textured patch meshes and a combined scene.
     """
@@ -146,13 +147,21 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
                                           n_images=n_images)
     n_textures = len(textures)
 
-    n_patches = F.n_patches
+    if active_patch_ids is None:
+        patch_ids = list(range(F.n_patches))
+    else:
+        patch_ids = [int(patch_idx) for patch_idx in active_patch_ids]
+
+    if len(patch_ids) == 0:
+        print("  No active patches found; skipping checkerboard export.")
+        return []
+
     meshes = []          # textured (OBJ) versions
     colored_meshes = []  # vertex-colored (PLY) versions
 
-    for cid in range(n_patches):
+    for export_idx, cid in enumerate(patch_ids):
         verts, uv, faces = _sample_patch_grid(F, cid, resolution, device)
-        tex_img = textures[cid % n_textures]
+        tex_img = textures[export_idx % n_textures]
 
         if debug_uv_png:
             # Use the original UV layout before optional geometry duplication.
@@ -325,7 +334,8 @@ def _load_model_from_checkpoint(ckpt_path, device, model_path=None):
             'center': np.array(normalization['center'], dtype=np.float32),
             'scale': float(normalization['scale']),
         }
-    return F, meta, args
+    active_patch_ids = ckpt.get('active_patch_ids')
+    return F, meta, args, active_patch_ids
 
 
 def _resolve_checkpoint_paths(ckpt_path):
@@ -392,8 +402,12 @@ def main():
         ckpt_name = os.path.splitext(os.path.basename(ckpt_path))[0]
         export_dir = os.path.join(args.out_dir, ckpt_name)
 
-        F, meta, _ = _load_model_from_checkpoint(ckpt_path, args.device, args.model_path)
+        F, meta, _, active_patch_ids = _load_model_from_checkpoint(
+            ckpt_path, args.device, args.model_path
+        )
         print(f"  Loaded model: {F.n_rows}x{F.n_cols} = {F.n_patches} patches")
+        if active_patch_ids is not None:
+            print(f"  Active patches in checkpoint: {len(active_patch_ids)}")
         print(f"  Exporting checkpoint {ckpt_name} → {export_dir}")
 
         export_checkerboard_patches(
@@ -408,6 +422,7 @@ def main():
             unnormalize=not args.no_unnormalize,
             export_ply=not args.no_ply,
             double_sided=not args.single_sided,
+            active_patch_ids=active_patch_ids,
         )
 
     print(f"\n  Done. Textured patches → {args.out_dir}")
