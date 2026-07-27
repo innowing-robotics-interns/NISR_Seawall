@@ -17,6 +17,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib import cm
 
 import utils.pc_presegmentation as pc_presegmentation
+import utils.correspondence_vis as correspondence_vis
 import utils.utils as utils
 from model.losses import (boundary_chamfer_loss, chamfer_1d,
                                        chamfer_distance,
@@ -64,7 +65,11 @@ def train_multi_patch(pts3n: np.ndarray,
                       normals: np.ndarray = None,
                       reg_every: int = 1,
                       pretrained_F_state: dict = None,
-                      pretrained_ckpt_path: str = None):
+                      pretrained_ckpt_path: str = None,
+                      correspondence_dir: str = None,
+                      save_correspondence_every: int = 0,
+                      correspondence_max_lines: int = 300,
+                      correspondence_line_segment: str = 't_to_q'):
     """
     Train the multi-patch model and inverse map.
 
@@ -214,6 +219,10 @@ def train_multi_patch(pts3n: np.ndarray,
 
     checkpoint_dir = vis_dir if vis_dir is not None else os.getcwd()
     os.makedirs(checkpoint_dir, exist_ok=True)
+    if correspondence_dir is None:
+        correspondence_dir = os.path.join(checkpoint_dir, 'correspondences')
+    if save_correspondence_every > 0:
+        os.makedirs(correspondence_dir, exist_ok=True)
 
     def _save_epoch_checkpoint(epoch: int):
         if checkpoint_every <= 0 or epoch % checkpoint_every != 0:
@@ -258,6 +267,35 @@ def train_multi_patch(pts3n: np.ndarray,
 
         torch.save(payload, epoch_ckpt_path)
         print(f"    Checkpoint → {epoch_ckpt_path}")
+
+    def _save_correspondence_snapshot(epoch: int,
+                                      q_batch: torch.Tensor,
+                                      tgt_batch: torch.Tensor,
+                                      dist_batch: torch.Tensor):
+        if save_correspondence_every <= 0 or epoch % save_correspondence_every != 0:
+            return
+
+        epoch_dir = os.path.join(correspondence_dir, f'epoch_{epoch:05d}')
+        q_np = q_batch.detach().cpu().numpy()
+        tgt_np = tgt_batch.detach().cpu().numpy()
+        dist_np = dist_batch.detach().cpu().numpy()
+        correspondence_vis.export_patchwise_chamfer_correspondences(
+            q_batches=q_np,
+            t_batches=tgt_np,
+            distance_batches=dist_np,
+            output_dir=epoch_dir,
+            patch_ids=np.asarray(active_ids, dtype=np.int32),
+            max_lines=correspondence_max_lines,
+            plot_direction=correspondence_line_segment,
+        )
+        if epoch == epochs:
+            correspondence_vis.export_combined_correspondence_ply(
+                q_batches=q_np,
+                t_batches=tgt_np,
+                distance_batches=dist_np,
+                output_ply_path=os.path.join(epoch_dir, 'all_patches_combined.ply'),
+                plot_direction=correspondence_line_segment,
+            )
 
     zero = torch.tensor(0.0, device=device)
     vertex_features_init = F.complex.vertex_features.detach().clone()
@@ -363,11 +401,11 @@ def train_multi_patch(pts3n: np.ndarray,
             history['param'].append(float(param_loss))
             history['tangent'].append(float(tangent_loss))
             history['normal'].append(float(normal_loss))
-            history['mu_eff'].append(float(mu_eff))
+            # history['mu_eff'].append(float(mu_eff))
             history['total'].append(float(loss))
 
             elapsed = time.time() - t0
-            mu_str = f"  μ_eff={float(mu_eff):.4f}" if (mu_warmup_epochs > 0 and mu > 0) else ""
+            # mu_str = f"  μ_eff={float(mu_eff):.4f}" if (mu_warmup_epochs > 0 and mu > 0) else ""
             print(f"  Epoch {epoch:5d}/{epochs}  |  "
                   f"CD={float(cd_loss):.5f}  "
                   f"Cycle={float(cycle_loss):.5f}  "
@@ -375,7 +413,7 @@ def train_multi_patch(pts3n: np.ndarray,
                   f"Tangent={float(tangent_loss):.5f}  "
                   f"Normal={float(normal_loss):.5f}  "
                   f"Total={float(loss):.5f}"
-                  f"{mu_str}  "
+                  f"μ_eff={float(mu_eff):.4f}  "
                   f"[{elapsed:.1f}s]")
             # vf = F.complex.vertex_features
             # vf_delta = (vf.detach() - vertex_features_init).norm().item()
@@ -388,6 +426,7 @@ def train_multi_patch(pts3n: np.ndarray,
             # print("    vertex_features[:, 0]="
             #     + ", ".join(f"v{i}={val:.6f}" for i, val in enumerate(vf_first)))
 
+            _save_correspondence_snapshot(epoch, Q, tgt, D)
             _save_epoch_checkpoint(epoch)
 
     print(f"{'─'*60}\n")
@@ -518,7 +557,7 @@ def main():
     parser.add_argument('--file', type=str, default=None,
                         help='Point cloud file (.ply/.xyz/.txt/.npy). Omit for synthetic demo')
     parser.add_argument('--shape', type=str, default='flat_sheet',
-                        choices=['saddle', 'hemisphere', 'torus_patch', 'wavy', 'sphere', 'flat_sheet'],
+                        choices=['saddle', 'hemisphere', 'torus_patch', 'wavy', 'sphere', 'flat_sheet', 'stepped_sheet'],
                         help='Synthetic surface type for demo mode')
     parser.add_argument('--result_dir', type=str, default='results_sheet',
                         help='Output directory (auto-increments if exists)')
@@ -574,6 +613,12 @@ def main():
                              'epochs (2-5 speeds training with little quality loss)')
     parser.add_argument('--checkpoint_every', type=int, default=50,
                         help='[Multi-patch] Save an intermediate checkpoint every N epochs')
+    parser.add_argument('--save_correspondence_every', type=int, default=500,
+                        help='[Multi-patch] Save Chamfer correspondence CSV/PNG every N epochs (0 disables)')
+    parser.add_argument('--correspondence_max_lines', type=int, default=300,
+                        help='[Multi-patch] Max correspondence lines drawn per saved PNG')
+    parser.add_argument('--correspondence_line_segment', type=str, default='t_to_q', choices=['t_to_q', 'both', 'q_to_t'],
+                        help='Direction of correspondence lines')
     parser.add_argument('--pretrain_init', action='store_true', default=False,
                         help='Run multi-patch flat-sheet initialization pretraining only')
     parser.add_argument('--pretrain_then_train', action='store_true', default=False,
@@ -745,6 +790,10 @@ def main():
             reg_every=args.reg_every,
             pretrained_F_state=pretrained_F_state,
             pretrained_ckpt_path=ckpt_path if pretrained_F_state is not None else None,
+            correspondence_dir=os.path.join(result_dir, 'correspondences'),
+            save_correspondence_every=args.save_correspondence_every,
+            correspondence_max_lines=args.correspondence_max_lines,
+            correspondence_line_segment=args.correspondence_line_segment,
         )
         F_model.eval()
         G_model.eval()

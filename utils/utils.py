@@ -288,6 +288,54 @@ def make_synthetic_surface(shape='saddle', n=20000, noise=0.02, seed=42):
         x = rng.uniform(-1, 1, n)
         y = rng.uniform(-1, 1, n)
         z = np.ones(n, dtype=np.float32)
+    elif shape == 'stepped_sheet':
+        # Continuous union of rectangular sheets on the plane z = 1.
+        # A large base rectangle is augmented with narrower rectangular
+        # extensions so the footprint is no longer a perfect rectangle.
+        rectangles = [
+            (-1.0, 0.0, -1.0, 1.0),
+            (0.0, 0.5, -0.6, 0.6),
+            (0.5, 0.85, -0.25, 0.25),
+        ]
+        areas = np.array([
+            (x1 - x0) * (y1 - y0) for x0, x1, y0, y1 in rectangles
+        ], dtype=np.float64)
+        probs = areas / areas.sum()
+        counts = rng.multinomial(n, probs)
+
+        pts_parts = []
+        for count, (x0, x1, y0, y1) in zip(counts, rectangles):
+            if count == 0:
+                continue
+            xr = rng.uniform(x0, x1, count)
+            yr = rng.uniform(y0, y1, count)
+            zr = np.ones(count, dtype=np.float32)
+            pts_parts.append(np.stack([xr, yr, zr], axis=-1))
+
+        pts = np.concatenate(pts_parts, axis=0).astype(np.float32)
+        rng.shuffle(pts)
+        pts += rng.normal(0, noise, pts.shape).astype(np.float32)
+
+        center = pts.mean(axis=0)
+        pts -= center
+        scale = float(np.abs(pts).max())
+        if scale > 1e-8:
+            pts /= scale
+
+        meta = {
+            'center': center,
+            'scale': scale,
+            'n_raw': n,
+        }
+
+        ply_path = os.path.abspath(f"synthetic_{shape}_n{n}_seed{seed}.ply")
+        export_point_cloud_ply(pts, ply_path)
+        meta['synthetic_ply_path'] = ply_path
+
+        print(f"  Generated '{shape}' surface: {n} points, noise={noise}")
+        print(f"  Normalization: center={center}, scale={scale:.6f}")
+        print(f"  Synthetic point cloud saved to: {meta['synthetic_ply_path']}")
+        return pts, meta
     else:
         raise ValueError(f"Unknown surface type: {shape}")
 
