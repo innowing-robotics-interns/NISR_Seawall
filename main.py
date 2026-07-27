@@ -288,7 +288,9 @@ def train_multi_patch(pts3n: np.ndarray,
 
         # Loss 1: Chamfer distance.
         D = torch.cdist(tgt, Q)
-        cd_loss = D.min(dim=2).values.mean() + D.min(dim=1).values.mean()
+        # cd_loss = D.min(dim=2).values.mean() + D.min(dim=1).values.mean()
+        cd_loss = D.min(dim=2).values.mean() # Map only xyz ->  uv
+
 
         # Loss 2: cycle consistency.
         if lam > 0:
