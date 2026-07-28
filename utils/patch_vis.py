@@ -10,6 +10,9 @@ import torch
 import trimesh
 from PIL import Image
 
+import pc_presegmentation as pc_presegmentation
+import utils as utils
+
 # Load the texture
 def load_checkerboard_textures(texture_path, pattern="Slide5.jpg", n_images=1):
     """
@@ -130,6 +133,73 @@ def _make_double_sided(verts, uv, faces):
     return verts2, uv2, faces2
 
 
+def _build_patch_uv_occupancy(points, subdivision_depth: int, min_points: int = 1):
+    """Build an occupancy mask over a patch-local UV domain [0,1]^2."""
+    if points is None or len(points) < min_points:
+        return np.zeros((1, 1), dtype=bool)
+
+    final_res = 1 << max(0, subdivision_depth)
+    occ = np.zeros((final_res, final_res), dtype=bool)
+
+    if subdivision_depth == 0:
+        occ[0, 0] = len(points) >= min_points
+        return occ
+
+    cells = [(points, 0, 0, final_res)]
+
+    for depth in range(subdivision_depth):
+        next_cells = []
+        for cell_points, row0, col0, size in cells:
+            if len(cell_points) < min_points:
+                continue
+            if size <= 1:
+                next_cells.append((cell_points, row0, col0, size))
+                continue
+            assignments, _, _ = pc_presegmentation.pca_grid_segmentation(
+                cell_points, n_patches_u=2, n_patches_v=2
+            )
+            half = size // 2
+            for sub_id in range(4):
+                sub_points = cell_points[assignments == sub_id]
+                if len(sub_points) < min_points:
+                    continue
+                sub_r = sub_id // 2
+                sub_c = sub_id % 2
+                next_cells.append((sub_points, row0 + sub_r * half, col0 + sub_c * half, half))
+        cells = next_cells
+        if not cells:
+            break
+
+    for _, row0, col0, size in cells:
+        occ[row0:row0 + size, col0:col0 + size] = True
+    return occ
+
+
+def _filter_patch_mesh_by_occupancy(verts, uv, faces, occ_mask):
+    """Keep only vertices/faces whose UVs lie in occupied cells."""
+    if occ_mask.size == 0 or not occ_mask.any():
+        return (np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 2), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.int32))
+
+    res_u, res_v = occ_mask.shape
+    u_idx = np.clip((uv[:, 0] * res_u).astype(int), 0, res_u - 1)
+    v_idx = np.clip((uv[:, 1] * res_v).astype(int), 0, res_v - 1)
+    keep_v = occ_mask[u_idx, v_idx]
+
+    kept_indices = np.flatnonzero(keep_v)
+    if kept_indices.size == 0:
+        return (np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 2), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.int32))
+
+    index_map = -np.ones(len(verts), dtype=np.int32)
+    index_map[kept_indices] = np.arange(len(kept_indices), dtype=np.int32)
+    keep_f = keep_v[faces].all(axis=1)
+    faces_kept = index_map[faces[keep_f]]
+    return verts[kept_indices], uv[kept_indices], faces_kept
+
+
 
 # Export functions
 def export_checkerboard_patches(F, meta, save_dir, texture_path,
@@ -138,7 +208,10 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
                                  texture_pattern="Slide5.jpg", n_images=1,
                                  unnormalize=True, debug_uv_png=True,
                                  export_ply=True, double_sided=True,
-                                 active_patch_ids=None):
+                                 active_patch_ids=None,
+                                 patch_points_by_id=None,
+                                 subdivision_depth=1,
+                                 min_points_per_cell=1):
     """
     Export checkerboard-textured patch meshes and a combined scene.
     """
@@ -159,8 +232,20 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
     meshes = []          # textured (OBJ) versions
     colored_meshes = []  # vertex-colored (PLY) versions
 
+    use_legacy_sampling = subdivision_depth <= 0 or patch_points_by_id is None
+
     for export_idx, cid in enumerate(patch_ids):
         verts, uv, faces = _sample_patch_grid(F, cid, resolution, device)
+        if not use_legacy_sampling:
+            occ_mask = _build_patch_uv_occupancy(
+                patch_points_by_id.get(int(cid)),
+                subdivision_depth=subdivision_depth,
+                min_points=min_points_per_cell,
+            )
+            verts, uv, faces = _filter_patch_mesh_by_occupancy(verts, uv, faces, occ_mask)
+            if verts.shape[0] == 0 or faces.shape[0] == 0:
+                print(f"    Patch {cid:02d} skipped after occupancy filtering")
+                continue
         tex_img = textures[export_idx % n_textures]
 
         if debug_uv_png:
@@ -196,6 +281,10 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
             _save_debug_uv_png(uv, tex_img, save_dir, cid)
 
     # Combined OBJ scene with per-patch materials.
+    if len(meshes) == 0:
+        print("  No meshes remained after occupancy filtering; skipping combined export.")
+        return []
+
     scene = trimesh.Scene(meshes)
     obj_scene_name = f"{name}_checkerboard_{epoch}.obj" if name else f"checkerboard_{epoch}.obj"
     obj_scene_path = os.path.join(save_dir, obj_scene_name)
@@ -354,6 +443,28 @@ def _resolve_checkpoint_paths(ckpt_path):
     return [ckpt_path]
 
 
+def _build_patch_points_by_id(input_points: np.ndarray, assignments, active_patch_ids):
+    assignments = np.asarray(assignments)
+    patch_points = {}
+    for cid in active_patch_ids:
+        patch_points[int(cid)] = input_points[assignments == int(cid)]
+    return patch_points
+
+
+def _resegment_current_input_points(input_points: np.ndarray, n_rows: int, n_cols: int,
+                                    active_patch_ids=None):
+    """Use the current normalized input cloud directly to recover top-level patch groups."""
+    assignments, _, _ = pc_presegmentation.pca_grid_segmentation(
+        input_points, n_patches_u=n_rows, n_patches_v=n_cols
+    )
+    if active_patch_ids is None:
+        active_patch_ids = sorted(np.unique(assignments).tolist())
+    patch_points = {}
+    for cid in active_patch_ids:
+        patch_points[int(cid)] = input_points[assignments == int(cid)]
+    return patch_points
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Export checkerboard-textured per-patch meshes from a '
@@ -389,6 +500,12 @@ def main():
                             'Needed if patch_vis.py is not next to the model package and '
                             'not run from its folder. '
                             'e.g. /media/.../NISR_Seawall/model/model.py')
+    parser.add_argument('--input_file', type=str, default=None,
+                        help='Input point cloud used to build occupancy masks inside active patches')
+    parser.add_argument('--subdivision_depth', type=int, default=1,
+                        help='Recursive subdivision depth inside each active patch for UV occupancy filtering')
+    parser.add_argument('--min_points_per_cell', type=int, default=10,
+                        help='Minimum number of input points required for a subdivided UV cell to be kept')
     args = parser.parse_args()
 
     ckpt_paths = _resolve_checkpoint_paths(args.ckpt)
@@ -402,9 +519,18 @@ def main():
         ckpt_name = os.path.splitext(os.path.basename(ckpt_path))[0]
         export_dir = os.path.join(args.out_dir, ckpt_name)
 
-        F, meta, _, active_patch_ids, _ = _load_model_from_checkpoint(
+        F, meta, ckpt_args, active_patch_ids, _ = _load_model_from_checkpoint(
             ckpt_path, args.device, args.model_path
         )
+        patch_points_by_id = None
+        if active_patch_ids is not None and args.subdivision_depth > 0:
+            input_file = args.input_file or ckpt_args.get('file')
+            if input_file is None:
+                raise ValueError('Occupancy-aware export requires --input_file or checkpoint args[file].')
+            input_points, _ = utils.load_point_cloud(input_file)
+            patch_points_by_id = _resegment_current_input_points(
+                input_points, F.n_rows, F.n_cols, active_patch_ids=active_patch_ids
+            )
         print(f"  Loaded model: {F.n_rows}x{F.n_cols} = {F.n_patches} patches")
         if active_patch_ids is not None:
             print(f"  Active patches in checkpoint: {len(active_patch_ids)}")
@@ -422,7 +548,10 @@ def main():
             unnormalize=not args.no_unnormalize,
             export_ply=not args.no_ply,
             double_sided=not args.single_sided,
-            active_patch_ids=None,
+            active_patch_ids=active_patch_ids,
+            patch_points_by_id=patch_points_by_id,
+            subdivision_depth=args.subdivision_depth,
+            min_points_per_cell=args.min_points_per_cell,
         )
 
     print(f"\n  Done. Textured patches → {args.out_dir}")
