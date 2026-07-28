@@ -335,7 +335,7 @@ def _load_model_from_checkpoint(ckpt_path, device, model_path=None):
             'scale': float(normalization['scale']),
         }
     active_patch_ids = ckpt.get('active_patch_ids')
-    return F, meta, args, active_patch_ids
+    return F, meta, args, active_patch_ids, ckpt.get('grid_dims')
 
 
 def _resolve_checkpoint_paths(ckpt_path):
@@ -402,7 +402,7 @@ def main():
         ckpt_name = os.path.splitext(os.path.basename(ckpt_path))[0]
         export_dir = os.path.join(args.out_dir, ckpt_name)
 
-        F, meta, _, active_patch_ids = _load_model_from_checkpoint(
+        F, meta, _, active_patch_ids, _ = _load_model_from_checkpoint(
             ckpt_path, args.device, args.model_path
         )
         print(f"  Loaded model: {F.n_rows}x{F.n_cols} = {F.n_patches} patches")
@@ -422,7 +422,7 @@ def main():
             unnormalize=not args.no_unnormalize,
             export_ply=not args.no_ply,
             double_sided=not args.single_sided,
-            active_patch_ids=active_patch_ids,
+            active_patch_ids=None,
         )
 
     print(f"\n  Done. Textured patches → {args.out_dir}")

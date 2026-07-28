@@ -19,6 +19,7 @@ from matplotlib import cm
 import utils.pc_presegmentation as pc_presegmentation
 import utils.correspondence_vis as correspondence_vis
 import utils.utils as utils
+from utils.utils import (_build_patch_uv_masks, _sample_masked_patch_uv_batches)
 from model.losses import (boundary_chamfer_loss, chamfer_1d,
                                        chamfer_distance,
                                        chamfer_distance_chunked,
@@ -64,6 +65,10 @@ def train_multi_patch(pts3n: np.ndarray,
                       output_psr_mesh_path: str = None,
                       normals: np.ndarray = None,
                       reg_every: int = 1,
+                      lambda_anchor: float = 0.0,
+                      mask_res: int = 16,
+                      mask_dilate: int = 1,
+                      M_anchor: int = 0,
                       pretrained_F_state: dict = None,
                       pretrained_ckpt_path: str = None,
                       correspondence_dir: str = None,
@@ -88,9 +93,13 @@ def train_multi_patch(pts3n: np.ndarray,
         print(f"  Normal constraint active (γ={gamma}), normals shape: {normals.shape}")
 
     # Default pre-segmentation.
-    assignments, grid_topology, patch_params = pc_presegmentation.pca_grid_segmentation(
-        pts3n, n_rows, n_cols
-    )
+    # assignments, grid_topology, patch_params = pc_presegmentation.pca_grid_segmentation(
+    #     pts3n, n_rows, n_cols
+    # )
+    # assignments, grid_topology, patch_params = _flip_segmentation_left_right(
+    #     assignments, grid_topology, patch_params, n_cols
+    # )
+    # print("  Applied left-right patch flip to align segmentation with flat-sheet pretraining")
     
     # Alternative: Poisson spectral segmentation.
     # assignments, grid_topology, patch_params = pc_presegmentation.poisson_spectral_segmentation(
@@ -104,9 +113,9 @@ def train_multi_patch(pts3n: np.ndarray,
     # )
 
     # Alternative: axis-aligned grid segmentation.
-    # assignments, grid_topology, patch_params = pc_presegmentation.axis_aligned_grid_segmentation(
-    #     pts3n, n_rows, n_cols
-    # )
+    assignments, grid_topology, patch_params = pc_presegmentation.axis_aligned_grid_segmentation(
+        pts3n, n_rows, n_cols
+    )
 
     # Patch visualization.
     if save_patch_vis:
@@ -162,9 +171,18 @@ def train_multi_patch(pts3n: np.ndarray,
         raise RuntimeError("No active patches (all have < 10 points). "
                            "Reduce --n_patches or add more points.")
 
+    inactive_ids = [k for k in range(actual_n_patches) if k not in active_ids]
+    patch_uv_masks = _build_patch_uv_masks(assignments, patch_params, active_ids,
+                                           n_rows, n_cols, mask_res, mask_dilate)
+
     active_idx_dev = torch.tensor(active_ids, dtype=torch.long, device=device)
     pidx_flat = active_idx_dev.repeat_interleave(M_per_patch)
     lengths = [p.shape[0] for p in active_pts]
+    inactive_idx_dev = None
+    inactive_pidx_flat = None
+    if inactive_ids:
+        inactive_idx_dev = torch.tensor(inactive_ids, dtype=torch.long, device=device)
+        inactive_pidx_flat = inactive_idx_dev.repeat_interleave(M_per_patch)
 
     # Models.
     F = MultiPatchForwardMap(n_rows, n_cols, d_features,
@@ -181,6 +199,22 @@ def train_multi_patch(pts3n: np.ndarray,
             print(f"    Missing keys: {len(missing)}")
         if unexpected:
             print(f"    Unexpected keys: {len(unexpected)}")
+
+    F_init = None
+    if lambda_anchor > 0:
+        if pretrained_F_state is None:
+            print("  [warn] lambda_anchor > 0 but no pretrained F state was provided; "
+                  "anchor loss will be disabled.")
+        else:
+            F_init = MultiPatchForwardMap(n_rows, n_cols, d_features,
+                                          L=L, W=W, D=D, beta=beta).to(device)
+            F_init.load_state_dict(pretrained_F_state, strict=False)
+            F_init.eval()
+            for param in F_init.parameters():
+                param.requires_grad_(False)
+            print(f"  Anchor loss active (λ_anchor={lambda_anchor})")
+            print(f"    Active outer-region anchor patches: {len(active_ids)}")
+            print(f"    Inactive full-patch anchor patches: {len(inactive_ids)}")
 
     print(f"  Model device: {next(F.parameters()).device}")
     n_params_F = sum(p.numel() for p in F.parameters())
@@ -200,16 +234,21 @@ def train_multi_patch(pts3n: np.ndarray,
     opt = torch.optim.Adam(list(F.parameters()) + list(G.parameters()), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
 
-    history = {'cd': [], 'cycle': [], 'param': [], 'tangent': [], 'normal': [],
+    history = {'cd': [], 'cycle': [], 'param': [], 'tangent': [], 'normal': [], 'anchor': [],
                'mu_eff': [], 'total': [], 'epoch': []}
     
 
     print(f"\n{'─'*60}")
     print(f"  Multi-Patch Feature Complex Training (VECTORIZED)")
     print(f"  Grid={n_rows}×{n_cols}  active_patches={K}/{actual_n_patches}")
+    print(f"  Inactive patches={len(inactive_ids)}/{actual_n_patches}")
+    if K > 0:
+        occ_fracs = [patch_uv_masks[patch_id]['occupied_fraction'] for patch_id in active_ids]
+        print(f"  UV occupancy mask: res={mask_res}  dilate={mask_dilate}  "
+              f"mean occupied fraction={np.mean(occ_fracs):.3f}")
     print(f"  d_features={d_features}  W={W}  D={D}  L(fwd/global-UV)={L}  L_inv={L_inv}  β={beta}")
-    print(f"  M_per_patch={M_per_patch}  batch/step={K*M_per_patch}  reg_every={reg_every}")
-    print(f"  μ={mu}  γ={gamma}  λ₁={lam}  λ₂={lam2}")
+    print(f"  M_per_patch={M_per_patch}  M_anchor={M_anchor}  batch/step={K*M_per_patch}  reg_every={reg_every}")
+    print(f"  μ={mu}  γ={gamma}  λ₁={lam}  λ₂={lam2}  λ_anchor={lambda_anchor}")
     if mu_warmup_epochs > 0 and mu > 0:
         print(f"  μ warmup: {mu_warmup_schedule} ramp over {mu_warmup_epochs} epochs "
               f"(0.0 → {mu})")
@@ -250,6 +289,10 @@ def train_multi_patch(pts3n: np.ndarray,
                 'gamma': gamma,
                 'lam': lam,
                 'lam2': lam2,
+                'lambda_anchor': lambda_anchor,
+                'mask_res': mask_res,
+                'mask_dilate': mask_dilate,
+                'M_anchor': M_anchor,
                 'lambda_bcd': lambda_bcd,
                 'beta': beta,
                 'device': device,
@@ -319,10 +362,39 @@ def train_multi_patch(pts3n: np.ndarray,
         if gamma > 0:
             tgt_nrm = nrm_batch.to(device)
 
-        # Single batched forward pass.
-        uv_flat = torch.rand(K * M_per_patch, 2, device=device, requires_grad=True)
+        # Single batched forward pass on occupied UV cells only.
+        pidx_flat, uv_flat = _sample_masked_patch_uv_batches(
+            active_ids, patch_uv_masks, M_per_patch, mask_res, device, mode='occupied'
+        )
         Q_flat = F(pidx_flat, uv_flat)
         Q = Q_flat.reshape(K, M_per_patch, 3)
+
+        anchor_terms = []
+        uv_active_outer_flat = None
+        Q_active_outer_flat = None
+        if F_init is not None and M_anchor > 0:
+            active_outer_pidx_flat, uv_active_outer_flat = _sample_masked_patch_uv_batches(
+                active_ids, patch_uv_masks, M_anchor, mask_res, device, mode='unoccupied'
+            )
+            if active_outer_pidx_flat is not None and uv_active_outer_flat is not None:
+                Q_active_outer_flat = F(active_outer_pidx_flat, uv_active_outer_flat)
+                with torch.no_grad():
+                    Q_active_outer_init_flat = F_init(active_outer_pidx_flat, uv_active_outer_flat.detach())
+                anchor_terms.append(nn.functional.mse_loss(Q_active_outer_flat, Q_active_outer_init_flat))
+
+        if F_init is not None and inactive_pidx_flat is not None and M_anchor > 0:
+            uv_inactive_flat = torch.rand(len(inactive_ids) * M_anchor, 2,
+                                          device=device, requires_grad=True)
+            inactive_anchor_pidx_flat = inactive_idx_dev.repeat_interleave(M_anchor)
+            Q_inactive_flat = F(inactive_anchor_pidx_flat, uv_inactive_flat)
+            with torch.no_grad():
+                Q_inactive_init_flat = F_init(inactive_anchor_pidx_flat, uv_inactive_flat.detach())
+            anchor_terms.append(nn.functional.mse_loss(Q_inactive_flat, Q_inactive_init_flat))
+        else:
+            uv_inactive_flat = None
+            Q_inactive_flat = None
+
+        anchor_loss = torch.stack(anchor_terms).mean() if anchor_terms else zero
 
         # Loss 1: Chamfer distance.
         D = torch.cdist(tgt, Q)
@@ -359,7 +431,19 @@ def train_multi_patch(pts3n: np.ndarray,
         mu_eff = mu_warmup_schedule(epoch, mu_warmup_epochs, mu,
                                     schedule=schedule, delay_epochs=mu_warmup_delay) if mu > 0 else 0.0
         if do_reg:
-            t_u, t_v = surface_jacobian(Q_flat, uv_flat)
+            t_u_active, t_v_active = surface_jacobian(Q_flat, uv_flat)
+            t_u_parts = [t_u_active]
+            t_v_parts = [t_v_active]
+            if Q_active_outer_flat is not None and uv_active_outer_flat is not None:
+                t_u_active_outer, t_v_active_outer = surface_jacobian(Q_active_outer_flat, uv_active_outer_flat)
+                t_u_parts.append(t_u_active_outer)
+                t_v_parts.append(t_v_active_outer)
+            if Q_inactive_flat is not None and uv_inactive_flat is not None:
+                t_u_inactive, t_v_inactive = surface_jacobian(Q_inactive_flat, uv_inactive_flat)
+                t_u_parts.append(t_u_inactive)
+                t_v_parts.append(t_v_inactive)
+            t_u = torch.cat(t_u_parts, dim=0)
+            t_v = torch.cat(t_v_parts, dim=0)
 
             if mu_eff > 0:
                 tangent_loss = tangent_loss_from_jac(t_u, t_v)
@@ -386,6 +470,7 @@ def train_multi_patch(pts3n: np.ndarray,
         loss = (cd_loss
                 + lam * cycle_loss
                 + lam2 * param_loss
+            + lambda_anchor * anchor_loss
                 + mu_eff * tangent_loss
                 + gamma * normal_loss)
         loss.backward()
@@ -401,6 +486,7 @@ def train_multi_patch(pts3n: np.ndarray,
             history['param'].append(float(param_loss))
             history['tangent'].append(float(tangent_loss))
             history['normal'].append(float(normal_loss))
+            history['anchor'].append(float(anchor_loss))
             # history['mu_eff'].append(float(mu_eff))
             history['total'].append(float(loss))
 
@@ -410,6 +496,7 @@ def train_multi_patch(pts3n: np.ndarray,
                   f"CD={float(cd_loss):.5f}  "
                   f"Cycle={float(cycle_loss):.5f}  "
                   f"Param={float(param_loss):.5f}  "
+                  f"Anchor={float(anchor_loss):.5f}  "
                   f"Tangent={float(tangent_loss):.5f}  "
                   f"Normal={float(normal_loss):.5f}  "
                   f"Total={float(loss):.5f}"
@@ -611,9 +698,18 @@ def main():
     parser.add_argument('--reg_every', type=int, default=1,
                         help='[Multi-patch] Compute tangent+normal losses every N '
                              'epochs (2-5 speeds training with little quality loss)')
+    parser.add_argument('--lambda_anchor', type=float, default=0.0,
+                        help='[Multi-patch] Weight for keeping inactive patches near '
+                             'the pretrained flat-sheet initialization')
+    parser.add_argument('--mask_res', type=int, default=32,
+                        help='[Multi-patch] UV occupancy mask resolution per patch')
+    parser.add_argument('--mask_dilate', type=int, default=1,
+                        help='[Multi-patch] Dilation radius in UV occupancy-mask cells')
+    parser.add_argument('--M_anchor', type=int, default=1024,
+                        help='[Multi-patch] # UV anchor samples per patch for outer/inactive regions')
     parser.add_argument('--checkpoint_every', type=int, default=50,
                         help='[Multi-patch] Save an intermediate checkpoint every N epochs')
-    parser.add_argument('--save_correspondence_every', type=int, default=500,
+    parser.add_argument('--save_correspondence_every', type=int, default=5000,
                         help='[Multi-patch] Save Chamfer correspondence CSV/PNG every N epochs (0 disables)')
     parser.add_argument('--correspondence_max_lines', type=int, default=300,
                         help='[Multi-patch] Max correspondence lines drawn per saved PNG')
@@ -788,6 +884,10 @@ def main():
             output_psr_mesh_path=psr_ply_path,
             normals=normals,
             reg_every=args.reg_every,
+            lambda_anchor=args.lambda_anchor,
+            mask_res=args.mask_res,
+            mask_dilate=args.mask_dilate,
+            M_anchor=args.M_anchor,
             pretrained_F_state=pretrained_F_state,
             pretrained_ckpt_path=ckpt_path if pretrained_F_state is not None else None,
             correspondence_dir=os.path.join(result_dir, 'correspondences'),

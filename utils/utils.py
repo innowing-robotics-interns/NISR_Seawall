@@ -1138,3 +1138,111 @@ def _save_run_metadata(log_path: str, args, input_file: str, result_dir: str,
     with open(log_path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2, sort_keys=False)
     print(f"    Metadata → {log_path}")
+
+
+# masked patch sampling utilities
+def _patch_id_to_row_col(patch_id: int, n_cols: int):
+    """Convert a flat patch index to grid row and column."""
+    return patch_id // n_cols, patch_id % n_cols
+
+
+def _global_to_local_patch_uv(global_uv: np.ndarray,
+                              patch_id: int,
+                              n_rows: int,
+                              n_cols: int) -> np.ndarray:
+    """Convert global segmentation UV coordinates to local patch UV."""
+    row, col = _patch_id_to_row_col(patch_id, n_cols)
+    local_u = global_uv[:, 0] * n_rows - row
+    local_v = global_uv[:, 1] * n_cols - col
+    local_uv = np.stack([local_u, local_v], axis=1)
+    return np.clip(local_uv, 0.0, 1.0)
+
+
+def _dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Dilate a boolean occupancy mask with a square neighborhood."""
+    if radius <= 0:
+        return mask
+
+    h, w = mask.shape
+    dilated = mask.copy()
+    occupied = np.argwhere(mask)
+    for i, j in occupied:
+        i0 = max(0, i - radius)
+        i1 = min(h, i + radius + 1)
+        j0 = max(0, j - radius)
+        j1 = min(w, j + radius + 1)
+        dilated[i0:i1, j0:j1] = True
+    return dilated
+
+
+def _build_patch_uv_masks(assignments: np.ndarray,
+                          patch_params: np.ndarray,
+                          active_ids: list,
+                          n_rows: int,
+                          n_cols: int,
+                          mask_res: int,
+                          dilate_radius: int):
+    """Build occupied/unoccupied UV cell lists for each active patch."""
+    patch_masks = {}
+    for patch_id in active_ids:
+        mask = assignments == patch_id
+        params_k = patch_params[mask]
+        local_uv = _global_to_local_patch_uv(params_k, patch_id, n_rows, n_cols)
+
+        occ = np.zeros((mask_res, mask_res), dtype=bool)
+        if local_uv.shape[0] > 0:
+            iu = np.clip((local_uv[:, 0] * mask_res).astype(int), 0, mask_res - 1)
+            iv = np.clip((local_uv[:, 1] * mask_res).astype(int), 0, mask_res - 1)
+            occ[iu, iv] = True
+
+        occ = _dilate_mask(occ, dilate_radius)
+        occupied_cells = np.argwhere(occ)
+        unoccupied_cells = np.argwhere(~occ)
+        patch_masks[patch_id] = {
+            'mask': occ,
+            'occupied_cells': occupied_cells,
+            'unoccupied_cells': unoccupied_cells,
+            'occupied_fraction': float(occ.mean()),
+        }
+    return patch_masks
+
+
+def _sample_uv_from_cells(cell_coords: np.ndarray,
+                          n_samples: int,
+                          mask_res: int,
+                          device: str) -> torch.Tensor:
+    """Sample UV coordinates uniformly from a set of occupancy-grid cells."""
+    if n_samples <= 0:
+        return torch.empty((0, 2), device=device)
+    if cell_coords.shape[0] == 0:
+        return torch.rand(n_samples, 2, device=device)
+
+    choice = np.random.randint(0, cell_coords.shape[0], size=n_samples)
+    chosen = cell_coords[choice]
+    base = torch.tensor(chosen, dtype=torch.float32, device=device)
+    jitter = torch.rand(n_samples, 2, device=device)
+    uv = (base + jitter) / float(mask_res)
+    return uv.clamp_(0.0, 1.0)
+
+
+def _sample_masked_patch_uv_batches(patch_ids: list,
+                                    patch_masks: dict,
+                                    samples_per_patch: int,
+                                    mask_res: int,
+                                    device: str,
+                                    mode: str):
+    """Sample UV batches from occupied or unoccupied cells for each patch."""
+    if samples_per_patch <= 0 or len(patch_ids) == 0:
+        return None, None
+
+    uv_batches = []
+    patch_idx = []
+    for patch_id in patch_ids:
+        cells = patch_masks[patch_id]['occupied_cells' if mode == 'occupied' else 'unoccupied_cells']
+        uv = _sample_uv_from_cells(cells, samples_per_patch, mask_res, device)
+        uv_batches.append(uv)
+        patch_idx.append(torch.full((samples_per_patch,), int(patch_id), dtype=torch.long, device=device))
+
+    uv_flat = torch.cat(uv_batches, dim=0).requires_grad_(True)
+    patch_idx_flat = torch.cat(patch_idx, dim=0)
+    return patch_idx_flat, uv_flat
