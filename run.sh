@@ -3,16 +3,16 @@
 # SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # cd "$SCRIPT_DIR"
 
-FILE="noisy_data_4_normals.xyz"
+FILE="noisy_data_2_normals.xyz"
 INPUT_FILE="data/${FILE}"
-OUTPUT_DIR="logs/${FILE%.*}_StartMuAt500_ARAP0.0625"
+OUTPUT_DIR="logs/boundaryFix/${FILE%.*}"
 
 python main.py \
     --multi_patch \
     --pretrain_then_train \
     --result_dir ${OUTPUT_DIR} \
-    --pretrain_epochs 0 \
-    --epochs 5000 \
+    --pretrain_epochs 10000 \
+    --epochs 2000 \
     --n_patches 16 \
     --d_features 88 \
     --M_per_patch 4096 \
@@ -25,10 +25,15 @@ python main.py \
     --beta 100 \
     --mu 0.08 \
     --gamma 0 \
+    --lambda_outer_boundary 10 \
     --lam 0 \
     --lam2 0 \
     --log_every 200 \
-    --pretrain_loss l1 
+    --pretrain_loss l1 \
+    --mu_warmup_epochs 1000 \
+    --mu_warmup_delay 300 \
+    --schedule cosine \
+    --checkpoint_every 200 \
 
 REAL_OUTPUT_DIR="${OUTPUT_DIR}"
 
@@ -36,6 +41,8 @@ python utils/patch_vis.py \
     --ckpt ${REAL_OUTPUT_DIR}/checkpoint.pt \
     --out_dir ${REAL_OUTPUT_DIR} \
     --n_images 1 \
+    --input_file ${INPUT_FILE} \
+    --subdivision_depth "-1"
 
 # python main.py \
 #     --file ${INPUT_FILE} \
