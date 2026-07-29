@@ -393,7 +393,6 @@ def train_multi_patch(pts3n: np.ndarray,
         if lambda_outer_boundary > 0:
             outer_boundary_loss = outer_boundary_rectangle_loss(
                 F_model=F,
-                active_patch_ids=active_ids,
                 n_boundary_samples=outer_boundary_samples,
                 loss_type=outer_boundary_loss_type,
                 device=device,
@@ -627,6 +626,7 @@ def main():
     parser.add_argument('--lambda_bcd', type=float, default=0,
                         help='[Multi-patch] Boundary Chamfer Distance weight (optional)')
     
+    # Global Boundary Constraint
     parser.add_argument('--lambda_outer_boundary', type=float, default=1.0,
                         help='[Multi-patch] Weight for matching the global outer border to a fixed rectangle')
     parser.add_argument('--outer_boundary_samples', type=int, default=512,

@@ -43,7 +43,6 @@ def _sample_rectangle_patch_edge(n_rows: int,
 
 
 def outer_boundary_rectangle_loss(F_model,
-                                  active_patch_ids,
                                   n_boundary_samples: int = 64,
                                   loss_type: str = 'l1',
                                   device: str = 'cuda'):
@@ -58,7 +57,6 @@ def outer_boundary_rectangle_loss(F_model,
     if n_boundary_samples <= 0:
         return torch.tensor(0.0, device=device)
 
-    active_patch_ids = {int(pid) for pid in active_patch_ids}
     t = torch.linspace(0.0, 1.0, n_boundary_samples, device=device).unsqueeze(1)
 
     if loss_type == 'l1':
@@ -74,8 +72,6 @@ def outer_boundary_rectangle_loss(F_model,
     for row in range(F_model.n_rows):
         for col in range(F_model.n_cols):
             patch_id = row * F_model.n_cols + col
-            if patch_id not in active_patch_ids:
-                continue
 
             if row == 0:
                 uv = torch.cat([torch.zeros_like(t), t], dim=1)
