@@ -110,6 +110,75 @@ def outer_boundary_rectangle_loss(F_model,
     return total_loss / n_terms
 
 
+def sample_outer_boundary_correspondence(F_model,
+                                         n_boundary_samples: int = 64,
+                                         device: str = 'cuda'):
+    """
+    Sample model/target point pairs used by the outer-boundary rectangle loss.
+
+    Returns:
+        dict with batched model points, target points, patch ids, and edge labels.
+    """
+    if n_boundary_samples <= 0:
+        empty_pts = torch.empty(0, 0, 3, device=device)
+        empty_ids = torch.empty(0, dtype=torch.long, device=device)
+        return {
+            'model_points': empty_pts,
+            'target_points': empty_pts,
+            'patch_ids': empty_ids,
+            'edge_names': [],
+        }
+
+    t = torch.linspace(0.0, 1.0, n_boundary_samples, device=device).unsqueeze(1)
+    model_batches = []
+    target_batches = []
+    patch_ids = []
+    edge_names = []
+
+    for row in range(F_model.n_rows):
+        for col in range(F_model.n_cols):
+            patch_id = row * F_model.n_cols + col
+
+            if row == 0:
+                uv = torch.cat([torch.zeros_like(t), t], dim=1)
+                model_batches.append(F_model(patch_id, uv))
+                target_batches.append(_sample_rectangle_patch_edge(
+                    F_model.n_rows, F_model.n_cols, row, col, 'top', t))
+                patch_ids.append(patch_id)
+                edge_names.append('top')
+
+            if row == F_model.n_rows - 1:
+                uv = torch.cat([torch.ones_like(t), t], dim=1)
+                model_batches.append(F_model(patch_id, uv))
+                target_batches.append(_sample_rectangle_patch_edge(
+                    F_model.n_rows, F_model.n_cols, row, col, 'bottom', t))
+                patch_ids.append(patch_id)
+                edge_names.append('bottom')
+
+            if col == 0:
+                uv = torch.cat([t, torch.zeros_like(t)], dim=1)
+                model_batches.append(F_model(patch_id, uv))
+                target_batches.append(_sample_rectangle_patch_edge(
+                    F_model.n_rows, F_model.n_cols, row, col, 'left', t))
+                patch_ids.append(patch_id)
+                edge_names.append('left')
+
+            if col == F_model.n_cols - 1:
+                uv = torch.cat([t, torch.ones_like(t)], dim=1)
+                model_batches.append(F_model(patch_id, uv))
+                target_batches.append(_sample_rectangle_patch_edge(
+                    F_model.n_rows, F_model.n_cols, row, col, 'right', t))
+                patch_ids.append(patch_id)
+                edge_names.append('right')
+
+    return {
+        'model_points': torch.stack(model_batches, dim=0),
+        'target_points': torch.stack(target_batches, dim=0),
+        'patch_ids': torch.tensor(patch_ids, dtype=torch.long, device=device),
+        'edge_names': edge_names,
+    }
+
+
 def mu_warmup_schedule(epoch: int, warmup_epochs: int, mu_target: float,
                        schedule: str = 'cosine',
                        delay_epochs: int = 300) -> float:

@@ -457,3 +457,90 @@ __all__ = [
     "export_patchwise_chamfer_correspondences",
     "export_combined_correspondence_ply",
 ]
+
+
+def export_boundary_correspondence_debug(
+    model_batches: np.ndarray,
+    target_batches: np.ndarray,
+    patch_ids: np.ndarray,
+    edge_names,
+    output_dir: str,
+    max_lines: int = 200,
+) -> None:
+    """Export debug visualizations for outer-boundary rectangle correspondences."""
+    model_batches = np.asarray(model_batches, dtype=np.float32)
+    target_batches = np.asarray(target_batches, dtype=np.float32)
+    patch_ids = np.asarray(patch_ids, dtype=np.int32)
+
+    if model_batches.ndim != 3 or model_batches.shape[-1] != 3:
+        raise ValueError(f"model_batches must have shape (K, N, 3), got {model_batches.shape}")
+    if target_batches.shape != model_batches.shape:
+        raise ValueError(
+            f"target_batches must match model_batches shape, got {target_batches.shape} vs {model_batches.shape}"
+        )
+    if patch_ids.shape[0] != model_batches.shape[0]:
+        raise ValueError(f"patch_ids must have length {model_batches.shape[0]}, got {patch_ids.shape[0]}")
+    if len(edge_names) != model_batches.shape[0]:
+        raise ValueError(f"edge_names must have length {model_batches.shape[0]}, got {len(edge_names)}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    for idx, (patch_id, edge_name) in enumerate(zip(patch_ids, edge_names)):
+        q_points = model_batches[idx]
+        t_points = target_batches[idx]
+        n = q_points.shape[0]
+        pair_idx = np.arange(n, dtype=np.int32)
+
+        csv_path = os.path.join(output_dir, f"patch_{int(patch_id):03d}_{edge_name}.csv")
+        png_path = os.path.join(output_dir, f"patch_{int(patch_id):03d}_{edge_name}.png")
+        ply_path = os.path.join(output_dir, f"patch_{int(patch_id):03d}_{edge_name}.ply")
+
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(CSV_HEADER + ["edge_name", "sample_index"])
+            for sample_idx, (q, t) in enumerate(zip(q_points, t_points)):
+                dist = float(np.linalg.norm(q - t))
+                writer.writerow([
+                    sample_idx,
+                    int(patch_id),
+                    "boundary_direct",
+                    float(q[0]), float(q[1]), float(q[2]),
+                    float(t[0]), float(t[1]), float(t[2]),
+                    dist,
+                    edge_name,
+                    sample_idx,
+                ])
+
+        _plot_correspondences(
+            q_points=q_points,
+            t_points=t_points,
+            q_to_t_idx=pair_idx,
+            t_to_q_idx=pair_idx,
+            output_png_path=png_path,
+            max_lines=max_lines,
+            point_size=8.0,
+            line_width=1.2,
+            plot_direction="both",
+        )
+
+        export_correspondence_ply(
+            q_points=q_points,
+            t_points=t_points,
+            q_to_t_idx=pair_idx,
+            t_to_q_idx=pair_idx,
+            output_ply_path=ply_path,
+            plot_direction="both",
+        )
+
+    export_combined_correspondence_ply(
+        q_batches=model_batches,
+        t_batches=target_batches,
+        distance_batches=np.linalg.norm(
+            target_batches[:, :, None, :] - model_batches[:, None, :, :], axis=-1
+        ).astype(np.float32),
+        output_ply_path=os.path.join(output_dir, "all_boundary_edges_combined.ply"),
+        plot_direction="both",
+    )
+
+
+__all__.append("export_boundary_correspondence_debug")

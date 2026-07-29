@@ -25,6 +25,7 @@ from model.losses import (boundary_chamfer_loss, chamfer_1d,
                                        mu_warmup_schedule,
                                        normal_consistency_loss,
                                outer_boundary_rectangle_loss,
+                   sample_outer_boundary_correspondence,
                                              surface_jacobian,
                                              tangent_fold_loss,
                                              tangent_loss_from_jac)
@@ -72,6 +73,7 @@ def train_multi_patch(pts3n: np.ndarray,
                       pretrained_ckpt_path: str = None,
                       correspondence_dir: str = None,
                       save_correspondence_every: int = 0,
+                      save_boundary_debug_every: int = 0,
                       correspondence_max_lines: int = 300,
                       correspondence_line_segment: str = 't_to_q'):
     """
@@ -228,6 +230,9 @@ def train_multi_patch(pts3n: np.ndarray,
         correspondence_dir = os.path.join(checkpoint_dir, 'correspondences')
     if save_correspondence_every > 0:
         os.makedirs(correspondence_dir, exist_ok=True)
+    boundary_debug_dir = os.path.join(checkpoint_dir, 'boundary_debug')
+    if save_boundary_debug_every > 0:
+        os.makedirs(boundary_debug_dir, exist_ok=True)
 
     def _save_epoch_checkpoint(epoch: int):
         if checkpoint_every <= 0 or epoch % checkpoint_every != 0:
@@ -304,6 +309,25 @@ def train_multi_patch(pts3n: np.ndarray,
                 output_ply_path=os.path.join(epoch_dir, 'all_patches_combined.ply'),
                 plot_direction=correspondence_line_segment,
             )
+
+    def _save_boundary_debug_snapshot(epoch: int):
+        if save_boundary_debug_every <= 0 or epoch % save_boundary_debug_every != 0:
+            return
+
+        epoch_dir = os.path.join(boundary_debug_dir, f'epoch_{epoch:05d}')
+        boundary_data = sample_outer_boundary_correspondence(
+            F_model=F,
+            n_boundary_samples=outer_boundary_samples,
+            device=device,
+        )
+        correspondence_vis.export_boundary_correspondence_debug(
+            model_batches=boundary_data['model_points'].detach().cpu().numpy(),
+            target_batches=boundary_data['target_points'].detach().cpu().numpy(),
+            patch_ids=boundary_data['patch_ids'].detach().cpu().numpy(),
+            edge_names=boundary_data['edge_names'],
+            output_dir=epoch_dir,
+            max_lines=min(correspondence_max_lines, outer_boundary_samples),
+        )
 
     zero = torch.tensor(0.0, device=device)
     vertex_features_init = F.complex.vertex_features.detach().clone()
@@ -448,6 +472,7 @@ def train_multi_patch(pts3n: np.ndarray,
             #     + ", ".join(f"v{i}={val:.6f}" for i, val in enumerate(vf_first)))
 
             _save_correspondence_snapshot(epoch, Q, tgt, D)
+            _save_boundary_debug_snapshot(epoch)
             _save_epoch_checkpoint(epoch)
 
     print(f"{'─'*60}\n")
@@ -645,6 +670,8 @@ def main():
                         help='[Multi-patch] Save an intermediate checkpoint every N epochs')
     parser.add_argument('--save_correspondence_every', type=int, default=500,
                         help='[Multi-patch] Save Chamfer correspondence CSV/PNG every N epochs (0 disables)')
+    parser.add_argument('--save_boundary_debug_every', type=int, default=100,
+                        help='[Multi-patch] Save outer-boundary model/rectangle correspondence debug every N epochs (0 disables)')
     parser.add_argument('--correspondence_max_lines', type=int, default=300,
                         help='[Multi-patch] Max correspondence lines drawn per saved PNG')
     parser.add_argument('--correspondence_line_segment', type=str, default='t_to_q', choices=['t_to_q', 'both', 'q_to_t'],
@@ -825,6 +852,7 @@ def main():
             pretrained_ckpt_path=ckpt_path if pretrained_F_state is not None else None,
             correspondence_dir=os.path.join(result_dir, 'correspondences'),
             save_correspondence_every=args.save_correspondence_every,
+            save_boundary_debug_every=args.save_boundary_debug_every,
             correspondence_max_lines=args.correspondence_max_lines,
             correspondence_line_segment=args.correspondence_line_segment,
         )
