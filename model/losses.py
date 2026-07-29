@@ -5,6 +5,115 @@ import math
 import torch
 
 
+def _sample_rectangle_patch_edge(n_rows: int,
+                                 n_cols: int,
+                                 row: int,
+                                 col: int,
+                                 edge_name: str,
+                                 t: torch.Tensor) -> torch.Tensor:
+    """
+    Sample the rectangle edge segment assigned to one specific outer patch.
+
+    The rectangle is partitioned exactly like the pretrained flat sheet:
+    each outer patch owns only its corresponding sub-segment of the global
+    rectangle perimeter, not the full side.
+    """
+    row_f = torch.full_like(t, float(row))
+    col_f = torch.full_like(t, float(col))
+
+    if edge_name == 'top':
+        global_u = (row_f + 0.0) / n_rows
+        global_v = (col_f + t) / n_cols
+    elif edge_name == 'bottom':
+        global_u = (row_f + 1.0) / n_rows
+        global_v = (col_f + t) / n_cols
+    elif edge_name == 'left':
+        global_u = (row_f + t) / n_rows
+        global_v = (col_f + 0.0) / n_cols
+    elif edge_name == 'right':
+        global_u = (row_f + t) / n_rows
+        global_v = (col_f + 1.0) / n_cols
+    else:
+        raise ValueError(f"Unknown rectangle edge: {edge_name}")
+
+    x = 2.0 * global_u - 1.0
+    y = 2.0 * global_v - 1.0
+    z = torch.zeros_like(x)
+    return torch.cat([x, y, z], dim=1)
+
+
+def outer_boundary_rectangle_loss(F_model,
+                                  active_patch_ids,
+                                  n_boundary_samples: int = 64,
+                                  loss_type: str = 'l1',
+                                  device: str = 'cuda'):
+    """
+    Match the true global outer border of the multi-patch sheet to the
+    rectangle boundary [-1,1]^2 x {0} using patch-aware correspondence.
+
+    Only patch edges on the outer grid boundary are constrained. Internal
+    shared edges are excluded. Each outer patch edge is matched only to its
+    own rectangle sub-segment, consistent with the flat-sheet pretraining.
+    """
+    if n_boundary_samples <= 0:
+        return torch.tensor(0.0, device=device)
+
+    active_patch_ids = {int(pid) for pid in active_patch_ids}
+    t = torch.linspace(0.0, 1.0, n_boundary_samples, device=device).unsqueeze(1)
+
+    if loss_type == 'l1':
+        point_loss = torch.nn.L1Loss(reduction='mean')
+    elif loss_type == 'mse':
+        point_loss = torch.nn.MSELoss(reduction='mean')
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}. Use 'l1' or 'mse'.")
+
+    total_loss = torch.tensor(0.0, device=device)
+    n_terms = 0
+
+    for row in range(F_model.n_rows):
+        for col in range(F_model.n_cols):
+            patch_id = row * F_model.n_cols + col
+            if patch_id not in active_patch_ids:
+                continue
+
+            if row == 0:
+                uv = torch.cat([torch.zeros_like(t), t], dim=1)
+                pred = F_model(patch_id, uv)
+                target = _sample_rectangle_patch_edge(
+                    F_model.n_rows, F_model.n_cols, row, col, 'top', t)
+                total_loss = total_loss + point_loss(pred, target)
+                n_terms += 1
+
+            if row == F_model.n_rows - 1:
+                uv = torch.cat([torch.ones_like(t), t], dim=1)
+                pred = F_model(patch_id, uv)
+                target = _sample_rectangle_patch_edge(
+                    F_model.n_rows, F_model.n_cols, row, col, 'bottom', t)
+                total_loss = total_loss + point_loss(pred, target)
+                n_terms += 1
+
+            if col == 0:
+                uv = torch.cat([t, torch.zeros_like(t)], dim=1)
+                pred = F_model(patch_id, uv)
+                target = _sample_rectangle_patch_edge(
+                    F_model.n_rows, F_model.n_cols, row, col, 'left', t)
+                total_loss = total_loss + point_loss(pred, target)
+                n_terms += 1
+
+            if col == F_model.n_cols - 1:
+                uv = torch.cat([t, torch.ones_like(t)], dim=1)
+                pred = F_model(patch_id, uv)
+                target = _sample_rectangle_patch_edge(
+                    F_model.n_rows, F_model.n_cols, row, col, 'right', t)
+                total_loss = total_loss + point_loss(pred, target)
+                n_terms += 1
+
+    if n_terms == 0:
+        return torch.tensor(0.0, device=device)
+    return total_loss / n_terms
+
+
 def mu_warmup_schedule(epoch: int, warmup_epochs: int, mu_target: float,
                        schedule: str = 'cosine',
                        delay_epochs: int = 300) -> float:
@@ -135,7 +244,7 @@ def tangent_loss_from_jac(t_u, t_v, mode='arap', eps=1e-4, scale_invariant=True)
     collapse = torch.relu(eps - S).pow(2).sum(dim=-1).mean()
 
     if mode == 'arap':
-        energy = ((S - 0.25) ** 2).sum(dim=-1).mean()
+        energy = ((S - 0.0625) ** 2).sum(dim=-1).mean()
     elif mode == 'arap_si':
         s_mean = S.mean(dim=-1, keepdim=True).detach()
         energy = ((S - s_mean) ** 2).sum(dim=-1).mean()
