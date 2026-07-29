@@ -220,7 +220,9 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
                                           n_images=n_images)
     n_textures = len(textures)
 
-    if active_patch_ids is None:
+    sample_all_patches = subdivision_depth < 0
+
+    if active_patch_ids is None or sample_all_patches:
         patch_ids = list(range(F.n_patches))
     else:
         patch_ids = [int(patch_idx) for patch_idx in active_patch_ids]
@@ -503,7 +505,9 @@ def main():
     parser.add_argument('--input_file', type=str, default=None,
                         help='Input point cloud used to build occupancy masks inside active patches')
     parser.add_argument('--subdivision_depth', type=int, default=1,
-                        help='Recursive subdivision depth inside each active patch for UV occupancy filtering')
+                        help='Recursive subdivision depth inside each active patch for UV occupancy filtering. '
+                            'Use 0 to keep only active patches without subdivision, and -1 to sample all UVs '
+                            'from every patch including empty/inactive ones.')
     parser.add_argument('--min_points_per_cell', type=int, default=10,
                         help='Minimum number of input points required for a subdivided UV cell to be kept')
     args = parser.parse_args()
