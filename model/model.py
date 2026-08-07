@@ -8,6 +8,108 @@ import torch
 import torch.nn as nn
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Mean Value Coordinates (MVC) — vectorized, differentiable PyTorch port
+#  of the demo's mvc.mvc_weights(). This is the core of the bilinear→MVC switch.
+# ─────────────────────────────────────────────────────────────────────────────
+def mvc_weights_torch(points: torch.Tensor,
+                      polys: torch.Tensor,
+                      eps: float = 1e-7,
+                      edge_eps: float = 1e-6) -> torch.Tensor:
+    """
+    Batched Mean Value Coordinates (Floater 2003).
+
+    Args
+    ----
+    points : (B, 2)      query points, one per row.
+    polys  : (B, K, 2)   the K polygon vertices for EACH query point, given in a
+                         consistent CCW order. In Phase 1 (regular grid) K == 4
+                         and the polygon is always the local-UV unit square, so
+                         the same square is broadcast to every row. In Phase 2
+                         (quadtree) K becomes the leaf's n-gon (corners + hanging
+                         nodes) and can differ per query — the math below is
+                         already written for the general K case.
+
+    Returns
+    -------
+    (B, K) weights, non-negative for convex polygons, summing to 1 per row.
+
+    Formula (tangent-of-half-angle):
+        tan(alpha_i / 2) = (r_i * r_{i+1} - <s_i, s_{i+1}>) / cross(s_i, s_{i+1})
+        w_i = ( tan(alpha_{i-1}/2) + tan(alpha_i/2) ) / r_i
+    where s_i = v_i - p and r_i = |s_i|.
+
+    Two degenerate cases are handled exactly like the demo:
+      * Case A — query coincides with a vertex  -> one-hot on that vertex.
+      * Case B — query lies ON an edge          -> LINEAR interpolation between
+        that edge's two endpoints. This is the "on the edge we only use linear
+        interpolation" rule you asked for, and it is what keeps neighbouring
+        patches continuous when hanging nodes appear in Phase 2. Note it is not
+        a hack: as p approaches an edge, MVC naturally converges to linear
+        interpolation along it; Case B just evaluates that limit robustly.
+    """
+    B, K, _ = polys.shape
+
+    s = polys - points.unsqueeze(1)                    # (B, K, 2) vectors p->v_i
+    r = torch.linalg.norm(s, dim=-1)                   # (B, K) distances
+
+    # "next" vertex (i -> i+1), wrapping around the polygon.
+    s_nxt = torch.roll(s, shifts=-1, dims=1)           # (B, K, 2)
+    r_nxt = torch.roll(r, shifts=-1, dims=1)           # (B, K)
+
+    # cross / dot per edge (i, i+1); indexed by the edge's start vertex i.
+    cross = s[..., 0] * s_nxt[..., 1] - s[..., 1] * s_nxt[..., 0]   # (B, K)
+    dot = (s * s_nxt).sum(dim=-1)                                   # (B, K)
+
+    # tan(alpha_i / 2). Clamp the denominator so degenerate rows stay FINITE
+    # (never inf/nan): those rows are overwritten below via Case A / Case B, but
+    # keeping them finite avoids the classic torch.where 0*inf=nan grad trap.
+    safe_cross = torch.where(cross.abs() < eps,
+                             torch.full_like(cross, eps), cross)
+    tan_half = (r * r_nxt - dot) / safe_cross          # (B, K), edge i
+    tan_half_prev = torch.roll(tan_half, shifts=1, dims=1)  # tan(alpha_{i-1}/2)
+
+    r_safe = torch.where(r < eps, torch.full_like(r, eps), r)
+    w = (tan_half_prev + tan_half) / r_safe            # (B, K) unnormalized
+
+    # --- interior (generic) case: normalize ---------------------------------
+    w_sum = w.sum(dim=1, keepdim=True)
+    w_sum = torch.where(w_sum.abs() < eps, torch.ones_like(w_sum), w_sum)
+    w_interior = w / w_sum
+
+    # --- Case B: query on an edge -> linear interpolation on that edge -------
+    # An edge (i, i+1) contains p iff p is collinear (cross≈0) AND between the
+    # endpoints (dot<0, i.e. the vectors to the two endpoints point opposite).
+    on_edge = (cross.abs() < edge_eps) & (dot < 0.0)   # (B, K) flagged at edge i
+    any_edge = on_edge.any(dim=1)                      # (B,)
+
+    ei = on_edge.to(w.dtype)
+    denom_edge = torch.where((r + r_nxt) < eps,
+                             torch.ones_like(r), r + r_nxt)
+    w_i = (r_nxt / denom_edge) * ei                    # weight to vertex i
+    w_ip1 = (r / denom_edge) * ei                      # weight to vertex i+1
+    w_ip1_at_next = torch.roll(w_ip1, shifts=1, dims=1)  # place at position i+1
+    w_edge = w_i + w_ip1_at_next
+    w_edge_sum = w_edge.sum(dim=1, keepdim=True)       # guards double-flag corners
+    w_edge_sum = torch.where(w_edge_sum.abs() < eps,
+                             torch.ones_like(w_edge_sum), w_edge_sum)
+    w_edge = w_edge / w_edge_sum
+
+    # --- Case A: query on a vertex -> one-hot -------------------------------
+    on_vertex = r < eps                                # (B, K)
+    any_vertex = on_vertex.any(dim=1)                  # (B,)
+    w_vert = on_vertex.to(w.dtype)
+    w_vert_sum = w_vert.sum(dim=1, keepdim=True)
+    w_vert_sum = torch.where(w_vert_sum.abs() < eps,
+                             torch.ones_like(w_vert_sum), w_vert_sum)
+    w_vert = w_vert / w_vert_sum
+
+    # priority: vertex  >  edge  >  interior
+    out = torch.where(any_edge.unsqueeze(1), w_edge, w_interior)
+    out = torch.where(any_vertex.unsqueeze(1), w_vert, out)
+    return out
+
+
 # Neural network architecture
 class PositionalEncoding(nn.Module):
     """Apply sin/cos Fourier features to the input coordinates."""
@@ -93,13 +195,23 @@ class InverseMap(nn.Module):
         return self.net(x)
 
 
-
 # Feature complex and multi-patch maps.
 class FeatureComplex(nn.Module):
     """
     Grid-based feature complex with shared vertex features.
 
     Adjacent patches share corner features, which enforces C0 continuity.
+
+    PHASE 1 CHANGE (bilinear -> MVC)
+    --------------------------------
+    `interpolate` previously blended the 4 corner features BILINEARLY. It now
+    blends them with MEAN VALUE COORDINATES. On the regular grid each patch is
+    the local-UV unit square, so the MVC polygon is just the 4 corners in CCW
+    order. MVC is a strict generalization of the bilinear-on-a-square idea that
+    (a) stays continuous across shared edges, and (b) extends unchanged to the
+    n-gon leaf polygons the quadtree will produce in Phase 2. Along any patch
+    edge MVC reduces to LINEAR interpolation between that edge's two endpoints,
+    which is exactly the property that makes hanging nodes seamless later.
     """
     def __init__(self, n_rows: int, n_cols: int, d_features: int = 64):
         super().__init__()
@@ -111,6 +223,16 @@ class FeatureComplex(nn.Module):
         self.vertex_features = nn.Parameter(
             torch.randn(n_vertices, d_features) * 0.1
         )
+
+        # Local-UV coordinates of the 4 patch corners, in CCW order.
+        # This order MUST match the feature-gather order used in interpolate():
+        #   (0,0) -> z00 , (1,0) -> z10 , (1,1) -> z11 , (0,1) -> z01
+        corner_uv = torch.tensor(
+            [[0.0, 0.0],
+             [1.0, 0.0],
+             [1.0, 1.0],
+             [0.0, 1.0]], dtype=torch.float32)
+        self.register_buffer('corner_uv', corner_uv)  # (4, 2)
 
     def _corner_indices(self, row, col):
         """
@@ -130,39 +252,29 @@ class FeatureComplex(nn.Module):
 
     def interpolate(self, row, col, uv):
         """
-        Bilinearly interpolate vertex features.
+        MVC-interpolate the shared vertex features across a patch.
 
         Args:
-            row, col: Patch grid positions per sample.
-            uv: UV coordinates in `[0, 1]`.
+            row, col: Patch grid positions per sample (each shape (B,)).
+            uv: Local UV coordinates in `[0, 1]`, shape (B, 2).
         Returns:
-            Interpolated feature tensor.
+            Interpolated feature tensor, shape (B, d_features).
         """
         i00, i01, i10, i11 = self._corner_indices(row, col)
         vf = self.vertex_features
-        z00 = vf[i00]
-        z01 = vf[i01]
-        z10 = vf[i10]
-        z11 = vf[i11]
 
-        u = uv[:, 0:1]
-        v = uv[:, 1:2]
+        # Gather corner features in the SAME CCW order as self.corner_uv:
+        #   [z00, z10, z11, z01]
+        z = torch.stack([vf[i00], vf[i10], vf[i11], vf[i01]], dim=1)  # (B, 4, d)
 
-        # Force u, v = 0 for debugging interpolation.
-        # u = torch.zeros_like(u)
-        # v = torch.zeros_like(v)
+        # Broadcast the local-UV unit square to every query point.
+        polys = self.corner_uv.unsqueeze(0).expand(uv.shape[0], -1, -1)  # (B,4,2)
 
-        features = ((1 - u) * (1 - v) * z00 +
-                    (1 - u) * v * z01 +
-                    u * (1 - v) * z10 +
-                    u * v * z11)
-        
-        # print("Feature Result: ", features[0])
-        # print("Check interpolation z00: ", z00[0])
-        # print("Check interpolation z01: ", z01[0])
-        # print("Check interpolation z10: ", z10[0])
-        # print("Check interpolation z11: ", z11[0])
+        # Mean value coordinates of uv w.r.t. the 4 corners.
+        w = mvc_weights_torch(uv, polys)               # (B, 4)
 
+        # Weighted combination of corner features.
+        features = torch.einsum('bk,bkd->bd', w, z)    # (B, d)
         return features
 
 
@@ -244,12 +356,16 @@ class MultiPatchForwardMap(nn.Module):
 
         return correction
 
+
 class MultiPatchInverseMap(nn.Module):
     """
     Multi-patch inverse map from 3D points to local UV coordinates.
 
-    The model encodes points into feature space, then recovers UV values by
-    de-interpolating the shared corner features.
+    NOTE (Phase 1): `de_interpolate` analytically inverts BILINEAR interpolation
+    and therefore no longer matches the forward map now that F uses MVC. Per the
+    project decision this inverse map is a deprecated experiment and is NOT used
+    by the training loop, so it is left untouched. Do not rely on cycle
+    consistency through G while MVC is active.
     """
     def __init__(self, feature_complex: FeatureComplex, d_features: int = 64,
                  L: int = 0, W: int = 256, D: int = 6, beta: float = 5.0):
@@ -280,13 +396,9 @@ class MultiPatchInverseMap(nn.Module):
 
     def de_interpolate(self, patch_idx, z_pred: torch.Tensor) -> torch.Tensor:
         """
-        Recover UV coordinates from predicted features.
+        Recover UV coordinates from predicted features (bilinear inverse).
 
-        Args:
-            patch_idx: Patch index or batch of patch indices.
-            z_pred: Predicted feature vectors.
-        Returns:
-            UV coordinates.
+        DEPRECATED under MVC — see class docstring.
         """
         B = z_pred.shape[0]
         if not torch.is_tensor(patch_idx):
