@@ -10,3 +10,4 @@ utils/vis_obj.py
 *.obj
 *.json
 run.sh
+demo/*
