@@ -28,6 +28,174 @@ import matplotlib.gridspec as gridspec
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib import cm
 
+
+class QuadtreeNode:
+    """One quadtree cell in integer lattice coordinates."""
+
+    __slots__ = ("ix", "iy", "isize", "depth", "children",
+                 "leaf_id", "empty", "count", "polygon")
+
+    def __init__(self, ix, iy, isize, depth):
+        self.ix = ix
+        self.iy = iy
+        self.isize = isize
+        self.depth = depth
+        self.children = None
+        self.leaf_id = -1
+        self.empty = True
+        self.count = 0
+        self.polygon = None
+
+    @property
+    def is_leaf(self):
+        return self.children is None
+
+
+class Quadtree:
+    """Adaptive top-view quadtree and its shared leaf-boundary vertices."""
+
+    def __init__(self, root, leaves, grid, vertices, vertex_ids,
+                 point_patch, points, global_uv):
+        self.root = root
+        self.leaves = leaves
+        self.grid = grid
+        self.vertices = vertices
+        self.vertex_ids = vertex_ids
+        self.point_patch = point_patch
+        self.points = points
+        self.global_uv = global_uv
+
+    @property
+    def patches(self):
+        return [leaf for leaf in self.leaves if not leaf.empty]
+
+    def locate(self, u, v):
+        if not (0.0 <= u <= 1.0 and 0.0 <= v <= 1.0):
+            return None
+        node = self.root
+        while not node.is_leaf:
+            half = node.isize / 2
+            mid_u = (node.ix + half) / self.grid
+            mid_v = (node.iy + half) / self.grid
+            right = 1 if u >= mid_u else 0
+            upper = 2 if v >= mid_v else 0
+            node = node.children[right + upper]
+        return node
+
+
+def quadtree_subdivision(points: np.ndarray, max_points: int = 200,
+                         max_depth: int = 6,
+                         axes=(0, 1)) -> Quadtree:
+    """Build an adaptive quadtree from a top-view projection of 3D points.
+
+    The selected coordinate axes are normalized independently to ``[0, 1]``.
+    The root is always split into four quadrants when it contains more than
+    ``max_points`` and ``max_depth`` has not been reached. Each non-empty cell
+    follows the same rule recursively; empty children remain leaves and are
+    never subdivided.
+
+    The returned object follows the data model used by ``demo/quadtree.py``:
+    leaves have stable ids, corners are shared through one vertex table, and
+    coarse leaf polygons include hanging vertices from finer neighbors.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] < 2:
+        raise ValueError(f"points must have shape (N, >=2), got {points.shape}")
+    if len(axes) != 2 or axes[0] == axes[1] or any(ax >= points.shape[1] for ax in axes):
+        raise ValueError(f"axes must contain two distinct valid coordinate indices, got {axes}")
+    if max_points < 1 or max_depth < 0:
+        raise ValueError("max_points must be positive and max_depth non-negative")
+
+    global_uv = np.column_stack([
+        _normalize_01(points[:, axes[0]]),
+        _normalize_01(points[:, axes[1]]),
+    ])
+    grid = 1 << max_depth
+    integer_uv = np.clip((global_uv * grid).astype(np.int64), 0, grid - 1)
+    leaves = []
+    point_patch = np.full(len(points), -1, dtype=np.int64)
+
+    def recurse(ix, iy, isize, depth, indices):
+        node = QuadtreeNode(ix, iy, isize, depth)
+        if indices.size == 0 or indices.size <= max_points \
+                or depth >= max_depth or isize <= 1:
+            node.leaf_id = len(leaves)
+            node.empty = indices.size == 0
+            node.count = int(indices.size)
+            if indices.size:
+                point_patch[indices] = node.leaf_id
+            leaves.append(node)
+            return node
+
+        half = isize // 2
+        right = integer_uv[indices, 0] >= ix + half
+        upper = integer_uv[indices, 1] >= iy + half
+        quadrant = right.astype(np.int64) + 2 * upper.astype(np.int64)
+        node.children = [
+            recurse(ix, iy, half, depth + 1, indices[quadrant == 0]),
+            recurse(ix + half, iy, half, depth + 1, indices[quadrant == 1]),
+            recurse(ix, iy + half, half, depth + 1, indices[quadrant == 2]),
+            recurse(ix + half, iy + half, half, depth + 1, indices[quadrant == 3]),
+        ]
+        return node
+
+    root = recurse(0, 0, grid, 0, np.arange(len(points), dtype=np.int64))
+
+    vertex_ids = {}
+    vertices = []
+
+    def key(ix, iy):
+        return int(iy) * (grid + 1) + int(ix)
+
+    def add_vertex(ix, iy):
+        vertex_key = key(ix, iy)
+        if vertex_key not in vertex_ids:
+            vertex_ids[vertex_key] = len(vertices)
+            vertices.append((ix / grid, iy / grid))
+        return vertex_ids[vertex_key]
+
+    for leaf in leaves:
+        add_vertex(leaf.ix, leaf.iy)
+        add_vertex(leaf.ix + leaf.isize, leaf.iy)
+        add_vertex(leaf.ix + leaf.isize, leaf.iy + leaf.isize)
+        add_vertex(leaf.ix, leaf.iy + leaf.isize)
+
+    horizontal = {}
+    vertical = {}
+    for vertex_key, vertex_id in vertex_ids.items():
+        iy, ix = divmod(vertex_key, grid + 1)
+        horizontal.setdefault(iy, []).append((ix, vertex_id))
+        vertical.setdefault(ix, []).append((iy, vertex_id))
+    for values in horizontal.values():
+        values.sort()
+    for values in vertical.values():
+        values.sort()
+
+    def between(index, line, start, end):
+        lo, hi = min(start, end), max(start, end)
+        return [(coord, vid) for coord, vid in index.get(line, [])
+                if lo < coord < hi]
+
+    for leaf in leaves:
+        if leaf.empty:
+            continue
+        x0, y0 = leaf.ix, leaf.iy
+        x1, y1 = x0 + leaf.isize, y0 + leaf.isize
+        polygon = [vertex_ids[key(x0, y0)]]
+        polygon.extend(vid for _, vid in sorted(between(horizontal, y0, x0, x1)))
+        polygon.append(vertex_ids[key(x1, y0)])
+        polygon.extend(vid for _, vid in sorted(between(vertical, x1, y0, y1)))
+        polygon.append(vertex_ids[key(x1, y1)])
+        polygon.extend(vid for _, vid in sorted(
+            between(horizontal, y1, x0, x1), reverse=True))
+        polygon.append(vertex_ids[key(x0, y1)])
+        polygon.extend(vid for _, vid in sorted(
+            between(vertical, x0, y0, y1), reverse=True))
+        leaf.polygon = polygon
+
+    return Quadtree(root, leaves, grid, np.asarray(vertices, dtype=np.float64),
+                    vertex_ids, point_patch, points, global_uv)
+
 def poisson_spectral_segmentation(points, normals, n_patches_u=4, n_patches_v=4,
                                    poisson_depth=8, trim_quantile=0.1,
                                    export_mesh_path=None):

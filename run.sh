@@ -5,13 +5,13 @@
 
 FILE="noisy_data_2_normals.xyz"
 INPUT_FILE="data/${FILE}"
-OUTPUT_DIR="logs/boundaryFix/${FILE%.*}"
+OUTPUT_DIR="logs/quadtree/${FILE%.*}"
 
 python main.py \
     --multi_patch \
     --pretrain_then_train \
     --result_dir ${OUTPUT_DIR} \
-    --pretrain_epochs 10000 \
+    --pretrain_epochs 100 \
     --epochs 2000 \
     --n_patches 16 \
     --d_features 88 \
@@ -34,15 +34,17 @@ python main.py \
     --mu_warmup_delay 300 \
     --schedule cosine \
     --checkpoint_every 200 \
+    --quadtree_max_points 2000 \
+    --quadtree_max_depth 4
 
 REAL_OUTPUT_DIR="${OUTPUT_DIR}"
 
-python utils/patch_vis.py \
-    --ckpt ${REAL_OUTPUT_DIR}/checkpoint.pt \
-    --out_dir ${REAL_OUTPUT_DIR} \
-    --n_images 1 \
-    --input_file ${INPUT_FILE} \
-    --subdivision_depth "-1"
+# python utils/patch_vis.py \
+#     --ckpt ${REAL_OUTPUT_DIR}/checkpoint.pt \
+#     --out_dir ${REAL_OUTPUT_DIR} \
+#     --n_images 1 \
+#     --input_file ${INPUT_FILE} \
+#     --subdivision_depth "-1"
 
 # python main.py \
 #     --file ${INPUT_FILE} \

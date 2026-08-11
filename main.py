@@ -36,9 +36,75 @@ try:
 except ImportError:
     o3d = None
 
+
+def _visualize_quadtree_segmentation(tree, points, save_path):
+    """Save the adaptive quadtree layout and its point assignments."""
+    leaf_count = len(tree.leaves)
+    cmap = plt.get_cmap('tab20', max(leaf_count, 1))
+    fig = plt.figure(figsize=(16, 10))
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.28, wspace=0.22)
+
+    def draw_leaf_boxes(ax, filled=False):
+        counts = np.asarray([leaf.count for leaf in tree.leaves], dtype=float)
+        max_count = max(counts.max(), 1.0)
+        for lid, leaf in enumerate(tree.leaves):
+            x0 = leaf.ix / tree.grid
+            y0 = leaf.iy / tree.grid
+            size = leaf.isize / tree.grid
+            face = cmap(lid) if filled else 'none'
+            alpha = 0.55 if filled else 1.0
+            ax.add_patch(plt.Rectangle(
+                (x0, y0), size, size, facecolor=face,
+                edgecolor='black', linewidth=0.45, alpha=alpha))
+            if size >= 1.0 / (tree.grid * 4):
+                ax.text(x0 + size / 2, y0 + size / 2, str(lid),
+                        ha='center', va='center', fontsize=5)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_aspect('equal')
+        ax.set_xlabel('u')
+        ax.set_ylabel('v')
+
+    ax0 = fig.add_subplot(gs[0, 0], projection='3d')
+    ax0.scatter(points[:, 0], points[:, 1], points[:, 2],
+                c=tree.point_patch, cmap='tab20', s=2, alpha=0.7,
+                vmin=0, vmax=max(leaf_count - 1, 1))
+    ax0.set_title('3D Points Colored by Quadtree Leaf')
+    ax0.set_xlabel('x')
+    ax0.set_ylabel('y')
+    ax0.set_zlabel('z')
+
+    ax1 = fig.add_subplot(gs[0, 1])
+    ax1.scatter(tree.global_uv[:, 0], tree.global_uv[:, 1],
+                c=tree.point_patch, cmap='tab20', s=3, alpha=0.7,
+                vmin=0, vmax=max(leaf_count - 1, 1))
+    draw_leaf_boxes(ax1)
+    ax1.set_title('Top View UV with Leaf Boundaries')
+
+    ax2 = fig.add_subplot(gs[1, 0])
+    draw_leaf_boxes(ax2, filled=True)
+    ax2.set_title('Quadtree Leaves (IDs and Occupancy)')
+
+    ax3 = fig.add_subplot(gs[1, 1])
+    draw_leaf_boxes(ax3)
+    if len(tree.vertices):
+        ax3.scatter(tree.vertices[:, 0], tree.vertices[:, 1],
+                    c='crimson', s=13, zorder=4)
+    ax3.set_title('Shared Vertices and Hanging-Node Boundaries')
+
+    fig.suptitle(
+        f'Quadtree Segmentation | leaves={leaf_count} | '
+        f'non-empty={len(tree.patches)} | vertices={len(tree.vertices)}',
+        fontsize=13)
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Quadtree visualization saved to: {save_path}")
+
 # Multi-patch training.
 def train_multi_patch(pts3n: np.ndarray,
                       n_patches: int = 4,
+                      quadtree_max_points: int = 200,
+                      quadtree_max_depth: int = 6,
                       d_features: int = 64,
                       epochs: int = 5000,
                       M: int = 4096,
@@ -82,7 +148,27 @@ def train_multi_patch(pts3n: np.ndarray,
     Expensive regularizers can be evaluated every `reg_every` steps instead of
     every iteration.
     """
-    # Grid dimensions.
+    # Build the adaptive top-view segmentation for inspection. The current
+    # rectangular model below still consumes the legacy grid assignment; this
+    # keeps this first migration step isolated from training changes.
+    quadtree = pc_presegmentation.quadtree_subdivision(
+        pts3n,
+        max_points=quadtree_max_points,
+        max_depth=quadtree_max_depth,
+        axes=(0, 1),
+    )
+    print(f"  Quadtree layout: {len(quadtree.leaves)} leaves, "
+          f"{len(quadtree.patches)} non-empty, "
+          f"{len(quadtree.vertices)} shared vertices")
+    if save_patch_vis:
+        if vis_dir is None:
+            vis_dir = os.getcwd()
+        os.makedirs(vis_dir, exist_ok=True)
+        _visualize_quadtree_segmentation(
+            quadtree, pts3n,
+            os.path.join(vis_dir, 'patch_assignments.png'))
+
+    # Grid dimensions for the legacy training path.
     n_rows, n_cols = pc_presegmentation.compute_grid_dims(n_patches)
     actual_n_patches = n_rows * n_cols
     print(f"  Grid layout: {n_rows} rows × {n_cols} cols = {actual_n_patches} patches")
@@ -139,11 +225,11 @@ def train_multi_patch(pts3n: np.ndarray,
             utils._visualize_patch_assignments(
                 pts_vis, asg_vis, grid_topology, pp_vis,
                 n_rows, n_cols,
-                save_path=os.path.join(vis_dir, 'patch_assignments.png')
+                save_path=os.path.join(vis_dir, 'grid_patch_assignments.png')
             )
             utils._visualize_patch_assignments_3d(
                 pts_vis, asg_vis, grid_topology, n_rows, n_cols,
-                save_path=os.path.join(vis_dir, 'patch_assignments_3d.png')
+                save_path=os.path.join(vis_dir, 'grid_patch_assignments_3d.png')
             )
         except Exception as e:
             print(f"  [warn] patch visualization skipped ({type(e).__name__}: {e})")
@@ -644,6 +730,10 @@ def main():
     # Multi patch specific args
     parser.add_argument('--n_patches', type=int, default=4,
                         help='[Multi-patch] Number of patches (factored into grid)')
+    parser.add_argument('--quadtree_max_points', type=int, default=200,
+                        help='[Quadtree debug] Split occupied cells above this point count')
+    parser.add_argument('--quadtree_max_depth', type=int, default=6,
+                        help='[Quadtree debug] Maximum recursive subdivision depth')
     parser.add_argument('--d_features', type=int, default=88,
                         help='[Multi-patch] Vertex feature dimension')
     parser.add_argument('--M_per_patch', type=int, default=4096,
@@ -809,6 +899,8 @@ def main():
         F_model, G_model, history, assignments, active_ids = train_multi_patch(
             pts3n,
             n_patches=args.n_patches,
+            quadtree_max_points=args.quadtree_max_points,
+            quadtree_max_depth=args.quadtree_max_depth,
             d_features=args.d_features,
             epochs=args.epochs,
             M=args.M,
