@@ -343,6 +343,79 @@ def axis_aligned_grid_segmentation(points, n_patches_u=4, n_patches_v=4,
     return patch_assignments, grid_topology, patch_params
 
 
+def two_sheet_axis_aligned_segmentation(points,
+                                        n_patches_u=2,
+                                        n_patches_v=2,
+                                        split_axis=2,
+                                        side_axes=(0, 1),
+                                        split_value=None):
+    """
+    Segment a point cloud into two axis-aligned sheets, each with its own grid.
+
+    The cloud is first split into two sides using one coordinate axis, then each
+    side is segmented independently with axis-aligned 2D binning. Patch ids are
+    flattened globally across both sides.
+
+    Args:
+        points: (N, 3) point positions.
+        n_patches_u: grid rows per side.
+        n_patches_v: grid cols per side.
+        split_axis: coordinate axis used to split the cloud into two sides.
+        side_axes: coordinate axes used for per-side 2D axis-aligned segmentation.
+        split_value: optional threshold on `split_axis`. If None, uses the median.
+
+    Returns:
+        assignments: (N,) global patch ids in [0, 2*n_patches_u*n_patches_v).
+        grid_topology: (2, n_patches_u, n_patches_v) patch ids per side.
+        patch_params: (N, 2) local per-side normalized UV coordinates.
+        side_assignments: (N,) side id in {0, 1}.
+    """
+    points = np.asarray(points)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points must have shape (N, 3), got {points.shape}")
+    if split_axis not in (0, 1, 2):
+        raise ValueError(f"split_axis must be one of (0, 1, 2), got {split_axis}")
+    if len(side_axes) != 2:
+        raise ValueError(f"side_axes must contain exactly two entries, got {side_axes}")
+    if side_axes[0] == side_axes[1]:
+        raise ValueError(f"side_axes must be different, got {side_axes}")
+    if any(ax not in (0, 1, 2) for ax in side_axes):
+        raise ValueError(f"side_axes must be chosen from (0, 1, 2), got {side_axes}")
+
+    if split_value is None:
+        split_value = float(np.median(points[:, split_axis]))
+
+    side_assignments = np.zeros(points.shape[0], dtype=np.int32)
+    side_assignments[points[:, split_axis] < split_value] = 1
+
+    patches_per_side = n_patches_u * n_patches_v
+    assignments = np.full(points.shape[0], -1, dtype=np.int32)
+    patch_params = np.zeros((points.shape[0], 2), dtype=np.float32)
+    grid_topology = np.stack([
+        np.arange(patches_per_side, dtype=np.int32).reshape(n_patches_u, n_patches_v),
+        (np.arange(patches_per_side, dtype=np.int32) + patches_per_side).reshape(n_patches_u, n_patches_v),
+    ], axis=0)
+
+    for side in range(2):
+        mask = side_assignments == side
+        pts_side = points[mask]
+        if pts_side.shape[0] == 0:
+            continue
+
+        u = _normalize_01(pts_side[:, side_axes[0]])
+        v = _normalize_01(pts_side[:, side_axes[1]])
+
+        u_bins = np.clip((u * n_patches_u).astype(int), 0, n_patches_u - 1)
+        v_bins = np.clip((v * n_patches_v).astype(int), 0, n_patches_v - 1)
+        local_patch_ids = u_bins * n_patches_v + v_bins
+        global_patch_ids = local_patch_ids + side * patches_per_side
+
+        assignments[mask] = global_patch_ids.astype(np.int32)
+        patch_params[mask] = np.stack([u, v], axis=1).astype(np.float32)
+
+    return assignments, grid_topology, patch_params, side_assignments
+
+
 
 # Helper functions
 def _normalize_01(x):
@@ -539,26 +612,38 @@ def presegment(points, normals=None, method='poisson_spectral',
         assignments, grid, params = axis_aligned_grid_segmentation(
             points, n_patches_u, n_patches_v, **kwargs
         )
+    elif method == 'two_sheet_axis_aligned':
+        assignments, grid, params, side_assignments = two_sheet_axis_aligned_segmentation(
+            points, n_patches_u, n_patches_v, **kwargs
+        )
     else:
         raise ValueError(f"Unknown method: {method}. "
-                        f"Choose from: poisson_spectral, spectral_direct, pca_grid, axis_aligned_grid")
+                        f"Choose from: poisson_spectral, spectral_direct, pca_grid, axis_aligned_grid, two_sheet_axis_aligned")
 
     # Print statistics
-    n_patches = n_patches_u * n_patches_v
+    n_patches = int(assignments.max()) + 1 if assignments.size > 0 else n_patches_u * n_patches_v
     counts = np.bincount(assignments, minlength=n_patches)
     print(f"[{method}] Patch statistics:")
     print(f"  Total points: {len(points)}")
-    print(f"  Grid: {n_patches_u} × {n_patches_v} = {n_patches} patches")
+    if method == 'two_sheet_axis_aligned':
+        print(f"  Two sheets: 2 × ({n_patches_u} × {n_patches_v}) = {n_patches} patches")
+        side_counts = np.bincount(side_assignments, minlength=2)
+        print(f"  Side split counts: side0={side_counts[0]}, side1={side_counts[1]}")
+    else:
+        print(f"  Grid: {n_patches_u} × {n_patches_v} = {n_patches} patches")
     print(f"  Points per patch: min={counts[counts>0].min()}, "
           f"max={counts.max()}, mean={counts[counts>0].mean():.0f}")
     print(f"  Empty patches: {(counts == 0).sum()}")
 
-    return {
+    result = {
         'assignments': assignments,
         'grid': grid,
         'params': params,
         'method': method,
     }
+    if method == 'two_sheet_axis_aligned':
+        result['side_assignments'] = side_assignments
+    return result
 
 
 

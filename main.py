@@ -30,13 +30,85 @@ from model.losses import (boundary_chamfer_loss, chamfer_1d,
                                              tangent_fold_loss,
                                              tangent_loss_from_jac)
 from model.model import (FeatureComplex, ForwardMap, InverseMap, MultiPatchForwardMap,
-                   MultiPatchInverseMap, PositionalEncoding, SkipMLP)
+           MultiPatchInverseMap, PositionalEncoding, SkipMLP,
+           TwoSheetForwardMap)
 try:
     import open3d as o3d
 except ImportError:
     o3d = None
 
-# Multi-patch training.
+# Multi-patch training with a single or two-sheet atlas.
+def _build_forward_model(atlas_mode: str,
+                         n_patches: int,
+                         d_features: int,
+                         L: int,
+                         W: int,
+                         D: int,
+                         beta: float,
+                         device: str,
+                         two_sheet_side_rows: int = 2,
+                         two_sheet_side_cols: int = 2):
+    """Create the forward model for the selected atlas configuration."""
+    if atlas_mode == 'single_sheet':
+        n_rows, n_cols = pc_presegmentation.compute_grid_dims(n_patches)
+        F = MultiPatchForwardMap(n_rows, n_cols, d_features,
+                                 L=L, W=W, D=D, beta=beta).to(device)
+        atlas_info = {
+            'atlas_mode': atlas_mode,
+            'n_rows': n_rows,
+            'n_cols': n_cols,
+            'actual_n_patches': n_rows * n_cols,
+            'n_sides': 1,
+            'patches_per_side': n_rows * n_cols,
+        }
+        return F, atlas_info
+
+    if atlas_mode == 'two_sheet':
+        n_rows = two_sheet_side_rows
+        n_cols = two_sheet_side_cols
+        F = TwoSheetForwardMap(n_rows=n_rows, n_cols=n_cols, d_features=d_features,
+                               L=L, W=W, D=D, beta=beta).to(device)
+        atlas_info = {
+            'atlas_mode': atlas_mode,
+            'n_rows': n_rows,
+            'n_cols': n_cols,
+            'actual_n_patches': F.n_patches,
+            'n_sides': F.n_sides,
+            'patches_per_side': F.patches_per_side,
+        }
+        return F, atlas_info
+
+    raise ValueError(f"Unknown atlas_mode: {atlas_mode}")
+
+
+def _run_presegmentation(pts3n: np.ndarray,
+                         atlas_mode: str,
+                         n_rows: int,
+                         n_cols: int,
+                         two_sheet_split_axis: int = 2,
+                         two_sheet_side_axes=(0, 1)):
+    """Run the segmentation strategy matching the selected atlas configuration."""
+    if atlas_mode == 'single_sheet':
+        assignments, grid_topology, patch_params = pc_presegmentation.axis_aligned_grid_segmentation(
+            pts3n, n_rows, n_cols
+        )
+        return assignments, grid_topology, patch_params, None
+
+    if atlas_mode == 'two_sheet':
+        assignments, grid_topology, patch_params, side_assignments = (
+            pc_presegmentation.two_sheet_axis_aligned_segmentation(
+                pts3n,
+                n_patches_u=n_rows,
+                n_patches_v=n_cols,
+                split_axis=two_sheet_split_axis,
+                side_axes=two_sheet_side_axes,
+            )
+        )
+        return assignments, grid_topology, patch_params, side_assignments
+
+    raise ValueError(f"Unknown atlas_mode: {atlas_mode}")
+
+
 def train_multi_patch(pts3n: np.ndarray,
                       n_patches: int = 4,
                       d_features: int = 64,
@@ -75,17 +147,38 @@ def train_multi_patch(pts3n: np.ndarray,
                       save_correspondence_every: int = 0,
                       save_boundary_debug_every: int = 0,
                       correspondence_max_lines: int = 300,
-                      correspondence_line_segment: str = 't_to_q'):
+                      correspondence_line_segment: str = 't_to_q',
+                      atlas_mode: str = 'single_sheet',
+                      two_sheet_side_rows: int = 2,
+                      two_sheet_side_cols: int = 2,
+                      two_sheet_split_axis: int = 2,
+                      two_sheet_side_axes=(0, 1)):
     """
     Train the multi-patch model and inverse map.
 
     Expensive regularizers can be evaluated every `reg_every` steps instead of
     every iteration.
     """
-    # Grid dimensions.
-    n_rows, n_cols = pc_presegmentation.compute_grid_dims(n_patches)
-    actual_n_patches = n_rows * n_cols
-    print(f"  Grid layout: {n_rows} rows × {n_cols} cols = {actual_n_patches} patches")
+    F, atlas_info = _build_forward_model(
+        atlas_mode=atlas_mode,
+        n_patches=n_patches,
+        d_features=d_features,
+        L=L,
+        W=W,
+        D=D,
+        beta=beta,
+        device=device,
+        two_sheet_side_rows=two_sheet_side_rows,
+        two_sheet_side_cols=two_sheet_side_cols,
+    )
+    n_rows = atlas_info['n_rows']
+    n_cols = atlas_info['n_cols']
+    actual_n_patches = atlas_info['actual_n_patches']
+
+    if atlas_mode == 'single_sheet':
+        print(f"  Grid layout: {n_rows} rows × {n_cols} cols = {actual_n_patches} patches")
+    else:
+        print(f"  Two-sheet layout: {atlas_info['n_sides']} sides × ({n_rows} rows × {n_cols} cols) = {actual_n_patches} patches")
 
     if gamma > 0:
         assert normals is not None, "normals must be provided when gamma > 0"
@@ -93,25 +186,13 @@ def train_multi_patch(pts3n: np.ndarray,
             f"Normals shape {normals.shape} != points shape {pts3n.shape}"
         print(f"  Normal constraint active (γ={gamma}), normals shape: {normals.shape}")
 
-    # Default pre-segmentation.
-    # assignments, grid_topology, patch_params = pc_presegmentation.pca_grid_segmentation(
-    #     pts3n, n_rows, n_cols
-    # )
-    
-    # Alternative: Poisson spectral segmentation.
-    # assignments, grid_topology, patch_params = pc_presegmentation.poisson_spectral_segmentation(
-    #     pts3n, normals, n_patches_u=n_rows, n_patches_v=n_cols,
-    #     export_mesh_path=output_psr_mesh_path
-    # )
-
-    # Alternative: spectral segmentation.
-    # assignments, grid_topology, patch_params = pc_presegmentation.spectral_direct_segmentation(
-    #     pts3n, n_patches_u=n_rows, n_patches_v=n_cols
-    # )
-
-    # Alternative: axis-aligned grid segmentation.
-    assignments, grid_topology, patch_params = pc_presegmentation.axis_aligned_grid_segmentation(
-        pts3n, n_rows, n_cols
+    assignments, grid_topology, patch_params, side_assignments = _run_presegmentation(
+        pts3n=pts3n,
+        atlas_mode=atlas_mode,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        two_sheet_split_axis=two_sheet_split_axis,
+        two_sheet_side_axes=two_sheet_side_axes,
     )
 
     # Patch visualization.
@@ -136,15 +217,18 @@ def train_multi_patch(pts3n: np.ndarray,
             pp_vis = patch_params
 
         try:
-            utils._visualize_patch_assignments(
-                pts_vis, asg_vis, grid_topology, pp_vis,
-                n_rows, n_cols,
-                save_path=os.path.join(vis_dir, 'patch_assignments.png')
-            )
-            utils._visualize_patch_assignments_3d(
-                pts_vis, asg_vis, grid_topology, n_rows, n_cols,
-                save_path=os.path.join(vis_dir, 'patch_assignments_3d.png')
-            )
+            if atlas_mode == 'single_sheet':
+                utils._visualize_patch_assignments(
+                    pts_vis, asg_vis, grid_topology, pp_vis,
+                    n_rows, n_cols,
+                    save_path=os.path.join(vis_dir, 'patch_assignments.png')
+                )
+                utils._visualize_patch_assignments_3d(
+                    pts_vis, asg_vis, grid_topology, n_rows, n_cols,
+                    save_path=os.path.join(vis_dir, 'patch_assignments_3d.png')
+                )
+            else:
+                print("  [info] two-sheet patch visualization will be added in a later step")
         except Exception as e:
             print(f"  [warn] patch visualization skipped ({type(e).__name__}: {e})")
 
@@ -173,10 +257,16 @@ def train_multi_patch(pts3n: np.ndarray,
     lengths = [p.shape[0] for p in active_pts]
 
     # Models.
-    F = MultiPatchForwardMap(n_rows, n_cols, d_features,
-                             L=L, W=W, D=D, beta=beta).to(device)
-    G = MultiPatchInverseMap(F.complex, d_features=d_features,
-                             L=L_inv, W=W, D=D, beta=beta).to(device)
+    use_inverse_map = (lam > 0) or (lam2 > 0)
+    G = None
+    if use_inverse_map:
+        if atlas_mode != 'single_sheet':
+            raise NotImplementedError(
+                "Inverse-map training is not yet implemented for atlas_mode='two_sheet'. "
+                "Use --lam 0 --lam2 0 for two-sheet experiments."
+            )
+        G = MultiPatchInverseMap(F.complex, d_features=d_features,
+                                 L=L_inv, W=W, D=D, beta=beta).to(device)
 
     if pretrained_F_state is not None:
         missing, unexpected = F.load_state_dict(pretrained_F_state, strict=False)
@@ -190,20 +280,27 @@ def train_multi_patch(pts3n: np.ndarray,
 
     print(f"  Model device: {next(F.parameters()).device}")
     n_params_F = sum(p.numel() for p in F.parameters())
-    n_params_G = sum(p.numel() for p in G.parameters())
+    n_params_G = sum(p.numel() for p in G.parameters()) if G is not None else 0
     n_vertex = F.complex.vertex_features.numel()
     print(f"  F total params: {n_params_F:,}")
-    print(f"    Vertex features (shared): {n_vertex:,} "
-          f"({(n_rows+1)*(n_cols+1)} vertices × {d_features}d)")
+    if atlas_mode == 'single_sheet':
+        print(f"    Vertex features (shared): {n_vertex:,} "
+              f"({(n_rows+1)*(n_cols+1)} vertices × {d_features}d)")
+    else:
+        print(f"    Vertex features (two-sheet shared-boundary layout): {n_vertex:,}")
     print(f"    Shared decoder (+ global-UV PE, L={L}): {n_params_F - n_vertex:,}")
-    print(f"  G encoder params (L_inv={L_inv}): {n_params_G:,}")
+    if G is not None:
+        print(f"  G encoder params (L_inv={L_inv}): {n_params_G:,}")
+    else:
+        print("  G encoder params: skipped (λ₁=0 and λ₂=0)")
     print(f"  Total unique params: {n_params_F + n_params_G:,}")
     print("  F parameter breakdown:")
     for name, param in F.named_parameters():
         print(f"    {name:<40} shape={tuple(param.shape)} "
               f"requires_grad={param.requires_grad}")
 
-    opt = torch.optim.Adam(list(F.parameters()) + list(G.parameters()), lr=lr)
+    opt_params = list(F.parameters()) + (list(G.parameters()) if G is not None else [])
+    opt = torch.optim.Adam(opt_params, lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
 
     history = {'cd': [], 'cycle': [], 'param': [], 'tangent': [], 'normal': [],
@@ -244,7 +341,7 @@ def train_multi_patch(pts3n: np.ndarray,
             'mode': 'multi_patch',
             'epoch': epoch,
             'F_state': F.state_dict(),
-            'G_state': G.state_dict(),
+            'G_state': G.state_dict() if G is not None else None,
             'args': (checkpoint_payload or {}).get('args', {
                 'n_patches': n_patches,
                 'd_features': d_features,
@@ -269,8 +366,14 @@ def train_multi_patch(pts3n: np.ndarray,
                 'log_every': log_every,
                 'save_patch_vis': save_patch_vis,
                 'reg_every': reg_every,
+                'atlas_mode': atlas_mode,
+                'two_sheet_side_rows': two_sheet_side_rows,
+                'two_sheet_side_cols': two_sheet_side_cols,
+                'two_sheet_split_axis': two_sheet_split_axis,
+                'two_sheet_side_axes': list(two_sheet_side_axes),
             }),
             'grid_dims': (n_rows, n_cols),
+            'atlas_info': atlas_info,
             'history': history,
         }
         if checkpoint_payload is not None:
@@ -433,7 +536,7 @@ def train_multi_patch(pts3n: np.ndarray,
                 + lambda_outer_boundary * outer_boundary_loss)
         loss.backward()
 
-        nn.utils.clip_grad_norm_(list(F.parameters()) + list(G.parameters()), 1.0)
+        nn.utils.clip_grad_norm_(opt_params, 1.0)
         opt.step()
         scheduler.step()
 
@@ -492,7 +595,10 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
                                     log_every: int = 200,
                                     noise: float = 0.0,
                                     lam_jac: float = 0.001,
-                                    loss_type: str = 'mse'):
+                                    loss_type: str = 'mse',
+                                    atlas_mode: str = 'single_sheet',
+                                    two_sheet_side_rows: int = 2,
+                                    two_sheet_side_cols: int = 2):
     """
     Pretrain only the multi-patch forward map F. 
 
@@ -502,11 +608,21 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
 
     Mapping F to plane (sample (u, v) from plane and train with MSE/L1 F(z(u, v)) = (x, y, z) = (u, v, 0))
     """
-    n_rows, n_cols = pc_presegmentation.compute_grid_dims(n_patches)
-    actual_n_patches = n_rows * n_cols
-
-    F = MultiPatchForwardMap(n_rows, n_cols, d_features,
-                             L=L, W=W, D=D, beta=beta).to(device)
+    F, atlas_info = _build_forward_model(
+        atlas_mode=atlas_mode,
+        n_patches=n_patches,
+        d_features=d_features,
+        L=L,
+        W=W,
+        D=D,
+        beta=beta,
+        device=device,
+        two_sheet_side_rows=two_sheet_side_rows,
+        two_sheet_side_cols=two_sheet_side_cols,
+    )
+    n_rows = atlas_info['n_rows']
+    n_cols = atlas_info['n_cols']
+    actual_n_patches = atlas_info['actual_n_patches']
 
     opt = torch.optim.Adam(F.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
@@ -515,7 +631,10 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
 
     print(f"\n{'─'*60}")
     print("  Multi-Patch Flat-Sheet Pretraining")
-    print(f"  Grid={n_rows}×{n_cols}  patches={actual_n_patches}")
+    if atlas_mode == 'single_sheet':
+        print(f"  Grid={n_rows}×{n_cols}  patches={actual_n_patches}")
+    else:
+        print(f"  Two-sheet grid={atlas_info['n_sides']} × ({n_rows}×{n_cols})  patches={actual_n_patches}")
     print(f"  d_features={d_features}  W={W}  D={D}  L={L}  β={beta}")
     print(f"  M_per_patch={M_per_patch}  batch/step={actual_n_patches*M_per_patch}")
     print(f"  Epochs={epochs}  lr={lr}  device={device}  loss={loss_type}")
@@ -594,6 +713,158 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
     return F, history
 
 
+def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
+                                      n_patches: int = 4,
+                                      d_features: int = 88,
+                                      epochs: int = 2000,
+                                      M_per_patch: int = 4096,
+                                      W: int = 512,
+                                      D: int = 6,
+                                      L: int = 0,
+                                      lr: float = 1e-3,
+                                      beta: float = 100.0,
+                                      device: str = 'cuda',
+                                      log_every: int = 200,
+                                      mu: float = 0.0,
+                                      mu_warmup_epochs: int = 0,
+                                      mu_warmup_delay: int = 0,
+                                      schedule: str = 'cosine',
+                                      beta_shape_samples: int = 200000,
+                                      atlas_mode: str = 'two_sheet',
+                                      two_sheet_side_rows: int = 2,
+                                      two_sheet_side_cols: int = 2,
+                                      two_sheet_split_axis: int = 2,
+                                      two_sheet_side_axes=(0, 1)):
+    """
+    Pretrain the multi-patch forward map on a synthetic closed shape.
+
+    This is intended for closed-surface atlas initialization, especially the
+    two-sheet setup used for sphere-like reconstruction. The model is first
+    trained to fit a synthetic closed shape before being fine-tuned on the real
+    point cloud.
+    """
+    if atlas_mode != 'two_sheet':
+        raise ValueError(
+            "pretrain_multi_patch_closed_shape currently supports atlas_mode='two_sheet' only"
+        )
+
+    pts3n, _ = utils.make_synthetic_surface(shape=shape, n=beta_shape_samples, noise=0)
+
+    F, atlas_info = _build_forward_model(
+        atlas_mode=atlas_mode,
+        n_patches=n_patches,
+        d_features=d_features,
+        L=L,
+        W=W,
+        D=D,
+        beta=beta,
+        device=device,
+        two_sheet_side_rows=two_sheet_side_rows,
+        two_sheet_side_cols=two_sheet_side_cols,
+    )
+    n_rows = atlas_info['n_rows']
+    n_cols = atlas_info['n_cols']
+    actual_n_patches = atlas_info['actual_n_patches']
+
+    assignments, _, _, _ = _run_presegmentation(
+        pts3n=pts3n,
+        atlas_mode=atlas_mode,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        two_sheet_split_axis=two_sheet_split_axis,
+        two_sheet_side_axes=two_sheet_side_axes,
+    )
+
+    active_ids = []
+    active_pts = []
+    for k in range(actual_n_patches):
+        mask = assignments == k
+        pts_k = pts3n[mask]
+        if pts_k.shape[0] >= 10:
+            active_ids.append(k)
+            active_pts.append(torch.tensor(pts_k, dtype=torch.float32))
+
+    K = len(active_ids)
+    if K == 0:
+        raise RuntimeError("Closed-shape pretraining found no active patches")
+
+    active_idx_dev = torch.tensor(active_ids, dtype=torch.long, device=device)
+    pidx_flat = active_idx_dev.repeat_interleave(M_per_patch)
+    lengths = [p.shape[0] for p in active_pts]
+
+    opt = torch.optim.Adam(F.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
+
+    history = {'cd': [], 'tangent': [], 'mu_eff': [], 'total': [], 'epoch': []}
+
+    print(f"\n{'─'*60}")
+    print(f"  Multi-Patch Closed-Shape Pretraining")
+    print(f"  Shape={shape}  atlas={atlas_mode}")
+    print(f"  Two-sheet grid={atlas_info['n_sides']} × ({n_rows}×{n_cols})  patches={actual_n_patches}")
+    print(f"  d_features={d_features}  W={W}  D={D}  L={L}  β={beta}")
+    print(f"  M_per_patch={M_per_patch}  active_patches={K}/{actual_n_patches}")
+    print(f"  μ={mu}  Epochs={epochs}  lr={lr}  device={device}")
+    print(f"{'─'*60}")
+    t0 = time.time()
+
+    zero = torch.tensor(0.0, device=device)
+
+    for epoch in range(1, epochs + 1):
+        opt.zero_grad()
+
+        pts_batch = torch.empty(K, M_per_patch, 3)
+        for i in range(K):
+            ridx = torch.randint(0, lengths[i], (M_per_patch,))
+            pts_batch[i] = active_pts[i][ridx]
+
+        tgt = pts_batch.to(device)
+
+        uv_flat = torch.rand(K * M_per_patch, 2, device=device, requires_grad=True)
+        Q_flat = F(pidx_flat, uv_flat)
+        Q = Q_flat.reshape(K, M_per_patch, 3)
+
+        Dmat = torch.cdist(tgt, Q)
+        cd_loss = Dmat.min(dim=2).values.mean() + Dmat.min(dim=1).values.mean()
+
+        mu_eff = mu_warmup_schedule(
+            epoch, mu_warmup_epochs, mu,
+            schedule=schedule, delay_epochs=mu_warmup_delay
+        ) if mu > 0 else 0.0
+
+        if mu_eff > 0:
+            t_u, t_v = surface_jacobian(Q_flat, uv_flat)
+            tangent_loss = tangent_loss_from_jac(t_u, t_v)
+        else:
+            tangent_loss = zero
+
+        loss = cd_loss + mu_eff * tangent_loss
+        loss.backward()
+
+        nn.utils.clip_grad_norm_(list(F.parameters()), 1.0)
+        opt.step()
+        scheduler.step()
+
+        if epoch % log_every == 0 or epoch == 1:
+            history['epoch'].append(epoch)
+            history['cd'].append(float(cd_loss))
+            history['tangent'].append(float(tangent_loss))
+            history['mu_eff'].append(float(mu_eff))
+            history['total'].append(float(loss))
+
+            elapsed = time.time() - t0
+            print(f"  Epoch {epoch:5d}/{epochs}  |  "
+                  f"CD={float(cd_loss):.6f}  "
+                  f"Tangent={float(tangent_loss):.6f}  "
+                  f"Total={float(loss):.6f}  "
+                  f"μ_eff={float(mu_eff):.4f}  "
+                  f"[{elapsed:.1f}s]")
+
+    print(f"{'─'*60}\n")
+    return F, history
+
+
+
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -616,6 +887,9 @@ def main():
     parser.add_argument('--log_every', type=int, default=200)
     parser.add_argument('--multi_patch', action='store_true', default=True,
                         help='Use multi-patch feature complex mode')
+    parser.add_argument('--atlas_mode', type=str, default='single_sheet',
+                        choices=['single_sheet', 'two_sheet'],
+                        help='Atlas configuration: one connected sheet or two-sheet shared-boundary atlas')
 
     # Shared hparam
     parser.add_argument('--epochs', type=int, default=5000)
@@ -668,9 +942,9 @@ def main():
                              'epochs (2-5 speeds training with little quality loss)')
     parser.add_argument('--checkpoint_every', type=int, default=50,
                         help='[Multi-patch] Save an intermediate checkpoint every N epochs')
-    parser.add_argument('--save_correspondence_every', type=int, default=500,
+    parser.add_argument('--save_correspondence_every', type=int, default=5000,
                         help='[Multi-patch] Save Chamfer correspondence CSV/PNG every N epochs (0 disables)')
-    parser.add_argument('--save_boundary_debug_every', type=int, default=100,
+    parser.add_argument('--save_boundary_debug_every', type=int, default=5000,
                         help='[Multi-patch] Save outer-boundary model/rectangle correspondence debug every N epochs (0 disables)')
     parser.add_argument('--correspondence_max_lines', type=int, default=300,
                         help='[Multi-patch] Max correspondence lines drawn per saved PNG')
@@ -684,8 +958,26 @@ def main():
                         help='Epochs for flat-sheet initialization pretraining')
     parser.add_argument('--pretrain_loss', type=str, default='l1', choices=['mse','cd','l1'],
                         help='Pointwise loss for flat-sheet initialization pretraining')
+    parser.add_argument('--pretrain_mode', type=str, default='auto',
+                        choices=['auto', 'flat', 'closed_shape'],
+                        help='Initialization pretraining mode: flat sheet, closed shape, or auto-select based on atlas')
+    parser.add_argument('--pretrain_shape', type=str, default='sphere',
+                        choices=['saddle', 'hemisphere', 'torus_patch', 'wavy', 'sphere', 'flat_sheet', 'stepped_sheet'],
+                        help='Synthetic shape used for closed-shape pretraining')
+    parser.add_argument('--pretrain_shape_samples', type=int, default=200000,
+                        help='Number of synthetic samples used for closed-shape pretraining')
     parser.add_argument('--mu_warmup_delay', type=int, default=0,
                         help='Epochs to delay μ warmup (μ=0) before ramping up')
+
+    two_sheet_group = parser.add_argument_group('two-sheet configuration')
+    two_sheet_group.add_argument('--two_sheet_side_rows', type=int, default=2,
+                                 help='Rows of patches per side for atlas_mode=two_sheet')
+    two_sheet_group.add_argument('--two_sheet_side_cols', type=int, default=2,
+                                 help='Cols of patches per side for atlas_mode=two_sheet')
+    two_sheet_group.add_argument('--two_sheet_split_axis', type=int, default=2, choices=[0, 1, 2],
+                                 help='Axis used to split the point cloud into two sides')
+    two_sheet_group.add_argument('--two_sheet_side_axes', type=int, nargs=2, default=(0, 1),
+                                 help='Two axes used for axis-aligned segmentation inside each side')
 
     args = parser.parse_args()
 
@@ -723,7 +1015,12 @@ def main():
             print(f"  ✓ Normals validated: {normals.shape[0]} normals, unit-length")
 
     print(f"  Final point count: {pts3n.shape[0]}")
-    mode_str = "MULTI-PATCH FEATURE COMPLEX" if args.multi_patch else "SINGLE-PATCH"
+    if args.multi_patch:
+        mode_str = "MULTI-PATCH FEATURE COMPLEX"
+        if args.atlas_mode == 'two_sheet':
+            mode_str += " (TWO-SHEET)"
+    else:
+        mode_str = "SINGLE-PATCH"
     print(f"  Mode: {mode_str}")
 
     # Output directory setup
@@ -753,20 +1050,53 @@ def main():
         if not args.multi_patch:
             raise ValueError("--pretrain_init and --pretrain_then_train currently support only --multi_patch mode")
 
-        F_model, pretrain_history = pretrain_multi_patch_flat_sheet(
-            n_patches=args.n_patches,
-            d_features=args.d_features,
-            epochs=args.pretrain_epochs,
-            M_per_patch=args.M_per_patch,
-            W=args.W,
-            D=args.D,
-            L=args.L,
-            lr=args.lr,
-            beta=args.beta,
-            device=args.device,
-            log_every=args.log_every,
-            loss_type=args.pretrain_loss,
-        )
+        pretrain_mode = args.pretrain_mode
+        if pretrain_mode == 'auto':
+            pretrain_mode = 'closed_shape' if args.atlas_mode == 'two_sheet' else 'flat'
+
+        if pretrain_mode == 'closed_shape':
+            F_model, pretrain_history = pretrain_multi_patch_closed_shape(
+                shape=args.pretrain_shape,
+                n_patches=args.n_patches,
+                d_features=args.d_features,
+                epochs=args.pretrain_epochs,
+                M_per_patch=args.M_per_patch,
+                W=args.W,
+                D=args.D,
+                L=args.L,
+                lr=args.lr,
+                beta=args.beta,
+                device=args.device,
+                log_every=args.log_every,
+                mu=args.mu,
+                mu_warmup_epochs=args.mu_warmup_epochs,
+                mu_warmup_delay=args.mu_warmup_delay,
+                schedule=args.schedule,
+                beta_shape_samples=args.pretrain_shape_samples,
+                atlas_mode=args.atlas_mode,
+                two_sheet_side_rows=args.two_sheet_side_rows,
+                two_sheet_side_cols=args.two_sheet_side_cols,
+                two_sheet_split_axis=args.two_sheet_split_axis,
+                two_sheet_side_axes=tuple(args.two_sheet_side_axes),
+            )
+        else:
+            F_model, pretrain_history = pretrain_multi_patch_flat_sheet(
+                n_patches=args.n_patches,
+                d_features=args.d_features,
+                epochs=args.pretrain_epochs,
+                M_per_patch=args.M_per_patch,
+                W=args.W,
+                D=args.D,
+                L=args.L,
+                lr=args.lr,
+                beta=args.beta,
+                device=args.device,
+                log_every=args.log_every,
+                loss_type=args.pretrain_loss,
+                atlas_mode=args.atlas_mode,
+                two_sheet_side_rows=args.two_sheet_side_rows,
+                two_sheet_side_cols=args.two_sheet_side_cols,
+            )
         F_model.eval()
         pretrained_F_state = {
             k: v.detach().cpu().clone()
@@ -782,11 +1112,12 @@ def main():
         utils.export_ply(verts, faces, init_ply_path)
 
         torch.save({
-            'mode': 'multi_patch_pretrain_flat_sheet',
+            'mode': 'multi_patch_pretrain_flat_sheet' if pretrain_mode == 'flat' else 'multi_patch_pretrain_closed_shape',
             'F_state': F_model.state_dict(),
             'args': vars(args),
             'history': pretrain_history,
             'grid_dims': (F_model.n_rows, F_model.n_cols),
+            'atlas_mode': args.atlas_mode,
         }, ckpt_path)
 
         print(f"    Pretrain checkpoint → {ckpt_path}")
@@ -855,9 +1186,15 @@ def main():
             save_boundary_debug_every=args.save_boundary_debug_every,
             correspondence_max_lines=args.correspondence_max_lines,
             correspondence_line_segment=args.correspondence_line_segment,
+            atlas_mode=args.atlas_mode,
+            two_sheet_side_rows=args.two_sheet_side_rows,
+            two_sheet_side_cols=args.two_sheet_side_cols,
+            two_sheet_split_axis=args.two_sheet_split_axis,
+            two_sheet_side_axes=tuple(args.two_sheet_side_axes),
         )
         F_model.eval()
-        G_model.eval()
+        if G_model is not None:
+            G_model.eval()
 
         print(f"\n  Saving results to: {result_dir}")
         utils._save_run_metadata(result_log, args, input_file_name, result_dir,
@@ -872,13 +1209,14 @@ def main():
         torch.save({
             'mode': 'multi_patch',
             'F_state': F_model.state_dict(),
-            'G_state': G_model.state_dict(),
+            'G_state': G_model.state_dict() if G_model is not None else None,
             'args': vars(args),
             'pretrain_history': pretrain_history,
             'history': history,
             'assignments': assignments.tolist(),
             'active_patch_ids': active_ids,
             'grid_dims': (F_model.n_rows, F_model.n_cols),
+            'atlas_mode': args.atlas_mode,
             'normalization': {
                 'center': meta['center'].tolist() if hasattr(meta['center'], 'tolist')
                           else list(meta['center']),

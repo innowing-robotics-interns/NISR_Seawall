@@ -246,7 +246,7 @@ def estimate_normals(pts, k=30):
     return normals.astype(np.float32)
 
 # Make synthetic_surface if no file is given
-def make_synthetic_surface(shape='saddle', n=20000, noise=0.02, seed=42):
+def make_synthetic_surface(shape='saddle', n=20000, noise=0, seed=42):
     """
     Generate a synthetic 3D point cloud on a known surface.
     Returns (pts_normalized, meta) where meta contains identity transform.
@@ -668,7 +668,9 @@ def visualise(F, G, pts3n, history, out_path, resolution=80, device='cuda'):
 
 @torch.no_grad()
 def visualise_multi_patch(F, pts3n, assignments, history, out_path,
-                          resolution=80, device='cuda', active_patch_ids=None):
+                          resolution=80, device='cuda', active_patch_ids=None,
+                          patch_uv_masks=None, mask_res=None,
+                          export_mode='full'):
     """
     6-panel figure for multi-patch feature complex mode:
       [0] Input point cloud colored by patch assignment
@@ -809,7 +811,8 @@ def visualise_multi_patch(F, pts3n, assignments, history, out_path,
     ax5.set_title("⑥ Training Loss", fontsize=10, pad=8)
     ax5.grid(True, alpha=0.3)
 
-    fig.suptitle(f"Feature Complex Sheet Fitting  ·  {n_rows}×{n_cols} grid  ·  "
+    atlas_label = "two-sheet shared-boundary atlas" if getattr(F, 'n_sides', 1) > 1 else f"{n_rows}×{n_cols} grid"
+    fig.suptitle(f"Feature Complex Sheet Fitting  ·  {atlas_label}  ·  "
                  f"active patches: {len(patch_ids)}  ·  "
                  f"shared vertices guarantee C0 continuity",
                  fontsize=13, fontweight='bold', y=0.97)
@@ -817,10 +820,7 @@ def visualise_multi_patch(F, pts3n, assignments, history, out_path,
     plt.close(fig)
     print(f"    PNG → {out_path}")
 
-    # ── Also produce the combined mesh for export ─────────────────────────────
-    verts, faces = sample_multi_patch_grid(
-        F, resolution, device_model, active_patch_ids=patch_ids
-    )
+    verts, faces = sample_multi_patch_grid(F, resolution, device_model, active_patch_ids=patch_ids)
     return verts, faces
 
 

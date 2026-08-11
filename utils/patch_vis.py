@@ -387,13 +387,14 @@ def _load_model_from_checkpoint(ckpt_path, device, model_path=None):
     """
     model_module = _import_model_module(model_path)
     MultiPatchForwardMap = getattr(model_module, 'MultiPatchForwardMap', None)
+    TwoSheetForwardMap = getattr(model_module, 'TwoSheetForwardMap', None)
     if MultiPatchForwardMap is None and model_path is not None and os.path.basename(model_path) == 'main.py':
         sibling_model_path = os.path.join(os.path.dirname(os.path.abspath(model_path)), 'model', 'model.py')
         if os.path.exists(sibling_model_path):
             model_module = _import_model_module(sibling_model_path)
             MultiPatchForwardMap = model_module.MultiPatchForwardMap
-    if MultiPatchForwardMap is None:
-        raise AttributeError("model module does not define MultiPatchForwardMap")
+    if MultiPatchForwardMap is None and TwoSheetForwardMap is None:
+        raise AttributeError("model module does not define MultiPatchForwardMap or TwoSheetForwardMap")
 
     ckpt = torch.load(ckpt_path, map_location=device)
     if ckpt.get('mode') != 'multi_patch' and ckpt.get('mode') != 'multi_patch_pretrain_flat_sheet':
@@ -404,12 +405,25 @@ def _load_model_from_checkpoint(ckpt_path, device, model_path=None):
 
     args = ckpt['args']
     n_rows, n_cols = ckpt['grid_dims']
+    atlas_mode = ckpt.get('atlas_mode', args.get('atlas_mode', 'single_sheet'))
 
-    F = MultiPatchForwardMap(
-        n_rows=n_rows, n_cols=n_cols,
-        d_features=args['d_features'],
-        L=args['L'], W=args['W'], D=args['D'], beta=args['beta'],
-    ).to(device)
+    if atlas_mode == 'two_sheet':
+        if TwoSheetForwardMap is None:
+            raise AttributeError("model module does not define TwoSheetForwardMap")
+        F = TwoSheetForwardMap(
+            n_rows=n_rows,
+            n_cols=n_cols,
+            d_features=args['d_features'],
+            L=args['L'], W=args['W'], D=args['D'], beta=args['beta'],
+        ).to(device)
+    else:
+        if MultiPatchForwardMap is None:
+            raise AttributeError("model module does not define MultiPatchForwardMap")
+        F = MultiPatchForwardMap(
+            n_rows=n_rows, n_cols=n_cols,
+            d_features=args['d_features'],
+            L=args['L'], W=args['W'], D=args['D'], beta=args['beta'],
+        ).to(device)
     F.load_state_dict(ckpt['F_state'])
     F.eval()
 

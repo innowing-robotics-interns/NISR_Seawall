@@ -309,7 +309,7 @@ def tangent_loss_from_jac(t_u, t_v, mode='arap', eps=1e-4, scale_invariant=True)
     collapse = torch.relu(eps - S).pow(2).sum(dim=-1).mean()
 
     if mode == 'arap':
-        energy = ((S - 0.0625) ** 2).sum(dim=-1).mean()
+        energy = ((S - 0.25) ** 2).sum(dim=-1).mean()
     elif mode == 'arap_si':
         s_mean = S.mean(dim=-1, keepdim=True).detach()
         energy = ((S - s_mean) ** 2).sum(dim=-1).mean()

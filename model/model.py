@@ -278,6 +278,127 @@ class FeatureComplex(nn.Module):
         return features
 
 
+class TwoSheetFeatureComplex(nn.Module):
+    """
+    Two-sided feature complex for sphere-like reconstruction.
+
+    Each side is a separate patch grid, but the boundary vertex features are
+    shared across both sides while interior vertices remain side-specific.
+    """
+    def __init__(self, n_rows: int, n_cols: int, d_features: int = 64, n_sides: int = 2):
+        super().__init__()
+        if n_sides != 2:
+            raise ValueError(f"TwoSheetFeatureComplex currently supports n_sides=2, got {n_sides}")
+        if n_rows < 2 or n_cols < 2:
+            raise ValueError("TwoSheetFeatureComplex expects at least a 2x2 patch grid per side")
+
+        self.n_rows = n_rows
+        self.n_cols = n_cols
+        self.d_features = d_features
+        self.n_sides = n_sides
+
+        n_boundary_vertices = 2 * (n_rows + n_cols)
+        n_interior_vertices_per_side = max((n_rows - 1) * (n_cols - 1), 0)
+        self.n_boundary_vertices = n_boundary_vertices
+        self.n_interior_vertices_per_side = n_interior_vertices_per_side
+        self.n_vertices = n_boundary_vertices + n_sides * n_interior_vertices_per_side
+
+        self.vertex_features = nn.Parameter(
+            torch.randn(self.n_vertices, d_features) * 0.1
+        )
+
+        corner_uv = torch.tensor(
+            [[0.0, 0.0],
+             [1.0, 0.0],
+             [1.0, 1.0],
+             [0.0, 1.0]], dtype=torch.float32)
+        self.register_buffer('corner_uv', corner_uv)
+
+    def _boundary_index(self, row, col):
+        """Return the shared boundary-vertex index for logical grid coordinates."""
+        if row == 0:
+            return col
+        if col == self.n_cols:
+            return self.n_cols + row
+        if row == self.n_rows:
+            return self.n_cols + self.n_rows + (self.n_cols - col)
+        if col == 0:
+            return self.n_cols + self.n_rows + self.n_cols + (self.n_rows - row)
+        raise ValueError(f"Vertex ({row}, {col}) is not on the boundary")
+
+    def _interior_index(self, side, row, col):
+        """Return the side-specific interior-vertex index."""
+        if not (0 <= side < self.n_sides):
+            raise ValueError(f"side must be in [0, {self.n_sides - 1}], got {side}")
+        if not (0 < row < self.n_rows and 0 < col < self.n_cols):
+            raise ValueError(f"Vertex ({row}, {col}) is not an interior vertex")
+
+        local_row = row - 1
+        local_col = col - 1
+        local_idx = local_row * (self.n_cols - 1) + local_col
+        return self.n_boundary_vertices + side * self.n_interior_vertices_per_side + local_idx
+
+    def _vertex_index(self, side, row, col):
+        """Map logical side/grid coordinates to the shared learnable feature index."""
+        if torch.is_tensor(side) or torch.is_tensor(row) or torch.is_tensor(col):
+            side_t = torch.as_tensor(side, dtype=torch.long, device=self.vertex_features.device)
+            row_t = torch.as_tensor(row, dtype=torch.long, device=self.vertex_features.device)
+            col_t = torch.as_tensor(col, dtype=torch.long, device=self.vertex_features.device)
+
+            out = torch.empty_like(row_t)
+            boundary_mask = ((row_t == 0) | (row_t == self.n_rows) |
+                             (col_t == 0) | (col_t == self.n_cols))
+
+            if boundary_mask.any():
+                rb = row_t[boundary_mask]
+                cb = col_t[boundary_mask]
+                boundary_idx = torch.empty_like(rb)
+
+                top = rb == 0
+                right = (~top) & (cb == self.n_cols)
+                bottom = (~top) & (~right) & (rb == self.n_rows)
+                left = (~top) & (~right) & (~bottom) & (cb == 0)
+
+                boundary_idx[top] = cb[top]
+                boundary_idx[right] = self.n_cols + rb[right]
+                boundary_idx[bottom] = self.n_cols + self.n_rows + (self.n_cols - cb[bottom])
+                boundary_idx[left] = self.n_cols + self.n_rows + self.n_cols + (self.n_rows - rb[left])
+                out[boundary_mask] = boundary_idx
+
+            if (~boundary_mask).any():
+                ri = row_t[~boundary_mask]
+                ci = col_t[~boundary_mask]
+                si = side_t[~boundary_mask]
+                local_idx = (ri - 1) * (self.n_cols - 1) + (ci - 1)
+                out[~boundary_mask] = (
+                    self.n_boundary_vertices
+                    + si * self.n_interior_vertices_per_side
+                    + local_idx
+                )
+            return out
+
+        if row == 0 or row == self.n_rows or col == 0 or col == self.n_cols:
+            return self._boundary_index(row, col)
+        return self._interior_index(side, row, col)
+
+    def _corner_indices(self, side, row, col):
+        """Return the four logical corner indices for a patch on a given side."""
+        i00 = self._vertex_index(side, row, col)
+        i01 = self._vertex_index(side, row, col + 1)
+        i10 = self._vertex_index(side, row + 1, col)
+        i11 = self._vertex_index(side, row + 1, col + 1)
+        return i00, i01, i10, i11
+
+    def interpolate(self, side, row, col, uv):
+        """MVC-interpolate features inside a patch on one of the two sheets."""
+        i00, i01, i10, i11 = self._corner_indices(side, row, col)
+        vf = self.vertex_features
+        z = torch.stack([vf[i00], vf[i10], vf[i11], vf[i01]], dim=1)
+        polys = self.corner_uv.unsqueeze(0).expand(uv.shape[0], -1, -1)
+        w = mvc_weights_torch(uv, polys)
+        return torch.einsum('bk,bkd->bd', w, z)
+
+
 class MultiPatchForwardMap(nn.Module):
     """
         Vectorized multi-patch forward map.
@@ -355,6 +476,84 @@ class MultiPatchForwardMap(nn.Module):
         correction = self.decoder(dec_in)
 
         return correction
+
+
+class TwoSheetForwardMap(nn.Module):
+    """
+    Two-sheet forward map with shared boundary features and one shared decoder.
+
+    To keep both sheets on the same front-facing orientation convention, the
+    second sheet uses a flipped local-u coordinate. This reverses the chart
+    orientation for side 1 before interpolation/decoding, which flips the
+    induced normal direction and helps align both sheets face orientation.
+    """
+    def __init__(self, n_rows: int, n_cols: int, d_features: int = 64,
+                 L: int = 8, W: int = 256, D: int = 6, beta: float = 5.0,
+                 n_sides: int = 2):
+        super().__init__()
+        if n_sides != 2:
+            raise ValueError(f"TwoSheetForwardMap currently supports n_sides=2, got {n_sides}")
+
+        self.n_rows = n_rows
+        self.n_cols = n_cols
+        self.n_sides = n_sides
+        self.patches_per_side = n_rows * n_cols
+        self.n_patches = self.patches_per_side * n_sides
+        self.d_features = d_features
+        self.L = L
+
+        self.complex = TwoSheetFeatureComplex(
+            n_rows=n_rows,
+            n_cols=n_cols,
+            d_features=d_features,
+            n_sides=n_sides,
+        )
+
+        if L > 0:
+            self.pe = PositionalEncoding(2, L)
+            d_pe = self.pe.d_out
+        else:
+            self.pe = None
+            d_pe = 0
+
+        self.decoder = SkipMLP(d_features + d_pe, 3, W, D, beta=beta)
+
+    def patch_idx_to_side_rowcol(self, patch_idx):
+        """Convert flattened patch indices to side, row, and column."""
+        side = patch_idx // self.patches_per_side
+        local_patch_idx = patch_idx % self.patches_per_side
+        row = local_patch_idx // self.n_cols
+        col = local_patch_idx % self.n_cols
+        return side, row, col
+
+    def forward(self, patch_idx, uv: torch.Tensor):
+        """Evaluate the two-sheet forward map on local UV samples."""
+        B = uv.shape[0]
+        if not torch.is_tensor(patch_idx):
+            patch_idx = torch.full((B,), int(patch_idx), dtype=torch.long, device=uv.device)
+        else:
+            patch_idx = patch_idx.to(device=uv.device, dtype=torch.long)
+
+        side, row, col = self.patch_idx_to_side_rowcol(patch_idx)
+
+        uv_oriented = uv.clone()
+        side1_mask = side == 1
+        if side1_mask.any():
+            uv_oriented[side1_mask, 0] = 1.0 - uv_oriented[side1_mask, 0]
+
+        features = self.complex.interpolate(side, row, col, uv_oriented)
+
+        u = uv_oriented[:, 0:1]
+        v = uv_oriented[:, 1:2]
+        global_u = (row.unsqueeze(1).float() + u) / self.n_rows
+        global_v = (col.unsqueeze(1).float() + v) / self.n_cols
+
+        dec_parts = [features]
+        if self.pe is not None:
+            dec_parts.append(self.pe(torch.cat([global_u, global_v], dim=1)))
+
+        dec_in = torch.cat(dec_parts, dim=1)
+        return self.decoder(dec_in)
 
 
 class MultiPatchInverseMap(nn.Module):
