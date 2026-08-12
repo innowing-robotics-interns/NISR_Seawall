@@ -228,7 +228,16 @@ def train_multi_patch(pts3n: np.ndarray,
                     save_path=os.path.join(vis_dir, 'patch_assignments_3d.png')
                 )
             else:
-                print("  [info] two-sheet patch visualization will be added in a later step")
+                side_vis = side_assignments[vsub] if pts3n.shape[0] > vis_cap else side_assignments
+                utils._visualize_two_sheet_patch_assignments(
+                    pts_vis, asg_vis, side_vis, grid_topology, pp_vis,
+                    n_rows, n_cols,
+                    save_path=os.path.join(vis_dir, 'patch_assignments_two_sheet.png')
+                )
+                utils._visualize_two_sheet_patch_assignments_3d(
+                    pts_vis, asg_vis, side_vis, n_rows, n_cols,
+                    save_path=os.path.join(vis_dir, 'patch_assignments_two_sheet_3d.png')
+                )
         except Exception as e:
             print(f"  [warn] patch visualization skipped ({type(e).__name__}: {e})")
 

@@ -987,6 +987,141 @@ def _visualize_patch_assignments_3d(pts3n, assignments, grid_topology,
     print(f"  3D patch visualization saved to: {save_path}")
 
 
+def _visualize_two_sheet_patch_assignments(pts3n, assignments, side_assignments,
+                                           grid_topology, patch_params,
+                                           n_rows, n_cols,
+                                           save_path='patch_assignments_two_sheet.png'):
+    """
+    Visualize two-sheet patch assignments in 3D and per-side UV parameter space.
+
+    Args:
+        pts3n: (N, 3) normalized point cloud
+        assignments: (N,) global patch ids
+        side_assignments: (N,) side ids in {0, 1}
+        grid_topology: (2, n_rows, n_cols) patch ids per side
+        patch_params: (N, 2) local UV coordinates within each side
+        n_rows, n_cols: grid dimensions per side
+        save_path: output file path
+    """
+    n_patches_total = int(np.max(assignments)) + 1 if len(assignments) > 0 else 2 * n_rows * n_cols
+    fig = plt.figure(figsize=(18, 10))
+    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.3, wspace=0.3)
+
+    cmap = plt.get_cmap('tab20', max(n_patches_total, 1))
+
+    ax0 = fig.add_subplot(gs[0, 0], projection='3d')
+    ax0.scatter(pts3n[:, 0], pts3n[:, 1], pts3n[:, 2],
+                c=assignments, cmap='tab20', s=2, alpha=0.7,
+                vmin=0, vmax=max(n_patches_total - 1, 1))
+    ax0.set_title('3D Point Cloud Colored by Two-Sheet Patch ID', fontsize=10)
+    ax0.set_xlabel('x')
+    ax0.set_ylabel('y')
+    ax0.set_zlabel('z')
+
+    for side in range(2):
+        ax = fig.add_subplot(gs[0, side + 1])
+        mask = side_assignments == side
+        if np.any(mask):
+            ax.scatter(patch_params[mask, 0], patch_params[mask, 1],
+                       c=assignments[mask], cmap='tab20', s=3, alpha=0.7,
+                       vmin=0, vmax=max(n_patches_total - 1, 1))
+        for i in range(1, n_rows):
+            ax.axhline(y=i / n_rows, color='black', linewidth=0.5, alpha=0.5)
+        for j in range(1, n_cols):
+            ax.axvline(x=j / n_cols, color='black', linewidth=0.5, alpha=0.5)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_aspect('equal')
+        ax.set_xlabel('u')
+        ax.set_ylabel('v')
+        ax.set_title(f'Side {side} UV Segmentation', fontsize=10)
+
+    for side in range(2):
+        ax = fig.add_subplot(gs[1, side])
+        side_grid = grid_topology[side]
+        im = ax.imshow(side_grid, cmap='tab20', aspect='equal',
+                       vmin=0, vmax=max(n_patches_total - 1, 1))
+        ax.set_title(f'Side {side} Grid Topology', fontsize=10)
+        ax.set_xlabel('Column')
+        ax.set_ylabel('Row')
+        for i in range(n_rows):
+            for j in range(n_cols):
+                patch_id = int(side_grid[i, j])
+                ax.text(j, i, str(patch_id), ha='center', va='center',
+                        color='white' if patch_id < n_patches_total // 2 else 'black', fontsize=8)
+
+    ax5 = fig.add_subplot(gs[1, 2])
+    counts = np.bincount(assignments, minlength=n_patches_total)
+    ax5.bar(range(n_patches_total), counts, color=[cmap(i) for i in range(n_patches_total)])
+    ax5.set_title('Points per Patch (Both Sides)', fontsize=10)
+    ax5.set_xlabel('Global Patch ID')
+    ax5.set_ylabel('Point Count')
+    if np.any(counts > 0):
+        ax5.axhline(y=np.mean(counts[counts > 0]), color='red', linestyle='--',
+                    label=f'Mean: {counts[counts > 0].mean():.0f}')
+        ax5.legend()
+
+    plt.suptitle(
+        f'Two-Sheet Patch Assignment Visualization ({2} × {n_rows}×{n_cols} = {n_patches_total} patches)',
+        fontsize=14, fontweight='bold'
+    )
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Two-sheet patch visualization saved to: {save_path}")
+
+
+def _visualize_two_sheet_patch_assignments_3d(pts3n, assignments, side_assignments,
+                                              n_rows, n_cols,
+                                              save_path='patch_assignments_two_sheet_3d.png'):
+    """Create multi-view 3D visualization for two-sheet patch assignments."""
+    n_patches_total = int(np.max(assignments)) + 1 if len(assignments) > 0 else 2 * n_rows * n_cols
+    cmap = plt.get_cmap('tab20', max(n_patches_total, 1))
+
+    fig = plt.figure(figsize=(18, 6))
+    views = [
+        (30, 45, 'View 1 (default)'),
+        (10, 90, 'View 2 (side)'),
+        (80, 45, 'View 3 (top)'),
+    ]
+
+    for idx, (elev, azim, title) in enumerate(views):
+        ax = fig.add_subplot(1, 3, idx + 1, projection='3d')
+        for patch_id in range(n_patches_total):
+            mask = assignments == patch_id
+            if np.any(mask):
+                ax.scatter(pts3n[mask, 0], pts3n[mask, 1], pts3n[mask, 2],
+                           c=[cmap(patch_id)], s=2, alpha=0.6)
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(f'{title}\nElev={elev}°, Azim={azim}°', fontsize=10)
+        ax.set_xlabel('x')
+        ax.set_ylabel('y')
+        ax.set_zlabel('z')
+
+        max_range = np.array([
+            pts3n[:, 0].max() - pts3n[:, 0].min(),
+            pts3n[:, 1].max() - pts3n[:, 1].min(),
+            pts3n[:, 2].max() - pts3n[:, 2].min(),
+        ]).max() / 2.0
+        mid_x = (pts3n[:, 0].max() + pts3n[:, 0].min()) * 0.5
+        mid_y = (pts3n[:, 1].max() + pts3n[:, 1].min()) * 0.5
+        mid_z = (pts3n[:, 2].max() + pts3n[:, 2].min()) * 0.5
+        ax.set_xlim(mid_x - max_range, mid_x + max_range)
+        ax.set_ylim(mid_y - max_range, mid_y + max_range)
+        ax.set_zlim(mid_z - max_range, mid_z + max_range)
+
+    side_counts = np.bincount(side_assignments, minlength=2)
+    plt.suptitle(
+        f'Two-Sheet 3D Patch Visualization ({2} × {n_rows}×{n_cols} patches)  '
+        f'side0={side_counts[0]}, side1={side_counts[1]}',
+        fontsize=14, fontweight='bold'
+    )
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Two-sheet 3D patch visualization saved to: {save_path}")
+
+
 def _save_patch_statistics(pts3n, assignments, n_rows, n_cols, save_path='patch_statistics.txt'):
     """
     Save detailed patch statistics to a text file.
