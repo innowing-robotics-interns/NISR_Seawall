@@ -197,104 +197,54 @@ class InverseMap(nn.Module):
 
 # Feature complex and multi-patch maps.
 class FeatureComplex(nn.Module):
-    """
-    Grid-based feature complex with shared vertex features.
-
-    Adjacent patches share corner features, which enforces C0 continuity.
-
-    PHASE 1 CHANGE (bilinear -> MVC)
-    --------------------------------
-    `interpolate` previously blended the 4 corner features BILINEARLY. It now
-    blends them with MEAN VALUE COORDINATES. On the regular grid each patch is
-    the local-UV unit square, so the MVC polygon is just the 4 corners in CCW
-    order. MVC is a strict generalization of the bilinear-on-a-square idea that
-    (a) stays continuous across shared edges, and (b) extends unchanged to the
-    n-gon leaf polygons the quadtree will produce in Phase 2. Along any patch
-    edge MVC reduces to LINEAR interpolation between that edge's two endpoints,
-    which is exactly the property that makes hanging nodes seamless later.
-    """
-    def __init__(self, n_rows: int, n_cols: int, d_features: int = 64):
+    """Shared-vertex MVC feature complex for an adaptive quadtree."""
+    def __init__(self, topology: dict, d_features: int = 64):
         super().__init__()
-        self.n_rows = n_rows
-        self.n_cols = n_cols
+        def tensor(value, dtype):
+            return value if isinstance(value, torch.Tensor) else torch.as_tensor(value, dtype=dtype)
+
+        self.register_buffer('vertex_uv', tensor(topology['vertex_uv'], torch.float32))
+        self.register_buffer('leaf_bbox', tensor(topology['leaf_bbox'], torch.float32))
+        self.register_buffer('leaf_poly_ids', tensor(topology['leaf_poly_ids'], torch.long))
+        self.register_buffer('leaf_poly_uv', tensor(topology['leaf_poly_uv'], torch.float32))
+        self.register_buffer('leaf_k', tensor(topology['leaf_k'], torch.long))
+        self.register_buffer('leaf_count', tensor(topology['leaf_count'], torch.long))
         self.d_features = d_features
+        self.n_vertices = int(self.vertex_uv.shape[0])
+        self.n_leaves = int(self.leaf_bbox.shape[0])
+        self.vertex_features = nn.Parameter(torch.randn(self.n_vertices, d_features) * 0.1)
 
-        n_vertices = (n_rows + 1) * (n_cols + 1)
-        self.vertex_features = nn.Parameter(
-            torch.randn(n_vertices, d_features) * 0.1
-        )
+    def topology_state(self):
+        return {
+            'vertex_uv': self.vertex_uv.detach().cpu(),
+            'leaf_bbox': self.leaf_bbox.detach().cpu(),
+            'leaf_poly_ids': self.leaf_poly_ids.detach().cpu(),
+            'leaf_poly_uv': self.leaf_poly_uv.detach().cpu(),
+            'leaf_k': self.leaf_k.detach().cpu(),
+            'leaf_count': self.leaf_count.detach().cpu(),
+        }
 
-        # Local-UV coordinates of the 4 patch corners, in CCW order.
-        # This order MUST match the feature-gather order used in interpolate():
-        #   (0,0) -> z00 , (1,0) -> z10 , (1,1) -> z11 , (0,1) -> z01
-        corner_uv = torch.tensor(
-            [[0.0, 0.0],
-             [1.0, 0.0],
-             [1.0, 1.0],
-             [0.0, 1.0]], dtype=torch.float32)
-        self.register_buffer('corner_uv', corner_uv)  # (4, 2)
-
-    def _corner_indices(self, row, col):
-        """
-        Return vectorized indices of the four patch corners.
-
-        Args:
-            row, col: Patch grid positions.
-        Returns:
-            Tuple `(i00, i01, i10, i11)`.
-        """
-        ncp = self.n_cols + 1
-        i00 = row * ncp + col
-        i01 = row * ncp + (col + 1)
-        i10 = (row + 1) * ncp + col
-        i11 = (row + 1) * ncp + (col + 1)
-        return i00, i01, i10, i11
-
-    def interpolate(self, row, col, uv):
-        """
-        MVC-interpolate the shared vertex features across a patch.
-
-        Args:
-            row, col: Patch grid positions per sample (each shape (B,)).
-            uv: Local UV coordinates in `[0, 1]`, shape (B, 2).
-        Returns:
-            Interpolated feature tensor, shape (B, d_features).
-        """
-        i00, i01, i10, i11 = self._corner_indices(row, col)
-        vf = self.vertex_features
-
-        # Gather corner features in the SAME CCW order as self.corner_uv:
-        #   [z00, z10, z11, z01]
-        z = torch.stack([vf[i00], vf[i10], vf[i11], vf[i01]], dim=1)  # (B, 4, d)
-
-        # Broadcast the local-UV unit square to every query point.
-        polys = self.corner_uv.unsqueeze(0).expand(uv.shape[0], -1, -1)  # (B,4,2)
-
-        # Mean value coordinates of uv w.r.t. the 4 corners.
-        w = mvc_weights_torch(uv, polys)               # (B, 4)
-
-        # Weighted combination of corner features.
-        features = torch.einsum('bk,bkd->bd', w, z)    # (B, d)
-        return features
+    def interpolate(self, leaf_id, uv):
+        k = int(self.leaf_k[leaf_id].item())
+        if k == 0:
+            raise ValueError(f'Cannot interpolate inactive leaf {leaf_id}')
+        ids = self.leaf_poly_ids[leaf_id, :k]
+        poly = self.leaf_poly_uv[leaf_id, :k]
+        polys = poly.unsqueeze(0).expand(uv.shape[0], -1, -1)
+        weights = mvc_weights_torch(uv, polys)
+        return weights @ self.vertex_features[ids]
 
 
 class MultiPatchForwardMap(nn.Module):
-    """
-        Vectorized multi-patch forward map.
-
-        Shared features and global UV coordinates keep neighboring patches
-        continuous across boundaries.
-    """
-    def __init__(self, n_rows: int, n_cols: int, d_features: int = 64,
+    """Vectorized quadtree forward map using shared MVC vertex features."""
+    def __init__(self, topology: dict, d_features: int = 64,
                  L: int = 8, W: int = 256, D: int = 6, beta: float = 5.0):
         super().__init__()
-        self.n_rows = n_rows
-        self.n_cols = n_cols
-        self.n_patches = n_rows * n_cols
+        self.complex = FeatureComplex(topology, d_features)
+        self.n_leaves = self.complex.n_leaves
+        self.n_patches = self.n_leaves
         self.d_features = d_features
         self.L = L
-
-        self.complex = FeatureComplex(n_rows, n_cols, d_features)
 
         if L > 0:
             self.pe = PositionalEncoding(2, L)
@@ -305,15 +255,17 @@ class MultiPatchForwardMap(nn.Module):
 
         self.decoder = SkipMLP(d_features + d_pe, 3, W, D, beta=beta)
 
+    @property
+    def active_patch_ids(self):
+        return torch.nonzero(self.complex.leaf_count > 0,
+                              as_tuple=False).flatten().tolist()
+
+    def topology_state(self):
+        return self.complex.topology_state()
+
         # Optional flat-plane initialization.
         # nn.init.zeros_(self.decoder.head.weight)
         # nn.init.zeros_(self.decoder.head.bias)
-
-    def patch_idx_to_rowcol(self, patch_idx):
-        """Convert patch indices to row and column indices."""
-        row = patch_idx // self.n_cols
-        col = patch_idx % self.n_cols
-        return row, col
 
     def forward(self, patch_idx, uv: torch.Tensor):
         """
@@ -323,21 +275,23 @@ class MultiPatchForwardMap(nn.Module):
         Returns:
             Predicted 3D points.
         """
-        B = uv.shape[0]
         if not torch.is_tensor(patch_idx):
-            patch_idx = torch.full((B,), int(patch_idx),
-                                   dtype=torch.long, device=uv.device)
-
-        row = patch_idx // self.n_cols
-        col = patch_idx % self.n_cols
-
-        features = self.complex.interpolate(row, col, uv)
-
-        u = uv[:, 0:1]
-        v = uv[:, 1:2]
-        # Convert local UV to global UV over the full patch grid.
-        global_u = (row.unsqueeze(1).float() + u) / self.n_rows
-        global_v = (col.unsqueeze(1).float() + v) / self.n_cols
+            patch_idx = int(patch_idx)
+            features = self.complex.interpolate(patch_idx, uv)
+            bbox = self.complex.leaf_bbox[patch_idx]
+            global_u = bbox[0] + uv[:, 0:1] * (bbox[2] - bbox[0])
+            global_v = bbox[1] + uv[:, 1:2] * (bbox[3] - bbox[1])
+        else:
+            patch_idx = patch_idx.to(uv.device)
+            features = uv.new_empty(uv.shape[0], self.d_features)
+            global_u = uv.new_empty(uv.shape[0], 1)
+            global_v = uv.new_empty(uv.shape[0], 1)
+            for leaf_id in torch.unique(patch_idx).tolist():
+                mask = patch_idx == leaf_id
+                features[mask] = self.complex.interpolate(int(leaf_id), uv[mask])
+                bbox = self.complex.leaf_bbox[int(leaf_id)]
+                global_u[mask] = bbox[0] + uv[mask, 0:1] * (bbox[2] - bbox[0])
+                global_v[mask] = bbox[1] + uv[mask, 1:2] * (bbox[3] - bbox[1])
 
         if self.pe is not None:
             pe = self.pe(torch.cat([global_u, global_v], dim=1))

@@ -10,7 +10,10 @@ parameter coordinates.
 from scipy.sparse import csr_matrix, diags
 from scipy.sparse.linalg import eigsh
 from scipy.spatial import KDTree
-import open3d as o3d
+try:
+    import open3d as o3d
+except ImportError:
+    o3d = None
 
 import json
 import math
@@ -81,6 +84,50 @@ class Quadtree:
             upper = 2 if v >= mid_v else 0
             node = node.children[right + upper]
         return node
+
+    def topology(self):
+        """Return tensors/arrays consumed by the quadtree feature complex."""
+        polygons = [leaf.polygon for leaf in self.leaves]
+        polygon_uv = []
+        for leaf, polygon in zip(self.leaves, polygons):
+            if polygon is None:
+                polygon_uv.append([])
+                continue
+            u0 = leaf.ix / self.grid
+            v0 = leaf.iy / self.grid
+            du = leaf.isize / self.grid
+            dv = leaf.isize / self.grid
+            polygon_uv.append([
+                ((self.vertices[vid, 0] - u0) / du,
+                 (self.vertices[vid, 1] - v0) / dv)
+                for vid in polygon
+            ])
+
+        max_k = max((len(poly) for poly in polygon_uv), default=4)
+        poly_ids = np.zeros((len(self.leaves), max_k), dtype=np.int64)
+        poly_uv = np.zeros((len(self.leaves), max_k, 2), dtype=np.float32)
+        leaf_k = np.zeros(len(self.leaves), dtype=np.int64)
+        leaf_bbox = np.zeros((len(self.leaves), 4), dtype=np.float32)
+        for lid, leaf in enumerate(self.leaves):
+            poly = polygon_uv[lid]
+            leaf_k[lid] = len(poly)
+            if poly:
+                poly_ids[lid, :len(poly)] = polygons[lid]
+                poly_uv[lid, :len(poly)] = np.asarray(poly, dtype=np.float32)
+            leaf_bbox[lid] = (
+                leaf.ix / self.grid, leaf.iy / self.grid,
+                (leaf.ix + leaf.isize) / self.grid,
+                (leaf.iy + leaf.isize) / self.grid,
+            )
+        return {
+            'vertex_uv': self.vertices.astype(np.float32),
+            'leaf_bbox': leaf_bbox,
+            'leaf_poly_ids': poly_ids,
+            'leaf_poly_uv': poly_uv,
+            'leaf_k': leaf_k,
+            'leaf_count': np.asarray([leaf.count for leaf in self.leaves], dtype=np.int64),
+            'max_depth': int(np.log2(self.grid)),
+        }
 
 
 def quadtree_subdivision(points: np.ndarray, max_points: int = 200,

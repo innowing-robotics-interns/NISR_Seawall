@@ -15,7 +15,7 @@ python main.py \
     --epochs 2000 \
     --n_patches 16 \
     --d_features 88 \
-    --M_per_patch 4096 \
+    --M_per_patch 200 \
     --W 512 \
     --N 5000000 \
     --mesh_res 200 \
@@ -23,9 +23,9 @@ python main.py \
     --D 6 \
     --L 0 \
     --beta 100 \
-    --mu 0.08 \
+    --mu 0.0 \
     --gamma 0 \
-    --lambda_outer_boundary 10 \
+    --lambda_outer_boundary 1 \
     --lam 0 \
     --lam2 0 \
     --log_every 200 \
@@ -33,18 +33,20 @@ python main.py \
     --mu_warmup_epochs 1000 \
     --mu_warmup_delay 300 \
     --schedule cosine \
-    --checkpoint_every 200 \
+    --checkpoint_every 1000 \
     --quadtree_max_points 2000 \
     --quadtree_max_depth 4
 
-REAL_OUTPUT_DIR="${OUTPUT_DIR}"
+# REAL_OUTPUT_DIR="${OUTPUT_DIR}_6"
 
 # python utils/patch_vis.py \
 #     --ckpt ${REAL_OUTPUT_DIR}/checkpoint.pt \
 #     --out_dir ${REAL_OUTPUT_DIR} \
 #     --n_images 1 \
 #     --input_file ${INPUT_FILE} \
-#     --subdivision_depth "-1"
+#     --subdivision_depth "-1" \
+#     --quadtree \
+#     --no_save_each_patches
 
 # python main.py \
 #     --file ${INPUT_FILE} \

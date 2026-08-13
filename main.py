@@ -102,6 +102,8 @@ def _visualize_quadtree_segmentation(tree, points, save_path):
 
 # Multi-patch training.
 def train_multi_patch(pts3n: np.ndarray,
+                      topology: dict,
+                      assignments: np.ndarray,
                       n_patches: int = 4,
                       quadtree_max_points: int = 200,
                       quadtree_max_depth: int = 6,
@@ -148,30 +150,10 @@ def train_multi_patch(pts3n: np.ndarray,
     Expensive regularizers can be evaluated every `reg_every` steps instead of
     every iteration.
     """
-    # Build the adaptive top-view segmentation for inspection. The current
-    # rectangular model below still consumes the legacy grid assignment; this
-    # keeps this first migration step isolated from training changes.
-    quadtree = pc_presegmentation.quadtree_subdivision(
-        pts3n,
-        max_points=quadtree_max_points,
-        max_depth=quadtree_max_depth,
-        axes=(0, 1),
-    )
-    print(f"  Quadtree layout: {len(quadtree.leaves)} leaves, "
-          f"{len(quadtree.patches)} non-empty, "
-          f"{len(quadtree.vertices)} shared vertices")
-    if save_patch_vis:
-        if vis_dir is None:
-            vis_dir = os.getcwd()
-        os.makedirs(vis_dir, exist_ok=True)
-        _visualize_quadtree_segmentation(
-            quadtree, pts3n,
-            os.path.join(vis_dir, 'patch_assignments.png'))
-
-    # Grid dimensions for the legacy training path.
-    n_rows, n_cols = pc_presegmentation.compute_grid_dims(n_patches)
-    actual_n_patches = n_rows * n_cols
-    print(f"  Grid layout: {n_rows} rows × {n_cols} cols = {actual_n_patches} patches")
+    n_leaves = int(topology['leaf_bbox'].shape[0])
+    print(f"  Quadtree layout: {n_leaves} leaves, "
+          f"{int(np.sum(np.asarray(topology['leaf_count']) > 0))} non-empty, "
+          f"{topology['vertex_uv'].shape[0]} shared vertices")
 
     if gamma > 0:
         assert normals is not None, "normals must be provided when gamma > 0"
@@ -179,66 +161,11 @@ def train_multi_patch(pts3n: np.ndarray,
             f"Normals shape {normals.shape} != points shape {pts3n.shape}"
         print(f"  Normal constraint active (γ={gamma}), normals shape: {normals.shape}")
 
-    # Default pre-segmentation.
-    # assignments, grid_topology, patch_params = pc_presegmentation.pca_grid_segmentation(
-    #     pts3n, n_rows, n_cols
-    # )
-    
-    # Alternative: Poisson spectral segmentation.
-    # assignments, grid_topology, patch_params = pc_presegmentation.poisson_spectral_segmentation(
-    #     pts3n, normals, n_patches_u=n_rows, n_patches_v=n_cols,
-    #     export_mesh_path=output_psr_mesh_path
-    # )
-
-    # Alternative: spectral segmentation.
-    # assignments, grid_topology, patch_params = pc_presegmentation.spectral_direct_segmentation(
-    #     pts3n, n_patches_u=n_rows, n_patches_v=n_cols
-    # )
-
-    # Alternative: axis-aligned grid segmentation.
-    assignments, grid_topology, patch_params = pc_presegmentation.axis_aligned_grid_segmentation(
-        pts3n, n_rows, n_cols
-    )
-
-    # Patch visualization.
-    if save_patch_vis:
-        if vis_dir is None:
-            vis_dir = os.getcwd()
-        os.makedirs(vis_dir, exist_ok=True)
-
-        vis_cap = 200_000
-        if pts3n.shape[0] > vis_cap:
-            vsub = np.random.choice(pts3n.shape[0], vis_cap, replace=False)
-            pts_vis = pts3n[vsub]
-            asg_vis = assignments[vsub]
-            if (hasattr(patch_params, 'shape')
-                    and patch_params.shape[0] == pts3n.shape[0]):
-                pp_vis = patch_params[vsub]
-            else:
-                pp_vis = patch_params
-        else:
-            pts_vis = pts3n
-            asg_vis = assignments
-            pp_vis = patch_params
-
-        try:
-            utils._visualize_patch_assignments(
-                pts_vis, asg_vis, grid_topology, pp_vis,
-                n_rows, n_cols,
-                save_path=os.path.join(vis_dir, 'grid_patch_assignments.png')
-            )
-            utils._visualize_patch_assignments_3d(
-                pts_vis, asg_vis, grid_topology, n_rows, n_cols,
-                save_path=os.path.join(vis_dir, 'grid_patch_assignments_3d.png')
-            )
-        except Exception as e:
-            print(f"  [warn] patch visualization skipped ({type(e).__name__}: {e})")
-
     # Keep only active patches with enough assigned points.
     active_ids = []
     active_pts = []   # list of (N_k, 3) CPU tensors
     active_nrm = []   # list of (N_k, 3) CPU tensors or None
-    for k in range(actual_n_patches):
+    for k in range(n_leaves):
         mask = assignments == k
         pts_k = pts3n[mask]
         if pts_k.shape[0] >= 10:
@@ -252,17 +179,16 @@ def train_multi_patch(pts3n: np.ndarray,
     K = len(active_ids)
     if K == 0:
         raise RuntimeError("No active patches (all have < 10 points). "
-                           "Reduce --n_patches or add more points.")
+                           "Increase point count or reduce quadtree subdivision.")
 
     active_idx_dev = torch.tensor(active_ids, dtype=torch.long, device=device)
     pidx_flat = active_idx_dev.repeat_interleave(M_per_patch)
     lengths = [p.shape[0] for p in active_pts]
 
     # Models.
-    F = MultiPatchForwardMap(n_rows, n_cols, d_features,
+    F = MultiPatchForwardMap(topology, d_features,
                              L=L, W=W, D=D, beta=beta).to(device)
-    G = MultiPatchInverseMap(F.complex, d_features=d_features,
-                             L=L_inv, W=W, D=D, beta=beta).to(device)
+    G = None
 
     if pretrained_F_state is not None:
         missing, unexpected = F.load_state_dict(pretrained_F_state, strict=False)
@@ -276,20 +202,19 @@ def train_multi_patch(pts3n: np.ndarray,
 
     print(f"  Model device: {next(F.parameters()).device}")
     n_params_F = sum(p.numel() for p in F.parameters())
-    n_params_G = sum(p.numel() for p in G.parameters())
     n_vertex = F.complex.vertex_features.numel()
     print(f"  F total params: {n_params_F:,}")
     print(f"    Vertex features (shared): {n_vertex:,} "
-          f"({(n_rows+1)*(n_cols+1)} vertices × {d_features}d)")
+          f"({F.complex.n_vertices} vertices × {d_features}d)")
     print(f"    Shared decoder (+ global-UV PE, L={L}): {n_params_F - n_vertex:,}")
-    print(f"  G encoder params (L_inv={L_inv}): {n_params_G:,}")
-    print(f"  Total unique params: {n_params_F + n_params_G:,}")
+    print("  Inverse map disabled")
+    print(f"  Total unique params: {n_params_F:,}")
     print("  F parameter breakdown:")
     for name, param in F.named_parameters():
         print(f"    {name:<40} shape={tuple(param.shape)} "
               f"requires_grad={param.requires_grad}")
 
-    opt = torch.optim.Adam(list(F.parameters()) + list(G.parameters()), lr=lr)
+    opt = torch.optim.Adam(F.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
 
     history = {'cd': [], 'cycle': [], 'param': [], 'tangent': [], 'normal': [],
@@ -299,7 +224,7 @@ def train_multi_patch(pts3n: np.ndarray,
 
     print(f"\n{'─'*60}")
     print(f"  Multi-Patch Feature Complex Training (VECTORIZED)")
-    print(f"  Grid={n_rows}×{n_cols}  active_patches={K}/{actual_n_patches}")
+    print(f"  Quadtree leaves={K}/{n_leaves} active")
     print(f"  d_features={d_features}  W={W}  D={D}  L(fwd/global-UV)={L}  L_inv={L_inv}  β={beta}")
     print(f"  M_per_patch={M_per_patch}  batch/step={K*M_per_patch}  reg_every={reg_every}")
     print(f"  μ={mu}  γ={gamma}  λ₁={lam}  λ₂={lam2}  λ_outer={lambda_outer_boundary}")
@@ -330,7 +255,6 @@ def train_multi_patch(pts3n: np.ndarray,
             'mode': 'multi_patch',
             'epoch': epoch,
             'F_state': F.state_dict(),
-            'G_state': G.state_dict(),
             'args': (checkpoint_payload or {}).get('args', {
                 'n_patches': n_patches,
                 'd_features': d_features,
@@ -356,7 +280,7 @@ def train_multi_patch(pts3n: np.ndarray,
                 'save_patch_vis': save_patch_vis,
                 'reg_every': reg_every,
             }),
-            'grid_dims': (n_rows, n_cols),
+            'topology': F.topology_state(),
             'history': history,
         }
         if checkpoint_payload is not None:
@@ -449,28 +373,8 @@ def train_multi_patch(pts3n: np.ndarray,
 
 
         # Loss 2: cycle consistency.
-        if lam > 0:
-            uv_inv = G(pidx_flat, tgt_flat)
-            P_recon = F(pidx_flat, uv_inv)
-            P_recon = P_recon.reshape(K, M_per_patch, 3)
-            cycle_loss = torch.stack([
-                chamfer_distance_chunked(P_recon[k], tgt[k], chunk_size=min(1024, M_per_patch))
-                for k in range(K)
-            ]).mean()
-        else:
-            cycle_loss = zero
-
-        # Loss 3: inverse cycle consistency.
-        if lam2 > 0:
-            uv_recon = G(pidx_flat, Q_flat)
-            uv_recon = uv_recon.reshape(K, M_per_patch, 2)
-            uv_grid = uv_flat.reshape(K, M_per_patch, 2)
-            param_loss = torch.stack([
-                chamfer_distance_chunked(uv_recon[k], uv_grid[k], chunk_size=min(1024, M_per_patch))
-                for k in range(K)
-            ]).mean()
-        else:
-            param_loss = zero
+        cycle_loss = zero
+        param_loss = zero
 
         # Loss 4 and 5: tangent and normal regularization.
         do_reg = (mu > 0 or gamma > 0) and (epoch % reg_every == 0)
@@ -519,7 +423,7 @@ def train_multi_patch(pts3n: np.ndarray,
                 + lambda_outer_boundary * outer_boundary_loss)
         loss.backward()
 
-        nn.utils.clip_grad_norm_(list(F.parameters()) + list(G.parameters()), 1.0)
+        nn.utils.clip_grad_norm_(F.parameters(), 1.0)
         opt.step()
         scheduler.step()
 
@@ -565,7 +469,7 @@ def train_multi_patch(pts3n: np.ndarray,
     return F, G, history, assignments, active_ids
 
 
-def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
+def pretrain_multi_patch_flat_sheet(topology: dict,
                                     d_features: int = 88,
                                     epochs: int = 2000,
                                     M_per_patch: int = 4096,
@@ -588,10 +492,10 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
 
     Mapping F to plane (sample (u, v) from plane and train with MSE/L1 F(z(u, v)) = (x, y, z) = (u, v, 0))
     """
-    n_rows, n_cols = pc_presegmentation.compute_grid_dims(n_patches)
-    actual_n_patches = n_rows * n_cols
+    n_leaves = int(topology['leaf_bbox'].shape[0])
+    active_ids = np.flatnonzero(np.asarray(topology['leaf_count']) > 0).tolist()
 
-    F = MultiPatchForwardMap(n_rows, n_cols, d_features,
+    F = MultiPatchForwardMap(topology, d_features,
                              L=L, W=W, D=D, beta=beta).to(device)
 
     opt = torch.optim.Adam(F.parameters(), lr=lr)
@@ -601,9 +505,9 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
 
     print(f"\n{'─'*60}")
     print("  Multi-Patch Flat-Sheet Pretraining")
-    print(f"  Grid={n_rows}×{n_cols}  patches={actual_n_patches}")
+    print(f"  Quadtree leaves={n_leaves}  active={len(active_ids)}")
     print(f"  d_features={d_features}  W={W}  D={D}  L={L}  β={beta}")
-    print(f"  M_per_patch={M_per_patch}  batch/step={actual_n_patches*M_per_patch}")
+    print(f"  M_per_patch={M_per_patch}  batch/step={len(active_ids)*M_per_patch}")
     print(f"  Epochs={epochs}  lr={lr}  device={device}  loss={loss_type}")
     print(f"{'─'*60}")
     t0 = time.time()
@@ -621,19 +525,15 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
         opt.zero_grad()
 
         # Sample each local uv uniformly in [0, 1]² for each patch
-        uv_local = torch.rand(actual_n_patches, M_per_patch, 2, device=device, requires_grad=True)
+        uv_local = torch.rand(len(active_ids), M_per_patch, 2, device=device, requires_grad=True)
         # create a flat array of patch IDs repeated for each sample in the patch
-        patch_ids = torch.arange(actual_n_patches, device=device, dtype=torch.long)
+        patch_ids = torch.tensor(active_ids, device=device, dtype=torch.long)
         patch_ids_flat = patch_ids.repeat_interleave(M_per_patch)
         uv_flat = uv_local.reshape(-1, 2)
 
-        row = patch_ids_flat // n_cols
-        col = patch_ids_flat % n_cols
-
-        u_local = uv_flat[:, 0:1]
-        v_local = uv_flat[:, 1:2]
-        global_u = (row.unsqueeze(1).float() + u_local) / n_rows
-        global_v = (col.unsqueeze(1).float() + v_local) / n_cols
+        bbox = F.complex.leaf_bbox[patch_ids_flat]
+        global_u = bbox[:, 0:1] + uv_flat[:, 0:1] * (bbox[:, 2:3] - bbox[:, 0:1])
+        global_v = bbox[:, 1:2] + uv_flat[:, 1:2] * (bbox[:, 3:4] - bbox[:, 1:2])
 
         target = torch.cat([
             2.0 * global_u - 1.0,
@@ -647,11 +547,11 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
 
         pred = F(patch_ids_flat, uv_flat)
         if loss_type == 'cd':
-            pred_patch = pred.reshape(actual_n_patches, M_per_patch, 3)
-            target_patch = target.reshape(actual_n_patches, M_per_patch, 3)
+            pred_patch = pred.reshape(len(active_ids), M_per_patch, 3)
+            target_patch = target.reshape(len(active_ids), M_per_patch, 3)
             plane_loss = torch.stack([
                 chamfer_distance(pred_patch[k], target_patch[k])
-                for k in range(actual_n_patches)
+                for k in range(len(active_ids))
             ]).mean()
 
             if lam_jac > 0:
@@ -758,7 +658,7 @@ def main():
                              'epochs (2-5 speeds training with little quality loss)')
     parser.add_argument('--checkpoint_every', type=int, default=50,
                         help='[Multi-patch] Save an intermediate checkpoint every N epochs')
-    parser.add_argument('--save_correspondence_every', type=int, default=500,
+    parser.add_argument('--save_correspondence_every', type=int, default=1000,
                         help='[Multi-patch] Save Chamfer correspondence CSV/PNG every N epochs (0 disables)')
     parser.add_argument('--save_boundary_debug_every', type=int, default=100,
                         help='[Multi-patch] Save outer-boundary model/rectangle correspondence debug every N epochs (0 disables)')
@@ -831,6 +731,22 @@ def main():
 
     print(f"  Output directory: {result_dir}")
 
+    quadtree = pc_presegmentation.quadtree_subdivision(
+        pts3n,
+        max_points=args.quadtree_max_points,
+        max_depth=args.quadtree_max_depth,
+        axes=(0, 1),
+    )
+    topology = quadtree.topology()
+    assignments = quadtree.point_patch
+    print(f"  Quadtree: {len(quadtree.leaves)} leaves, "
+          f"{len(quadtree.patches)} active leaves, "
+          f"{len(quadtree.vertices)} shared vertices")
+    if args.save_patch_vis:
+        _visualize_quadtree_segmentation(
+            quadtree, pts3n,
+            os.path.join(result_dir, 'patch_assignments.png'))
+
     # Training
     print(f"\n{'='*60}")
     print(f"  Starting training ({mode_str})...")
@@ -844,7 +760,7 @@ def main():
             raise ValueError("--pretrain_init and --pretrain_then_train currently support only --multi_patch mode")
 
         F_model, pretrain_history = pretrain_multi_patch_flat_sheet(
-            n_patches=args.n_patches,
+            topology=topology,
             d_features=args.d_features,
             epochs=args.pretrain_epochs,
             M_per_patch=args.M_per_patch,
@@ -867,7 +783,7 @@ def main():
             F_model,
             resolution=args.mesh_res,
             device=args.device,
-            active_patch_ids=list(range(F_model.n_patches)),
+            active_patch_ids=F_model.active_patch_ids,
         )
         utils.export_ply(verts, faces, init_ply_path)
 
@@ -876,7 +792,7 @@ def main():
             'F_state': F_model.state_dict(),
             'args': vars(args),
             'history': pretrain_history,
-            'grid_dims': (F_model.n_rows, F_model.n_cols),
+            'topology': F_model.topology_state(),
         }, ckpt_path)
 
         print(f"    Pretrain checkpoint → {ckpt_path}")
@@ -898,6 +814,8 @@ def main():
     if args.multi_patch:
         F_model, G_model, history, assignments, active_ids = train_multi_patch(
             pts3n,
+            topology=topology,
+            assignments=assignments,
             n_patches=args.n_patches,
             quadtree_max_points=args.quadtree_max_points,
             quadtree_max_depth=args.quadtree_max_depth,
@@ -949,7 +867,8 @@ def main():
             correspondence_line_segment=args.correspondence_line_segment,
         )
         F_model.eval()
-        G_model.eval()
+        if G_model is not None:
+            G_model.eval()
 
         print(f"\n  Saving results to: {result_dir}")
         utils._save_run_metadata(result_log, args, input_file_name, result_dir,
@@ -964,13 +883,10 @@ def main():
         torch.save({
             'mode': 'multi_patch',
             'F_state': F_model.state_dict(),
-            'G_state': G_model.state_dict(),
-            'args': vars(args),
             'pretrain_history': pretrain_history,
             'history': history,
-            'assignments': assignments.tolist(),
             'active_patch_ids': active_ids,
-            'grid_dims': (F_model.n_rows, F_model.n_cols),
+            'topology': F_model.topology_state(),
             'normalization': {
                 'center': meta['center'].tolist() if hasattr(meta['center'], 'tolist')
                           else list(meta['center']),

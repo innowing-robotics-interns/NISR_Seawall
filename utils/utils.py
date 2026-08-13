@@ -461,7 +461,7 @@ def sample_multi_patch_grid(F, resolution=100, device='cuda', active_patch_ids=N
         all_faces: (total_faces, 3) combined face index array
     """
     if active_patch_ids is None:
-        patch_ids = list(range(F.n_patches))
+        patch_ids = list(getattr(F, 'active_patch_ids', range(F.n_patches)))
     else:
         patch_ids = [int(patch_idx) for patch_idx in active_patch_ids]
 
@@ -691,13 +691,13 @@ def visualise_multi_patch(F, pts3n, assignments, history, out_path,
     device_model = next(F.parameters()).device
     P_np = pts3n
     if active_patch_ids is None:
-        patch_ids = list(range(F.n_patches))
+        patch_ids = list(getattr(F, 'active_patch_ids', range(F.n_patches)))
     else:
         patch_ids = [int(patch_idx) for patch_idx in active_patch_ids]
 
     n_patches = max(len(patch_ids), 1)
-    n_rows = F.n_rows
-    n_cols = F.n_cols
+    n_rows = getattr(F, 'n_rows', 1)
+    n_cols = getattr(F, 'n_cols', F.n_patches)
 
     # ── Sample each patch on its UV grid ──────────────────────────────────────
     # Store per-patch surface grids for individual plotting
@@ -809,7 +809,7 @@ def visualise_multi_patch(F, pts3n, assignments, history, out_path,
     ax5.set_title("⑥ Training Loss", fontsize=10, pad=8)
     ax5.grid(True, alpha=0.3)
 
-    fig.suptitle(f"Feature Complex Sheet Fitting  ·  {n_rows}×{n_cols} grid  ·  "
+    fig.suptitle(f"Feature Complex Sheet Fitting  ·  quadtree leaves={F.n_patches}  ·  "
                  f"active patches: {len(patch_ids)}  ·  "
                  f"shared vertices guarantee C0 continuity",
                  fontsize=13, fontweight='bold', y=0.97)

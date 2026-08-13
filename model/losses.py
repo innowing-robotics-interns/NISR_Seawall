@@ -5,6 +5,11 @@ import math
 import torch
 
 
+def _flat_rectangle_target(gu, gv):
+    return torch.cat([2.0 * gu - 1.0, 2.0 * gv - 1.0,
+                      torch.zeros_like(gu)], dim=1)
+
+
 def _sample_rectangle_patch_edge(n_rows: int,
                                  n_cols: int,
                                  row: int,
@@ -65,6 +70,34 @@ def outer_boundary_rectangle_loss(F_model,
         point_loss = torch.nn.MSELoss(reduction='mean')
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}. Use 'l1' or 'mse'.")
+
+    # Quadtree path: constrain only occupied leaves on the true unit-square
+    # outer boundary. Internal edges are structurally shared and excluded.
+    if hasattr(F_model.complex, 'leaf_bbox'):
+        bbox = F_model.complex.leaf_bbox.detach().cpu().numpy()
+        counts = F_model.complex.leaf_count.detach().cpu().numpy()
+        total_loss = torch.tensor(0.0, device=device)
+        n_terms = 0
+        for lid, (u0, v0, u1, v1) in enumerate(bbox):
+            if counts[lid] <= 0:
+                continue
+            edges = []
+            if u0 <= 1e-6:
+                edges.append((torch.zeros_like(t), t, u0, v0, u0, v1))
+            if u1 >= 1.0 - 1e-6:
+                edges.append((torch.ones_like(t), t, u1, v0, u1, v1))
+            if v0 <= 1e-6:
+                edges.append((t, torch.zeros_like(t), u0, v0, u1, v0))
+            if v1 >= 1.0 - 1e-6:
+                edges.append((t, torch.ones_like(t), u0, v1, u1, v1))
+            for uv_u, uv_v, gu0, gv0, gu1, gv1 in edges:
+                pred = F_model(lid, torch.cat([uv_u, uv_v], dim=1))
+                gu = torch.full_like(t, gu0) if gu0 == gu1 else gu0 + t * (gu1 - gu0)
+                gv = torch.full_like(t, gv0) if gv0 == gv1 else gv0 + t * (gv1 - gv0)
+                target = _flat_rectangle_target(gu, gv)
+                total_loss = total_loss + point_loss(pred, target)
+                n_terms += 1
+        return total_loss / n_terms if n_terms else torch.tensor(0.0, device=device)
 
     total_loss = torch.tensor(0.0, device=device)
     n_terms = 0
@@ -128,6 +161,42 @@ def sample_outer_boundary_correspondence(F_model,
             'patch_ids': empty_ids,
             'edge_names': [],
         }
+
+    if hasattr(F_model.complex, 'leaf_bbox'):
+        bbox = F_model.complex.leaf_bbox.detach().cpu().numpy()
+        counts = F_model.complex.leaf_count.detach().cpu().numpy()
+        t = torch.linspace(0.0, 1.0, n_boundary_samples, device=device).unsqueeze(1)
+        model_batches, target_batches, patch_ids, edge_names = [], [], [], []
+        for lid, (u0, v0, u1, v1) in enumerate(bbox):
+            if counts[lid] <= 0:
+                continue
+            edges = []
+            if u0 <= 1e-6:
+                edges.append(('u_min', torch.zeros_like(t), t,
+                              torch.full_like(t, u0), v0 + t * (v1 - v0)))
+            if u1 >= 1.0 - 1e-6:
+                edges.append(('u_max', torch.ones_like(t), t,
+                              torch.full_like(t, u1), v0 + t * (v1 - v0)))
+            if v0 <= 1e-6:
+                edges.append(('v_min', t, torch.zeros_like(t),
+                              u0 + t * (u1 - u0), torch.full_like(t, v0)))
+            if v1 >= 1.0 - 1e-6:
+                edges.append(('v_max', t, torch.ones_like(t),
+                              u0 + t * (u1 - u0), torch.full_like(t, v1)))
+            for name, uv_u, uv_v, gu, gv in edges:
+                model_batches.append(F_model(lid, torch.cat([uv_u, uv_v], dim=1)))
+                target_batches.append(_flat_rectangle_target(gu, gv))
+                patch_ids.append(lid)
+                edge_names.append(name)
+        if not model_batches:
+            empty = torch.empty(0, n_boundary_samples, 3, device=device)
+            return {'model_points': empty, 'target_points': empty,
+                    'patch_ids': torch.empty(0, dtype=torch.long, device=device),
+                    'edge_names': []}
+        return {'model_points': torch.stack(model_batches),
+                'target_points': torch.stack(target_batches),
+                'patch_ids': torch.tensor(patch_ids, dtype=torch.long, device=device),
+                'edge_names': edge_names}
 
     t = torch.linspace(0.0, 1.0, n_boundary_samples, device=device).unsqueeze(1)
     model_batches = []
