@@ -149,6 +149,7 @@ def train_multi_patch(pts3n: np.ndarray,
                       correspondence_max_lines: int = 300,
                       correspondence_line_segment: str = 't_to_q',
                       atlas_mode: str = 'single_sheet',
+                      no_presplit: bool = False,
                       two_sheet_side_rows: int = 2,
                       two_sheet_side_cols: int = 2,
                       two_sheet_split_axis: int = 2,
@@ -186,14 +187,26 @@ def train_multi_patch(pts3n: np.ndarray,
             f"Normals shape {normals.shape} != points shape {pts3n.shape}"
         print(f"  Normal constraint active (γ={gamma}), normals shape: {normals.shape}")
 
-    assignments, grid_topology, patch_params, side_assignments = _run_presegmentation(
-        pts3n=pts3n,
-        atlas_mode=atlas_mode,
-        n_rows=n_rows,
-        n_cols=n_cols,
-        two_sheet_split_axis=two_sheet_split_axis,
-        two_sheet_side_axes=two_sheet_side_axes,
-    )
+    if no_presplit and atlas_mode != 'two_sheet':
+        raise ValueError("--no_presplit is currently supported only with atlas_mode='two_sheet'")
+
+    if no_presplit:
+        assignments = np.arange(pts3n.shape[0], dtype=np.int32) % actual_n_patches
+        grid_topology = np.stack([
+            np.arange(atlas_info['patches_per_side'], dtype=np.int32).reshape(n_rows, n_cols),
+            (np.arange(atlas_info['patches_per_side'], dtype=np.int32) + atlas_info['patches_per_side']).reshape(n_rows, n_cols),
+        ], axis=0)
+        patch_params = np.zeros((pts3n.shape[0], 2), dtype=np.float32)
+        side_assignments = np.full(pts3n.shape[0], -1, dtype=np.int32)
+    else:
+        assignments, grid_topology, patch_params, side_assignments = _run_presegmentation(
+            pts3n=pts3n,
+            atlas_mode=atlas_mode,
+            n_rows=n_rows,
+            n_cols=n_cols,
+            two_sheet_split_axis=two_sheet_split_axis,
+            two_sheet_side_axes=two_sheet_side_axes,
+        )
 
     # Patch visualization.
     if save_patch_vis:
@@ -241,29 +254,38 @@ def train_multi_patch(pts3n: np.ndarray,
         except Exception as e:
             print(f"  [warn] patch visualization skipped ({type(e).__name__}: {e})")
 
-    # Keep only active patches with enough assigned points.
-    active_ids = []
-    active_pts = []   # list of (N_k, 3) CPU tensors
-    active_nrm = []   # list of (N_k, 3) CPU tensors or None
-    for k in range(actual_n_patches):
-        mask = assignments == k
-        pts_k = pts3n[mask]
-        if pts_k.shape[0] >= 10:
-            active_ids.append(k)
-            active_pts.append(torch.tensor(pts_k, dtype=torch.float32))
-            if gamma > 0:
-                active_nrm.append(torch.tensor(normals[mask], dtype=torch.float32))
-            else:
-                active_nrm.append(None)
+    # Keep only active patches with enough assigned points, unless using global no-presplit training.
+    if no_presplit:
+        active_ids = list(range(actual_n_patches))
+        active_pts = None
+        active_nrm = None
+        K = len(active_ids)
+        active_idx_dev = torch.tensor(active_ids, dtype=torch.long, device=device)
+        pidx_flat = active_idx_dev.repeat_interleave(M_per_patch)
+        lengths = None
+    else:
+        active_ids = []
+        active_pts = []   # list of (N_k, 3) CPU tensors
+        active_nrm = []   # list of (N_k, 3) CPU tensors or None
+        for k in range(actual_n_patches):
+            mask = assignments == k
+            pts_k = pts3n[mask]
+            if pts_k.shape[0] >= 10:
+                active_ids.append(k)
+                active_pts.append(torch.tensor(pts_k, dtype=torch.float32))
+                if gamma > 0:
+                    active_nrm.append(torch.tensor(normals[mask], dtype=torch.float32))
+                else:
+                    active_nrm.append(None)
 
-    K = len(active_ids)
-    if K == 0:
-        raise RuntimeError("No active patches (all have < 10 points). "
-                           "Reduce --n_patches or add more points.")
+        K = len(active_ids)
+        if K == 0:
+            raise RuntimeError("No active patches (all have < 10 points). "
+                               "Reduce --n_patches or add more points.")
 
-    active_idx_dev = torch.tensor(active_ids, dtype=torch.long, device=device)
-    pidx_flat = active_idx_dev.repeat_interleave(M_per_patch)
-    lengths = [p.shape[0] for p in active_pts]
+        active_idx_dev = torch.tensor(active_ids, dtype=torch.long, device=device)
+        pidx_flat = active_idx_dev.repeat_interleave(M_per_patch)
+        lengths = [p.shape[0] for p in active_pts]
 
     # Models.
     use_inverse_map = (lam > 0) or (lam2 > 0)
@@ -320,6 +342,8 @@ def train_multi_patch(pts3n: np.ndarray,
     print(f"\n{'─'*60}")
     print(f"  Multi-Patch Feature Complex Training (VECTORIZED)")
     print(f"  Grid={n_rows}×{n_cols}  active_patches={K}/{actual_n_patches}")
+    if no_presplit:
+        print("  Training mode: no-presplit global Chamfer over full target cloud")
     print(f"  d_features={d_features}  W={W}  D={D}  L(fwd/global-UV)={L}  L_inv={L_inv}  β={beta}")
     print(f"  M_per_patch={M_per_patch}  batch/step={K*M_per_patch}  reg_every={reg_every}")
     print(f"  μ={mu}  γ={gamma}  λ₁={lam}  λ₂={lam2}  λ_outer={lambda_outer_boundary}")
@@ -450,18 +474,26 @@ def train_multi_patch(pts3n: np.ndarray,
         opt.zero_grad()
 
         # Build the target batch on CPU, then transfer once to the device.
-        pts_batch = torch.empty(K, M_per_patch, 3)
-        nrm_batch = torch.empty(K, M_per_patch, 3) if gamma > 0 else None
-        for i in range(K):
-            ridx = torch.randint(0, lengths[i], (M_per_patch,))
-            pts_batch[i] = active_pts[i][ridx]
+        if no_presplit:
+            target_batch_size = K * M_per_patch
+            ridx = torch.randint(0, pts3n.shape[0], (target_batch_size,))
+            tgt_flat = torch.tensor(pts3n[ridx], dtype=torch.float32, device=device)
+            tgt = tgt_flat.reshape(1, target_batch_size, 3)
             if gamma > 0:
-                nrm_batch[i] = active_nrm[i][ridx]
+                tgt_nrm = torch.tensor(normals[ridx], dtype=torch.float32, device=device).reshape(1, target_batch_size, 3)
+        else:
+            pts_batch = torch.empty(K, M_per_patch, 3)
+            nrm_batch = torch.empty(K, M_per_patch, 3) if gamma > 0 else None
+            for i in range(K):
+                ridx = torch.randint(0, lengths[i], (M_per_patch,))
+                pts_batch[i] = active_pts[i][ridx]
+                if gamma > 0:
+                    nrm_batch[i] = active_nrm[i][ridx]
 
-        tgt = pts_batch.to(device)
-        tgt_flat = tgt.reshape(-1, 3)
-        if gamma > 0:
-            tgt_nrm = nrm_batch.to(device)
+            tgt = pts_batch.to(device)
+            tgt_flat = tgt.reshape(-1, 3)
+            if gamma > 0:
+                tgt_nrm = nrm_batch.to(device)
 
         # Single batched forward pass.
         uv_flat = torch.rand(K * M_per_patch, 2, device=device, requires_grad=True)
@@ -469,13 +501,19 @@ def train_multi_patch(pts3n: np.ndarray,
         Q = Q_flat.reshape(K, M_per_patch, 3)
 
         # Loss 1: Chamfer distance.
-        D = torch.cdist(tgt, Q)
-        cd_loss = D.min(dim=2).values.mean() + D.min(dim=1).values.mean()
+        if no_presplit:
+            cd_loss = chamfer_distance_chunked(Q_flat, tgt_flat, chunk_size=min(2048, K * M_per_patch))
+            D = None
+        else:
+            D = torch.cdist(tgt, Q)
+            cd_loss = D.min(dim=2).values.mean() + D.min(dim=1).values.mean()
         # cd_loss = D.min(dim=2).values.mean() # Map only xyz ->  uv
 
 
         # Loss 2: cycle consistency.
         if lam > 0:
+            if no_presplit:
+                raise NotImplementedError("Cycle consistency is not supported with --no_presplit")
             uv_inv = G(pidx_flat, tgt_flat)
             P_recon = F(pidx_flat, uv_inv)
             P_recon = P_recon.reshape(K, M_per_patch, 3)
@@ -488,6 +526,8 @@ def train_multi_patch(pts3n: np.ndarray,
 
         # Loss 3: inverse cycle consistency.
         if lam2 > 0:
+            if no_presplit:
+                raise NotImplementedError("Inverse cycle consistency is not supported with --no_presplit")
             uv_recon = G(pidx_flat, Q_flat)
             uv_recon = uv_recon.reshape(K, M_per_patch, 2)
             uv_grid = uv_flat.reshape(K, M_per_patch, 2)
@@ -511,6 +551,8 @@ def train_multi_patch(pts3n: np.ndarray,
                 tangent_loss = torch.zeros((), device=Q.device, dtype=Q.dtype)
 
             if gamma > 0:
+                if no_presplit:
+                    raise NotImplementedError("Normal consistency is not supported with --no_presplit")
                 n_surf = torch.cross(t_u, t_v, dim=-1)
                 n_surf = n_surf / (n_surf.norm(dim=-1, keepdim=True) + 1e-8)
                 n_surf = n_surf.reshape(K, M_per_patch, 3)
@@ -583,7 +625,8 @@ def train_multi_patch(pts3n: np.ndarray,
             # print("    vertex_features[:, 0]="
             #     + ", ".join(f"v{i}={val:.6f}" for i, val in enumerate(vf_first)))
 
-            _save_correspondence_snapshot(epoch, Q, tgt, D)
+            if not no_presplit:
+                _save_correspondence_snapshot(epoch, Q, tgt, D)
             _save_boundary_debug_snapshot(epoch)
             _save_epoch_checkpoint(epoch)
 
@@ -987,6 +1030,8 @@ def main():
                                  help='Axis used to split the point cloud into two sides')
     two_sheet_group.add_argument('--two_sheet_side_axes', type=int, nargs=2, default=(0, 1),
                                  help='Two axes used for axis-aligned segmentation inside each side')
+    two_sheet_group.add_argument('--no_presplit', action='store_true', default=False,
+                                 help='Train two-sheet atlas against the full target cloud without pre-splitting points by side')
 
     args = parser.parse_args()
 
@@ -1196,6 +1241,7 @@ def main():
             correspondence_max_lines=args.correspondence_max_lines,
             correspondence_line_segment=args.correspondence_line_segment,
             atlas_mode=args.atlas_mode,
+            no_presplit=args.no_presplit,
             two_sheet_side_rows=args.two_sheet_side_rows,
             two_sheet_side_cols=args.two_sheet_side_cols,
             two_sheet_split_axis=args.two_sheet_split_axis,
