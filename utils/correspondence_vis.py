@@ -324,6 +324,40 @@ def export_combined_correspondence_ply(
     print(f"    Combined correspondence PLY → {output_ply_path}")
 
 
+def export_global_correspondence_ply(
+    q_points: np.ndarray,
+    t_points: np.ndarray,
+    output_ply_path: str,
+    plot_direction: str = "both",
+) -> None:
+    """Export one global correspondence PLY for no-presplit training mode."""
+    q_points = np.asarray(q_points, dtype=np.float32)
+    t_points = np.asarray(t_points, dtype=np.float32)
+
+    if q_points.ndim != 2 or q_points.shape[1] != 3:
+        raise ValueError(f"q_points must have shape (N, 3), got {q_points.shape}")
+    if t_points.ndim != 2 or t_points.shape[1] != 3:
+        raise ValueError(f"t_points must have shape (M, 3), got {t_points.shape}")
+
+    if q_points.shape[0] == 0 or t_points.shape[0] == 0:
+        raise ValueError("q_points and t_points must both be non-empty")
+
+    distance_matrix = np.linalg.norm(
+        t_points[:, None, :] - q_points[None, :, :], axis=-1
+    ).astype(np.float32)
+    q_to_t_idx = distance_matrix.argmin(axis=0)
+    t_to_q_idx = distance_matrix.argmin(axis=1)
+
+    export_correspondence_ply(
+        q_points=q_points,
+        t_points=t_points,
+        q_to_t_idx=q_to_t_idx,
+        t_to_q_idx=t_to_q_idx,
+        output_ply_path=output_ply_path,
+        plot_direction=plot_direction,
+    )
+
+
 def _plot_correspondences(
     q_points: np.ndarray,
     t_points: np.ndarray,
@@ -456,6 +490,7 @@ __all__ = [
     "export_chamfer_correspondences",
     "export_patchwise_chamfer_correspondences",
     "export_combined_correspondence_ply",
+    "export_global_correspondence_ply",
 ]
 
 

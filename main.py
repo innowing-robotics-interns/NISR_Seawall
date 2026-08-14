@@ -427,6 +427,16 @@ def train_multi_patch(pts3n: np.ndarray,
         epoch_dir = os.path.join(correspondence_dir, f'epoch_{epoch:05d}')
         q_np = q_batch.detach().cpu().numpy()
         tgt_np = tgt_batch.detach().cpu().numpy()
+
+        if no_presplit:
+            correspondence_vis.export_global_correspondence_ply(
+                q_points=q_np.reshape(-1, 3),
+                t_points=tgt_np.reshape(-1, 3),
+                output_ply_path=os.path.join(epoch_dir, 'global_correspondence.ply'),
+                plot_direction=correspondence_line_segment,
+            )
+            return
+
         dist_np = dist_batch.detach().cpu().numpy()
         correspondence_vis.export_patchwise_chamfer_correspondences(
             q_batches=q_np,
@@ -625,8 +635,7 @@ def train_multi_patch(pts3n: np.ndarray,
             # print("    vertex_features[:, 0]="
             #     + ", ".join(f"v{i}={val:.6f}" for i, val in enumerate(vf_first)))
 
-            if not no_presplit:
-                _save_correspondence_snapshot(epoch, Q, tgt, D)
+            _save_correspondence_snapshot(epoch, Q, tgt, D)
             _save_boundary_debug_snapshot(epoch)
             _save_epoch_checkpoint(epoch)
 
