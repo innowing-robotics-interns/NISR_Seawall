@@ -397,9 +397,14 @@ def _load_model_from_checkpoint(ckpt_path, device, model_path=None):
         raise AttributeError("model module does not define MultiPatchForwardMap or TwoSheetForwardMap")
 
     ckpt = torch.load(ckpt_path, map_location=device)
-    if ckpt.get('mode') != 'multi_patch' and ckpt.get('mode') != 'multi_patch_pretrain_flat_sheet':
+    supported_modes = {
+        'multi_patch',
+        'multi_patch_pretrain_flat_sheet',
+        'multi_patch_pretrain_closed_shape',
+    }
+    if ckpt.get('mode') not in supported_modes:
         raise ValueError(
-            f"Checkpoint mode is '{ckpt.get('mode')}', expected 'multi_patch' or 'multi_patch_pretrain_flat_sheet'. "
+            f"Checkpoint mode is '{ckpt.get('mode')}', expected one of {sorted(supported_modes)}. "
             f"Checkerboard export only supports multi-patch checkpoints."
         )
 
