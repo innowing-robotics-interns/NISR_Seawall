@@ -795,7 +795,8 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
                                       two_sheet_side_rows: int = 2,
                                       two_sheet_side_cols: int = 2,
                                       two_sheet_split_axis: int = 2,
-                                      two_sheet_side_axes=(0, 1)):
+                                      two_sheet_side_axes=(0, 1),
+                                      no_presplit: bool = False):
     """
     Pretrain the multi-patch forward map on a synthetic closed shape.
 
@@ -827,31 +828,39 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
     n_cols = atlas_info['n_cols']
     actual_n_patches = atlas_info['actual_n_patches']
 
-    assignments, _, _, _ = _run_presegmentation(
-        pts3n=pts3n,
-        atlas_mode=atlas_mode,
-        n_rows=n_rows,
-        n_cols=n_cols,
-        two_sheet_split_axis=two_sheet_split_axis,
-        two_sheet_side_axes=two_sheet_side_axes,
-    )
+    if no_presplit:
+        active_ids = list(range(actual_n_patches))
+        active_pts = None
+        K = len(active_ids)
+        active_idx_dev = torch.tensor(active_ids, dtype=torch.long, device=device)
+        pidx_flat = active_idx_dev.repeat_interleave(M_per_patch)
+        lengths = None
+    else:
+        assignments, _, _, _ = _run_presegmentation(
+            pts3n=pts3n,
+            atlas_mode=atlas_mode,
+            n_rows=n_rows,
+            n_cols=n_cols,
+            two_sheet_split_axis=two_sheet_split_axis,
+            two_sheet_side_axes=two_sheet_side_axes,
+        )
 
-    active_ids = []
-    active_pts = []
-    for k in range(actual_n_patches):
-        mask = assignments == k
-        pts_k = pts3n[mask]
-        if pts_k.shape[0] >= 10:
-            active_ids.append(k)
-            active_pts.append(torch.tensor(pts_k, dtype=torch.float32))
+        active_ids = []
+        active_pts = []
+        for k in range(actual_n_patches):
+            mask = assignments == k
+            pts_k = pts3n[mask]
+            if pts_k.shape[0] >= 10:
+                active_ids.append(k)
+                active_pts.append(torch.tensor(pts_k, dtype=torch.float32))
 
-    K = len(active_ids)
-    if K == 0:
-        raise RuntimeError("Closed-shape pretraining found no active patches")
+        K = len(active_ids)
+        if K == 0:
+            raise RuntimeError("Closed-shape pretraining found no active patches")
 
-    active_idx_dev = torch.tensor(active_ids, dtype=torch.long, device=device)
-    pidx_flat = active_idx_dev.repeat_interleave(M_per_patch)
-    lengths = [p.shape[0] for p in active_pts]
+        active_idx_dev = torch.tensor(active_ids, dtype=torch.long, device=device)
+        pidx_flat = active_idx_dev.repeat_interleave(M_per_patch)
+        lengths = [p.shape[0] for p in active_pts]
 
     opt = torch.optim.Adam(F.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
@@ -864,6 +873,8 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
     print(f"  Two-sheet grid={atlas_info['n_sides']} × ({n_rows}×{n_cols})  patches={actual_n_patches}")
     print(f"  d_features={d_features}  W={W}  D={D}  L={L}  β={beta}")
     print(f"  M_per_patch={M_per_patch}  active_patches={K}/{actual_n_patches}")
+    if no_presplit:
+        print("  Pretraining mode: no-presplit global Chamfer over full synthetic cloud")
     print(f"  μ={mu}  Epochs={epochs}  lr={lr}  device={device}")
     print(f"{'─'*60}")
     t0 = time.time()
@@ -873,19 +884,31 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
     for epoch in range(1, epochs + 1):
         opt.zero_grad()
 
-        pts_batch = torch.empty(K, M_per_patch, 3)
-        for i in range(K):
-            ridx = torch.randint(0, lengths[i], (M_per_patch,))
-            pts_batch[i] = active_pts[i][ridx]
+        if no_presplit:
+            target_batch_size = K * M_per_patch
+            ridx = torch.randint(0, pts3n.shape[0], (target_batch_size,))
+            tgt_flat = torch.tensor(pts3n[ridx], dtype=torch.float32, device=device)
+            tgt = tgt_flat.reshape(1, target_batch_size, 3)
+        else:
+            pts_batch = torch.empty(K, M_per_patch, 3)
+            for i in range(K):
+                ridx = torch.randint(0, lengths[i], (M_per_patch,))
+                pts_batch[i] = active_pts[i][ridx]
 
-        tgt = pts_batch.to(device)
+            tgt = pts_batch.to(device)
+            tgt_flat = tgt.reshape(-1, 3)
 
         uv_flat = torch.rand(K * M_per_patch, 2, device=device, requires_grad=True)
         Q_flat = F(pidx_flat, uv_flat)
         Q = Q_flat.reshape(K, M_per_patch, 3)
 
-        Dmat = torch.cdist(tgt, Q)
-        cd_loss = Dmat.min(dim=2).values.mean() + Dmat.min(dim=1).values.mean()
+        if no_presplit:
+            cd_loss = chamfer_distance_chunked(
+                Q_flat, tgt_flat, chunk_size=min(2048, K * M_per_patch)
+            )
+        else:
+            Dmat = torch.cdist(tgt, Q)
+            cd_loss = Dmat.min(dim=2).values.mean() + Dmat.min(dim=1).values.mean()
 
         mu_eff = mu_warmup_schedule(
             epoch, mu_warmup_epochs, mu,
@@ -1030,6 +1053,7 @@ def main():
     parser.add_argument('--mu_warmup_delay', type=int, default=0,
                         help='Epochs to delay μ warmup (μ=0) before ramping up')
 
+    # Two sheet specific args
     two_sheet_group = parser.add_argument_group('two-sheet configuration')
     two_sheet_group.add_argument('--two_sheet_side_rows', type=int, default=2,
                                  help='Rows of patches per side for atlas_mode=two_sheet')
@@ -1041,7 +1065,8 @@ def main():
                                  help='Two axes used for axis-aligned segmentation inside each side')
     two_sheet_group.add_argument('--no_presplit', action='store_true', default=False,
                                  help='Train two-sheet atlas against the full target cloud without pre-splitting points by side')
-
+    two_sheet_group.add_argument('--no_presplit_pretrain', action='store_true', default=False,
+                                 help='Disable pre-splitting of points during pretraining for two-sheet mode')
     args = parser.parse_args()
 
     # Load the data
@@ -1141,6 +1166,7 @@ def main():
                 two_sheet_side_cols=args.two_sheet_side_cols,
                 two_sheet_split_axis=args.two_sheet_split_axis,
                 two_sheet_side_axes=tuple(args.two_sheet_side_axes),
+                no_presplit=args.no_presplit_pretrain,
             )
         else:
             F_model, pretrain_history = pretrain_multi_patch_flat_sheet(
