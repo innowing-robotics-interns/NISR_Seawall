@@ -388,13 +388,14 @@ def _load_model_from_checkpoint(ckpt_path, device, model_path=None):
     model_module = _import_model_module(model_path)
     MultiPatchForwardMap = getattr(model_module, 'MultiPatchForwardMap', None)
     TwoSheetForwardMap = getattr(model_module, 'TwoSheetForwardMap', None)
+    SixSheetForwardMap = getattr(model_module, 'SixSheetForwardMap', None)
     if MultiPatchForwardMap is None and model_path is not None and os.path.basename(model_path) == 'main.py':
         sibling_model_path = os.path.join(os.path.dirname(os.path.abspath(model_path)), 'model', 'model.py')
         if os.path.exists(sibling_model_path):
             model_module = _import_model_module(sibling_model_path)
             MultiPatchForwardMap = model_module.MultiPatchForwardMap
-    if MultiPatchForwardMap is None and TwoSheetForwardMap is None:
-        raise AttributeError("model module does not define MultiPatchForwardMap or TwoSheetForwardMap")
+    if MultiPatchForwardMap is None and TwoSheetForwardMap is None and SixSheetForwardMap is None:
+        raise AttributeError("model module does not define MultiPatchForwardMap, TwoSheetForwardMap, or SixSheetForwardMap")
 
     ckpt = torch.load(ckpt_path, map_location=device)
     supported_modes = {
@@ -416,6 +417,15 @@ def _load_model_from_checkpoint(ckpt_path, device, model_path=None):
         if TwoSheetForwardMap is None:
             raise AttributeError("model module does not define TwoSheetForwardMap")
         F = TwoSheetForwardMap(
+            n_rows=n_rows,
+            n_cols=n_cols,
+            d_features=args['d_features'],
+            L=args['L'], W=args['W'], D=args['D'], beta=args['beta'],
+        ).to(device)
+    elif atlas_mode == 'six_sheet':
+        if SixSheetForwardMap is None:
+            raise AttributeError("model module does not define SixSheetForwardMap")
+        F = SixSheetForwardMap(
             n_rows=n_rows,
             n_cols=n_cols,
             d_features=args['d_features'],

@@ -31,7 +31,7 @@ from model.losses import (boundary_chamfer_loss, chamfer_1d,
                                              tangent_loss_from_jac)
 from model.model import (FeatureComplex, ForwardMap, InverseMap, MultiPatchForwardMap,
            MultiPatchInverseMap, PositionalEncoding, SkipMLP,
-           TwoSheetForwardMap)
+       TwoSheetForwardMap, SixSheetForwardMap)
 try:
     import open3d as o3d
 except ImportError:
@@ -47,7 +47,9 @@ def _build_forward_model(atlas_mode: str,
                          beta: float,
                          device: str,
                          two_sheet_side_rows: int = 2,
-                         two_sheet_side_cols: int = 2):
+                         two_sheet_side_cols: int = 2,
+                         six_sheet_face_rows: int = 2,
+                         six_sheet_face_cols: int = 2):
     """Create the forward model for the selected atlas configuration."""
     if atlas_mode == 'single_sheet':
         n_rows, n_cols = pc_presegmentation.compute_grid_dims(n_patches)
@@ -67,6 +69,21 @@ def _build_forward_model(atlas_mode: str,
         n_rows = two_sheet_side_rows
         n_cols = two_sheet_side_cols
         F = TwoSheetForwardMap(n_rows=n_rows, n_cols=n_cols, d_features=d_features,
+                               L=L, W=W, D=D, beta=beta).to(device)
+        atlas_info = {
+            'atlas_mode': atlas_mode,
+            'n_rows': n_rows,
+            'n_cols': n_cols,
+            'actual_n_patches': F.n_patches,
+            'n_sides': F.n_sides,
+            'patches_per_side': F.patches_per_side,
+        }
+        return F, atlas_info
+
+    if atlas_mode == 'six_sheet':
+        n_rows = six_sheet_face_rows
+        n_cols = six_sheet_face_cols
+        F = SixSheetForwardMap(n_rows=n_rows, n_cols=n_cols, d_features=d_features,
                                L=L, W=W, D=D, beta=beta).to(device)
         atlas_info = {
             'atlas_mode': atlas_mode,
@@ -153,7 +170,9 @@ def train_multi_patch(pts3n: np.ndarray,
                       two_sheet_side_rows: int = 2,
                       two_sheet_side_cols: int = 2,
                       two_sheet_split_axis: int = 2,
-                      two_sheet_side_axes=(0, 1)):
+                      two_sheet_side_axes=(0, 1),
+                      six_sheet_face_rows: int = 2,
+                      six_sheet_face_cols: int = 2):
     """
     Train the multi-patch model and inverse map.
 
@@ -171,6 +190,8 @@ def train_multi_patch(pts3n: np.ndarray,
         device=device,
         two_sheet_side_rows=two_sheet_side_rows,
         two_sheet_side_cols=two_sheet_side_cols,
+        six_sheet_face_rows=six_sheet_face_rows,
+        six_sheet_face_cols=six_sheet_face_cols,
     )
     n_rows = atlas_info['n_rows']
     n_cols = atlas_info['n_cols']
@@ -178,8 +199,10 @@ def train_multi_patch(pts3n: np.ndarray,
 
     if atlas_mode == 'single_sheet':
         print(f"  Grid layout: {n_rows} rows × {n_cols} cols = {actual_n_patches} patches")
-    else:
+    elif atlas_mode == 'two_sheet':
         print(f"  Two-sheet layout: {atlas_info['n_sides']} sides × ({n_rows} rows × {n_cols} cols) = {actual_n_patches} patches")
+    else:
+        print(f"  Six-sheet layout: {atlas_info['n_sides']} faces × ({n_rows} rows × {n_cols} cols) = {actual_n_patches} patches")
 
     if gamma > 0:
         assert normals is not None, "normals must be provided when gamma > 0"
@@ -187,8 +210,8 @@ def train_multi_patch(pts3n: np.ndarray,
             f"Normals shape {normals.shape} != points shape {pts3n.shape}"
         print(f"  Normal constraint active (γ={gamma}), normals shape: {normals.shape}")
 
-    if no_presplit and atlas_mode != 'two_sheet':
-        raise ValueError("--no_presplit is currently supported only with atlas_mode='two_sheet'")
+    if no_presplit and atlas_mode not in ('two_sheet', 'six_sheet'):
+        raise ValueError("--no_presplit is currently supported only with atlas_mode='two_sheet' or 'six_sheet'")
 
     if no_presplit:
         assignments = np.arange(pts3n.shape[0], dtype=np.int32) % actual_n_patches
@@ -293,8 +316,8 @@ def train_multi_patch(pts3n: np.ndarray,
     if use_inverse_map:
         if atlas_mode != 'single_sheet':
             raise NotImplementedError(
-                "Inverse-map training is not yet implemented for atlas_mode='two_sheet'. "
-                "Use --lam 0 --lam2 0 for two-sheet experiments."
+                "Inverse-map training is not yet implemented for atlas_mode != 'single_sheet'. "
+                "Use --lam 0 --lam2 0 for multi-sheet experiments."
             )
         G = MultiPatchInverseMap(F.complex, d_features=d_features,
                                  L=L_inv, W=W, D=D, beta=beta).to(device)
@@ -404,6 +427,8 @@ def train_multi_patch(pts3n: np.ndarray,
                 'two_sheet_side_cols': two_sheet_side_cols,
                 'two_sheet_split_axis': two_sheet_split_axis,
                 'two_sheet_side_axes': list(two_sheet_side_axes),
+                'six_sheet_face_rows': six_sheet_face_rows,
+                'six_sheet_face_cols': six_sheet_face_cols,
             }),
             'grid_dims': (n_rows, n_cols),
             'atlas_info': atlas_info,
@@ -796,7 +821,10 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
                                       two_sheet_side_cols: int = 2,
                                       two_sheet_split_axis: int = 2,
                                       two_sheet_side_axes=(0, 1),
-                                      no_presplit: bool = False):
+                                      no_presplit: bool = False,
+                                      six_sheet_face_rows: int = 2,
+                                      six_sheet_face_cols: int = 2,
+                                      face_aware_box_supervision: bool = False):
     """
     Pretrain the multi-patch forward map on a synthetic closed shape.
 
@@ -805,12 +833,15 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
     trained to fit a synthetic closed shape before being fine-tuned on the real
     point cloud.
     """
-    if atlas_mode != 'two_sheet':
+    if atlas_mode not in ('two_sheet', 'six_sheet'):
         raise ValueError(
-            "pretrain_multi_patch_closed_shape currently supports atlas_mode='two_sheet' only"
+            "pretrain_multi_patch_closed_shape currently supports atlas_mode='two_sheet' or 'six_sheet' only"
         )
 
-    pts3n, _ = utils.make_synthetic_surface(shape=shape, n=beta_shape_samples, noise=0)
+    if atlas_mode == 'six_sheet' and shape != 'box' and face_aware_box_supervision:
+        raise ValueError("face-aware box supervision is only supported for atlas_mode='six_sheet' with shape='box'")
+
+    pts3n, synthetic_meta = utils.make_synthetic_surface(shape=shape, n=beta_shape_samples, noise=0)
 
     F, atlas_info = _build_forward_model(
         atlas_mode=atlas_mode,
@@ -823,12 +854,25 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
         device=device,
         two_sheet_side_rows=two_sheet_side_rows,
         two_sheet_side_cols=two_sheet_side_cols,
+        six_sheet_face_rows=six_sheet_face_rows,
+        six_sheet_face_cols=six_sheet_face_cols,
     )
     n_rows = atlas_info['n_rows']
     n_cols = atlas_info['n_cols']
     actual_n_patches = atlas_info['actual_n_patches']
 
-    if no_presplit:
+    if atlas_mode == 'six_sheet' and face_aware_box_supervision:
+        face_names = ['+X', '-X', '+Y', '-Y', '+Z', '-Z']
+        face_points_np = synthetic_meta.get('face_points')
+        if face_points_np is None:
+            raise ValueError("Synthetic box metadata is missing face_points required for face-aware supervision")
+        active_ids = list(range(actual_n_patches))
+        K = len(active_ids)
+        active_idx_dev = torch.tensor(active_ids, dtype=torch.long, device=device)
+        pidx_flat = active_idx_dev.repeat_interleave(M_per_patch)
+        lengths = None
+        active_pts = None
+    elif no_presplit:
         active_ids = list(range(actual_n_patches))
         active_pts = None
         K = len(active_ids)
@@ -870,10 +914,15 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
     print(f"\n{'─'*60}")
     print(f"  Multi-Patch Closed-Shape Pretraining")
     print(f"  Shape={shape}  atlas={atlas_mode}")
-    print(f"  Two-sheet grid={atlas_info['n_sides']} × ({n_rows}×{n_cols})  patches={actual_n_patches}")
+    if atlas_mode == 'two_sheet':
+        print(f"  Two-sheet grid={atlas_info['n_sides']} × ({n_rows}×{n_cols})  patches={actual_n_patches}")
+    else:
+        print(f"  Six-sheet grid={atlas_info['n_sides']} × ({n_rows}×{n_cols})  patches={actual_n_patches}")
     print(f"  d_features={d_features}  W={W}  D={D}  L={L}  β={beta}")
     print(f"  M_per_patch={M_per_patch}  active_patches={K}/{actual_n_patches}")
-    if no_presplit:
+    if atlas_mode == 'six_sheet' and face_aware_box_supervision:
+        print("  Pretraining mode: direct face-aware supervision on cube faces")
+    elif no_presplit:
         print("  Pretraining mode: no-presplit global Chamfer over full synthetic cloud")
     print(f"  μ={mu}  Epochs={epochs}  lr={lr}  device={device}")
     print(f"{'─'*60}")
@@ -884,7 +933,17 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
     for epoch in range(1, epochs + 1):
         opt.zero_grad()
 
-        if no_presplit:
+        if atlas_mode == 'six_sheet' and face_aware_box_supervision:
+            tgt_batches = []
+            for patch_id in active_ids:
+                face_idx = patch_id // (n_rows * n_cols)
+                face_name = face_names[face_idx]
+                pts_face = face_points_np[face_name]
+                ridx = np.random.randint(0, pts_face.shape[0], size=M_per_patch)
+                tgt_batches.append(torch.tensor(pts_face[ridx], dtype=torch.float32))
+            tgt = torch.stack(tgt_batches, dim=0).to(device)
+            tgt_flat = tgt.reshape(-1, 3)
+        elif no_presplit:
             target_batch_size = K * M_per_patch
             ridx = torch.randint(0, pts3n.shape[0], (target_batch_size,))
             tgt_flat = torch.tensor(pts3n[ridx], dtype=torch.float32, device=device)
@@ -902,7 +961,9 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
         Q_flat = F(pidx_flat, uv_flat)
         Q = Q_flat.reshape(K, M_per_patch, 3)
 
-        if no_presplit:
+        if atlas_mode == 'six_sheet' and face_aware_box_supervision:
+            cd_loss = torch.cdist(tgt, Q).min(dim=2).values.mean() + torch.cdist(tgt, Q).min(dim=1).values.mean()
+        elif no_presplit:
             cd_loss = chamfer_distance_chunked(
                 Q_flat, tgt_flat, chunk_size=min(2048, K * M_per_patch)
             )
@@ -958,7 +1019,7 @@ def main():
     parser.add_argument('--file', type=str, default=None,
                         help='Point cloud file (.ply/.xyz/.txt/.npy). Omit for synthetic demo')
     parser.add_argument('--shape', type=str, default='flat_sheet',
-                        choices=['saddle', 'hemisphere', 'torus_patch', 'wavy', 'sphere', 'flat_sheet', 'stepped_sheet'],
+                        choices=['saddle', 'hemisphere','box', 'torus_patch', 'wavy', 'sphere', 'flat_sheet', 'stepped_sheet'],
                         help='Synthetic surface type for demo mode')
     parser.add_argument('--result_dir', type=str, default='results_sheet',
                         help='Output directory (auto-increments if exists)')
@@ -972,7 +1033,7 @@ def main():
     parser.add_argument('--multi_patch', action='store_true', default=True,
                         help='Use multi-patch feature complex mode')
     parser.add_argument('--atlas_mode', type=str, default='single_sheet',
-                        choices=['single_sheet', 'two_sheet'],
+                        choices=['single_sheet', 'two_sheet', 'six_sheet'],
                         help='Atlas configuration: one connected sheet or two-sheet shared-boundary atlas')
 
     # Shared hparam
@@ -1046,7 +1107,7 @@ def main():
                         choices=['auto', 'flat', 'closed_shape'],
                         help='Initialization pretraining mode: flat sheet, closed shape, or auto-select based on atlas')
     parser.add_argument('--pretrain_shape', type=str, default='sphere',
-                        choices=['saddle', 'hemisphere', 'torus_patch', 'wavy', 'sphere', 'flat_sheet', 'stepped_sheet'],
+                        choices=['saddle', 'hemisphere', 'box', 'torus_patch', 'wavy', 'sphere', 'flat_sheet', 'stepped_sheet'],
                         help='Synthetic shape used for closed-shape pretraining')
     parser.add_argument('--pretrain_shape_samples', type=int, default=200000,
                         help='Number of synthetic samples used for closed-shape pretraining')
@@ -1067,6 +1128,13 @@ def main():
                                  help='Train two-sheet atlas against the full target cloud without pre-splitting points by side')
     two_sheet_group.add_argument('--no_presplit_pretrain', action='store_true', default=False,
                                  help='Disable pre-splitting of points during pretraining for two-sheet mode')
+    six_sheet_group = parser.add_argument_group('six-sheet configuration')
+    six_sheet_group.add_argument('--six_sheet_face_rows', type=int, default=2,
+                                 help='Rows of patches per face for atlas_mode=six_sheet')
+    six_sheet_group.add_argument('--six_sheet_face_cols', type=int, default=2,
+                                 help='Cols of patches per face for atlas_mode=six_sheet')
+    six_sheet_group.add_argument('--face_aware_box_supervision', action='store_true', default=False,
+                                 help='Use direct face-aware supervision during six-sheet box pretraining')
     args = parser.parse_args()
 
     # Load the data
@@ -1123,6 +1191,7 @@ def main():
     init_ply_path = os.path.join(result_dir, 'learned_sheet_initial.ply')
     psr_ply_path = os.path.join(result_dir, 'psr_reconstruction.ply')
     ckpt_path = os.path.join(result_dir, 'checkpoint.pt')
+    pretrain_ckpt_path = os.path.join(result_dir, 'pretrain_checkpoint.pt')
 
     print(f"  Output directory: {result_dir}")
 
@@ -1167,6 +1236,9 @@ def main():
                 two_sheet_split_axis=args.two_sheet_split_axis,
                 two_sheet_side_axes=tuple(args.two_sheet_side_axes),
                 no_presplit=args.no_presplit_pretrain,
+                six_sheet_face_rows=args.six_sheet_face_rows,
+                six_sheet_face_cols=args.six_sheet_face_cols,
+                face_aware_box_supervision=args.face_aware_box_supervision,
             )
         else:
             F_model, pretrain_history = pretrain_multi_patch_flat_sheet(
@@ -1185,6 +1257,8 @@ def main():
                 atlas_mode=args.atlas_mode,
                 two_sheet_side_rows=args.two_sheet_side_rows,
                 two_sheet_side_cols=args.two_sheet_side_cols,
+                six_sheet_face_rows=args.six_sheet_face_rows,
+                six_sheet_face_cols=args.six_sheet_face_cols,
             )
         F_model.eval()
         pretrained_F_state = {
@@ -1207,16 +1281,16 @@ def main():
             'history': pretrain_history,
             'grid_dims': (F_model.n_rows, F_model.n_cols),
             'atlas_mode': args.atlas_mode,
-        }, ckpt_path)
+        }, pretrain_ckpt_path)
 
-        print(f"    Pretrain checkpoint → {ckpt_path}")
+        print(f"    Pretrain checkpoint → {pretrain_ckpt_path}")
 
         if args.pretrain_init and not args.pretrain_then_train:
             print(f"\n{'='*60}")
             print("  Initialization pretraining complete!")
             print("  Outputs:")
             print(f"    {init_ply_path}     — initialized flat-sheet mesh")
-            print(f"    {ckpt_path}         — pretrained forward-map weights")
+            print(f"    {pretrain_ckpt_path}         — pretrained forward-map weights")
             print(f"{'='*60}\n")
             return
 
@@ -1269,7 +1343,7 @@ def main():
             normals=normals,
             reg_every=args.reg_every,
             pretrained_F_state=pretrained_F_state,
-            pretrained_ckpt_path=ckpt_path if pretrained_F_state is not None else None,
+            pretrained_ckpt_path=pretrain_ckpt_path if pretrained_F_state is not None else None,
             correspondence_dir=os.path.join(result_dir, 'correspondences'),
             save_correspondence_every=args.save_correspondence_every,
             save_boundary_debug_every=args.save_boundary_debug_every,
@@ -1281,6 +1355,8 @@ def main():
             two_sheet_side_cols=args.two_sheet_side_cols,
             two_sheet_split_axis=args.two_sheet_split_axis,
             two_sheet_side_axes=tuple(args.two_sheet_side_axes),
+            six_sheet_face_rows=args.six_sheet_face_rows,
+            six_sheet_face_cols=args.six_sheet_face_cols,
         )
         F_model.eval()
         if G_model is not None:

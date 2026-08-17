@@ -284,6 +284,77 @@ def make_synthetic_surface(shape='saddle', n=20000, noise=0, seed=42):
         x = np.sin(theta) * np.cos(phi)
         y = np.sin(theta) * np.sin(phi)
         z = np.cos(theta)
+    elif shape == 'box':
+        # Uniformly sample points on the 6 faces of the axis-aligned cube
+        # [-1, 1]^3.
+        face_names = ['+X', '-X', '+Y', '-Y', '+Z', '-Z']
+        face_ids = rng.integers(0, 6, size=n)
+        pts = np.empty((n, 3), dtype=np.float32)
+
+        for face_id in range(6):
+            mask = face_ids == face_id
+            count = int(mask.sum())
+            if count == 0:
+                continue
+
+            a = rng.uniform(-1.0, 1.0, count).astype(np.float32)
+            b = rng.uniform(-1.0, 1.0, count).astype(np.float32)
+
+            if face_id == 0:
+                pts[mask] = np.stack([
+                    np.ones(count, dtype=np.float32), a, b
+                ], axis=-1)
+            elif face_id == 1:
+                pts[mask] = np.stack([
+                    -np.ones(count, dtype=np.float32), a, b
+                ], axis=-1)
+            elif face_id == 2:
+                pts[mask] = np.stack([
+                    a, np.ones(count, dtype=np.float32), b
+                ], axis=-1)
+            elif face_id == 3:
+                pts[mask] = np.stack([
+                    a, -np.ones(count, dtype=np.float32), b
+                ], axis=-1)
+            elif face_id == 4:
+                pts[mask] = np.stack([
+                    a, b, np.ones(count, dtype=np.float32)
+                ], axis=-1)
+            else:
+                pts[mask] = np.stack([
+                    a, b, -np.ones(count, dtype=np.float32)
+                ], axis=-1)
+
+        pts += rng.normal(0, noise, pts.shape).astype(np.float32)
+
+        center = pts.mean(axis=0)
+        pts -= center
+        scale = float(np.abs(pts).max())
+        if scale > 1e-8:
+            pts /= scale
+
+        face_points = {
+            face_names[face_id]: pts[face_ids == face_id].astype(np.float32)
+            for face_id in range(6)
+        }
+
+        meta = {
+            'center': center,
+            'scale': scale,
+            'n_raw': n,
+            'face_ids': face_ids.astype(np.int32),
+            'face_names': face_names,
+            'face_points': face_points,
+        }
+
+        ply_path = os.path.abspath(f"synthetic_{shape}_n{n}_seed{seed}.ply")
+        export_point_cloud_ply(pts, ply_path)
+        meta['synthetic_ply_path'] = ply_path
+
+        print(f"  Generated '{shape}' surface: {n} points, noise={noise}")
+        print(f"  Normalization: center={center}, scale={scale:.6f}")
+        print(f"  Synthetic point cloud saved to: {meta['synthetic_ply_path']}")
+        return pts, meta
     elif shape == 'flat_sheet':
         x = rng.uniform(-1, 1, n)
         y = rng.uniform(-1, 1, n)
@@ -1120,6 +1191,141 @@ def _visualize_two_sheet_patch_assignments_3d(pts3n, assignments, side_assignmen
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"  Two-sheet 3D patch visualization saved to: {save_path}")
+
+
+def _visualize_six_sheet_patch_assignments(pts3n, assignments, face_assignments,
+                                           grid_topology, patch_params,
+                                           n_rows, n_cols,
+                                           save_path='patch_assignments_six_sheet.png'):
+    """Visualize six-sheet patch assignments in 3D and per-face UV space."""
+    n_faces = 6
+    n_patches_total = n_faces * n_rows * n_cols
+    face_names = ['+X', '-X', '+Y', '-Y', '+Z', '-Z']
+
+    fig = plt.figure(figsize=(20, 12))
+    gs = gridspec.GridSpec(3, 4, figure=fig, hspace=0.35, wspace=0.3)
+
+    cmap = plt.get_cmap('tab20', max(n_patches_total, 1))
+
+    ax0 = fig.add_subplot(gs[0, 0], projection='3d')
+    ax0.scatter(pts3n[:, 0], pts3n[:, 1], pts3n[:, 2],
+                c=assignments, cmap='tab20', s=2, alpha=0.7,
+                vmin=0, vmax=max(n_patches_total - 1, 1))
+    ax0.set_title('3D Point Cloud Colored by Six-Sheet Patch ID', fontsize=10)
+    ax0.set_xlabel('x')
+    ax0.set_ylabel('y')
+    ax0.set_zlabel('z')
+
+    for face_id in range(n_faces):
+        row = face_id // 3
+        col = face_id % 3 + 1
+        ax = fig.add_subplot(gs[row, col])
+        mask = face_assignments == face_id
+        if np.any(mask):
+            ax.scatter(patch_params[mask, 0], patch_params[mask, 1],
+                       c=assignments[mask], cmap='tab20', s=3, alpha=0.7,
+                       vmin=0, vmax=max(n_patches_total - 1, 1))
+        for i in range(1, n_rows):
+            ax.axhline(y=i / n_rows, color='black', linewidth=0.5, alpha=0.5)
+        for j in range(1, n_cols):
+            ax.axvline(x=j / n_cols, color='black', linewidth=0.5, alpha=0.5)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_aspect('equal')
+        ax.set_xlabel('u')
+        ax.set_ylabel('v')
+        ax.set_title(f'Face {face_names[face_id]} UV Segmentation', fontsize=10)
+
+    for face_id in range(n_faces):
+        row = 2
+        col = face_id % 4
+        if face_id >= 4:
+            continue
+        ax = fig.add_subplot(gs[row, col])
+        face_grid = grid_topology[face_id]
+        ax.imshow(face_grid, cmap='tab20', aspect='equal',
+                  vmin=0, vmax=max(n_patches_total - 1, 1))
+        ax.set_title(f'Face {face_names[face_id]} Grid', fontsize=10)
+        ax.set_xlabel('Column')
+        ax.set_ylabel('Row')
+        for i in range(n_rows):
+            for j in range(n_cols):
+                patch_id = int(face_grid[i, j])
+                ax.text(j, i, str(patch_id), ha='center', va='center',
+                        color='white' if patch_id < n_patches_total // 2 else 'black', fontsize=8)
+
+    counts = np.bincount(assignments, minlength=n_patches_total)
+    ax_counts = fig.add_axes([0.58, 0.08, 0.35, 0.18])
+    ax_counts.bar(range(n_patches_total), counts, color=[cmap(i) for i in range(n_patches_total)])
+    ax_counts.set_title('Points per Patch (All Six Faces)', fontsize=10)
+    ax_counts.set_xlabel('Global Patch ID')
+    ax_counts.set_ylabel('Point Count')
+    if np.any(counts > 0):
+        ax_counts.axhline(y=np.mean(counts[counts > 0]), color='red', linestyle='--',
+                          label=f'Mean: {counts[counts > 0].mean():.0f}')
+        ax_counts.legend()
+
+    plt.suptitle(
+        f'Six-Sheet Patch Assignment Visualization (6 × {n_rows}×{n_cols} = {n_patches_total} patches)',
+        fontsize=14, fontweight='bold'
+    )
+    plt.tight_layout(rect=[0, 0.08, 1, 0.96])
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Six-sheet patch visualization saved to: {save_path}")
+
+
+def _visualize_six_sheet_patch_assignments_3d(pts3n, assignments, face_assignments,
+                                              n_rows, n_cols,
+                                              save_path='patch_assignments_six_sheet_3d.png'):
+    """Create multi-view 3D visualization for six-sheet patch assignments."""
+    n_patches_total = 6 * n_rows * n_cols
+    cmap = plt.get_cmap('tab20', max(n_patches_total, 1))
+    face_names = ['+X', '-X', '+Y', '-Y', '+Z', '-Z']
+
+    fig = plt.figure(figsize=(18, 6))
+    views = [
+        (30, 45, 'View 1 (default)'),
+        (10, 90, 'View 2 (side)'),
+        (80, 45, 'View 3 (top)'),
+    ]
+
+    for idx, (elev, azim, title) in enumerate(views):
+        ax = fig.add_subplot(1, 3, idx + 1, projection='3d')
+        for patch_id in range(n_patches_total):
+            mask = assignments == patch_id
+            if np.any(mask):
+                ax.scatter(pts3n[mask, 0], pts3n[mask, 1], pts3n[mask, 2],
+                           c=[cmap(patch_id)], s=2, alpha=0.6)
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(f'{title}\nElev={elev}°, Azim={azim}°', fontsize=10)
+        ax.set_xlabel('x')
+        ax.set_ylabel('y')
+        ax.set_zlabel('z')
+
+        max_range = np.array([
+            pts3n[:, 0].max() - pts3n[:, 0].min(),
+            pts3n[:, 1].max() - pts3n[:, 1].min(),
+            pts3n[:, 2].max() - pts3n[:, 2].min(),
+        ]).max() / 2.0
+        mid_x = (pts3n[:, 0].max() + pts3n[:, 0].min()) * 0.5
+        mid_y = (pts3n[:, 1].max() + pts3n[:, 1].min()) * 0.5
+        mid_z = (pts3n[:, 2].max() + pts3n[:, 2].min()) * 0.5
+        ax.set_xlim(mid_x - max_range, mid_x + max_range)
+        ax.set_ylim(mid_y - max_range, mid_y + max_range)
+        ax.set_zlim(mid_z - max_range, mid_z + max_range)
+
+    face_counts = np.bincount(face_assignments, minlength=6)
+    plt.suptitle(
+        'Six-Sheet 3D Patch Visualization '
+        f'(6 × {n_rows}×{n_cols} patches)  '
+        + ', '.join([f'{face_names[i]}={face_counts[i]}' for i in range(6)]),
+        fontsize=14, fontweight='bold'
+    )
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Six-sheet 3D patch visualization saved to: {save_path}")
 
 
 def _save_patch_statistics(pts3n, assignments, n_rows, n_cols, save_path='patch_statistics.txt'):

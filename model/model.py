@@ -2,6 +2,7 @@
 # model.py
 
 import math
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -399,6 +400,215 @@ class TwoSheetFeatureComplex(nn.Module):
         return torch.einsum('bk,bkd->bd', w, z)
 
 
+class _UnionFind:
+    """Small union-find helper for atlas vertex equivalence classes."""
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+        self.rank = [0] * n
+
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: int, b: int) -> None:
+        ra = self.find(a)
+        rb = self.find(b)
+        if ra == rb:
+            return
+        if self.rank[ra] < self.rank[rb]:
+            self.parent[ra] = rb
+        elif self.rank[ra] > self.rank[rb]:
+            self.parent[rb] = ra
+        else:
+            self.parent[rb] = ra
+            self.rank[ra] += 1
+
+
+class CubeAtlasTopology:
+    """Cube-face atlas topology with shared edge and corner vertices."""
+    FACE_NAMES = ('+X', '-X', '+Y', '-Y', '+Z', '-Z')
+    FACE_INDEX = {name: idx for idx, name in enumerate(FACE_NAMES)}
+
+    FACE_EMBEDDINGS = {
+        '+X': lambda u, v: np.array([1.0, 1.0 - 2.0 * v, 2.0 * u - 1.0], dtype=np.float64),
+        '-X': lambda u, v: np.array([-1.0, 2.0 * v - 1.0, 2.0 * u - 1.0], dtype=np.float64),
+        '+Y': lambda u, v: np.array([2.0 * u - 1.0, 1.0, 2.0 * v - 1.0], dtype=np.float64),
+        '-Y': lambda u, v: np.array([2.0 * u - 1.0, -1.0, 1.0 - 2.0 * v], dtype=np.float64),
+        '+Z': lambda u, v: np.array([2.0 * u - 1.0, 1.0 - 2.0 * v, 1.0], dtype=np.float64),
+        '-Z': lambda u, v: np.array([2.0 * u - 1.0, 2.0 * v - 1.0, -1.0], dtype=np.float64),
+    }
+
+    def __init__(self, n_rows: int, n_cols: int):
+        self.n_rows = n_rows
+        self.n_cols = n_cols
+        self.n_faces = len(self.FACE_NAMES)
+        self.local_vertices_per_face = (n_rows + 1) * (n_cols + 1)
+        self.edge_glue = self._build_edge_glue()
+        self.vertex_map, self.n_vertices = self._build_vertex_map()
+
+    def _local_linear_index(self, face: int, row: int, col: int) -> int:
+        return face * self.local_vertices_per_face + row * (self.n_cols + 1) + col
+
+    def face_edge_vertices(self, face_name: str, edge_name: str):
+        face = self.FACE_INDEX[face_name]
+        if edge_name == 'top':
+            return [(face, 0, c) for c in range(self.n_cols + 1)]
+        if edge_name == 'bottom':
+            return [(face, self.n_rows, c) for c in range(self.n_cols + 1)]
+        if edge_name == 'left':
+            return [(face, r, 0) for r in range(self.n_rows + 1)]
+        if edge_name == 'right':
+            return [(face, r, self.n_cols) for r in range(self.n_rows + 1)]
+        raise ValueError(f"Unknown edge_name: {edge_name}")
+
+    def _face_xyz(self, face_name: str, u: float, v: float):
+        return self.FACE_EMBEDDINGS[face_name](u, v)
+
+    def _edge_xyz_samples(self, face_name: str, edge_name: str):
+        ts = np.linspace(0.0, 1.0, max(self.n_rows, self.n_cols) + 1)
+        samples = []
+        for t in ts:
+            if edge_name == 'top':
+                samples.append(self._face_xyz(face_name, t, 0.0))
+            elif edge_name == 'bottom':
+                samples.append(self._face_xyz(face_name, t, 1.0))
+            elif edge_name == 'left':
+                samples.append(self._face_xyz(face_name, 0.0, t))
+            elif edge_name == 'right':
+                samples.append(self._face_xyz(face_name, 1.0, t))
+            else:
+                raise ValueError(f"Unknown edge_name: {edge_name}")
+        return np.stack(samples, axis=0)
+
+    def _build_edge_glue(self):
+        edge_glue = defaultdict(dict)
+        all_edges = [(face, edge) for face in self.FACE_NAMES for edge in ('top', 'bottom', 'left', 'right')]
+        used = set()
+
+        for face_name, edge_name in all_edges:
+            if (face_name, edge_name) in used:
+                continue
+            samples_a = self._edge_xyz_samples(face_name, edge_name)
+            found = False
+            for nbr_face_name, nbr_edge_name in all_edges:
+                if nbr_face_name == face_name:
+                    continue
+                samples_b = self._edge_xyz_samples(nbr_face_name, nbr_edge_name)
+                if np.allclose(samples_a, samples_b, atol=1e-6):
+                    edge_glue[face_name][edge_name] = (nbr_face_name, nbr_edge_name, False)
+                    edge_glue[nbr_face_name][nbr_edge_name] = (face_name, edge_name, False)
+                    used.add((face_name, edge_name))
+                    used.add((nbr_face_name, nbr_edge_name))
+                    found = True
+                    break
+                if np.allclose(samples_a, samples_b[::-1], atol=1e-6):
+                    edge_glue[face_name][edge_name] = (nbr_face_name, nbr_edge_name, True)
+                    edge_glue[nbr_face_name][nbr_edge_name] = (face_name, edge_name, True)
+                    used.add((face_name, edge_name))
+                    used.add((nbr_face_name, nbr_edge_name))
+                    found = True
+                    break
+            if not found:
+                raise RuntimeError(f"Could not find glued neighbor for cube edge {face_name}:{edge_name}")
+        return edge_glue
+
+    def _build_vertex_map(self):
+        total_local = self.n_faces * self.local_vertices_per_face
+        uf = _UnionFind(total_local)
+
+        processed = set()
+        for face_name, edge_map in self.edge_glue.items():
+            for edge_name, (nbr_face_name, nbr_edge_name, reverse) in edge_map.items():
+                key = tuple(sorted(((face_name, edge_name), (nbr_face_name, nbr_edge_name))))
+                if key in processed:
+                    continue
+                processed.add(key)
+
+                edge_a = self.face_edge_vertices(face_name, edge_name)
+                edge_b = self.face_edge_vertices(nbr_face_name, nbr_edge_name)
+                if reverse:
+                    edge_b = list(reversed(edge_b))
+
+                if len(edge_a) != len(edge_b):
+                    raise ValueError(
+                        f"Mismatched edge lengths for {face_name}:{edge_name} and {nbr_face_name}:{nbr_edge_name}"
+                    )
+
+                for (fa, ra, ca), (fb, rb, cb) in zip(edge_a, edge_b):
+                    uf.union(
+                        self._local_linear_index(fa, ra, ca),
+                        self._local_linear_index(fb, rb, cb),
+                    )
+
+        root_to_global = {}
+        vertex_map = {}
+        next_idx = 0
+        for face in range(self.n_faces):
+            for row in range(self.n_rows + 1):
+                for col in range(self.n_cols + 1):
+                    local_idx = self._local_linear_index(face, row, col)
+                    root = uf.find(local_idx)
+                    if root not in root_to_global:
+                        root_to_global[root] = next_idx
+                        next_idx += 1
+                    vertex_map[(face, row, col)] = root_to_global[root]
+        return vertex_map, next_idx
+
+
+class SixSheetFeatureComplex(nn.Module):
+    """Six-face cube atlas with shared edge/corner vertex features."""
+    def __init__(self, n_rows: int, n_cols: int, d_features: int = 64):
+        super().__init__()
+        self.n_rows = n_rows
+        self.n_cols = n_cols
+        self.d_features = d_features
+        self.n_faces = 6
+        self.topology = CubeAtlasTopology(n_rows, n_cols)
+        self.n_vertices = self.topology.n_vertices
+
+        self.vertex_features = nn.Parameter(
+            torch.randn(self.n_vertices, d_features) * 0.1
+        )
+
+        corner_uv = torch.tensor(
+            [[0.0, 0.0],
+             [1.0, 0.0],
+             [1.0, 1.0],
+             [0.0, 1.0]], dtype=torch.float32)
+        self.register_buffer('corner_uv', corner_uv)
+
+    def _vertex_index(self, face, row, col):
+        if torch.is_tensor(face) or torch.is_tensor(row) or torch.is_tensor(col):
+            face_t = torch.as_tensor(face, dtype=torch.long, device=self.vertex_features.device)
+            row_t = torch.as_tensor(row, dtype=torch.long, device=self.vertex_features.device)
+            col_t = torch.as_tensor(col, dtype=torch.long, device=self.vertex_features.device)
+            out = torch.empty_like(face_t)
+            flat_face = face_t.reshape(-1).tolist()
+            flat_row = row_t.reshape(-1).tolist()
+            flat_col = col_t.reshape(-1).tolist()
+            mapped = [self.topology.vertex_map[(int(f), int(r), int(c))] for f, r, c in zip(flat_face, flat_row, flat_col)]
+            out = torch.tensor(mapped, dtype=torch.long, device=self.vertex_features.device).reshape(face_t.shape)
+            return out
+        return self.topology.vertex_map[(int(face), int(row), int(col))]
+
+    def _corner_indices(self, face, row, col):
+        i00 = self._vertex_index(face, row, col)
+        i01 = self._vertex_index(face, row, col + 1)
+        i10 = self._vertex_index(face, row + 1, col)
+        i11 = self._vertex_index(face, row + 1, col + 1)
+        return i00, i01, i10, i11
+
+    def interpolate(self, face, row, col, uv):
+        i00, i01, i10, i11 = self._corner_indices(face, row, col)
+        vf = self.vertex_features
+        z = torch.stack([vf[i00], vf[i10], vf[i11], vf[i01]], dim=1)
+        polys = self.corner_uv.unsqueeze(0).expand(uv.shape[0], -1, -1)
+        w = mvc_weights_torch(uv, polys)
+        return torch.einsum('bk,bkd->bd', w, z)
+
+
 class MultiPatchForwardMap(nn.Module):
     """
         Vectorized multi-patch forward map.
@@ -542,6 +752,86 @@ class TwoSheetForwardMap(nn.Module):
             uv_oriented[side1_mask, 0] = 1.0 - uv_oriented[side1_mask, 0]
 
         features = self.complex.interpolate(side, row, col, uv_oriented)
+
+        u = uv_oriented[:, 0:1]
+        v = uv_oriented[:, 1:2]
+        global_u = (row.unsqueeze(1).float() + u) / self.n_rows
+        global_v = (col.unsqueeze(1).float() + v) / self.n_cols
+
+        dec_parts = [features]
+        if self.pe is not None:
+            dec_parts.append(self.pe(torch.cat([global_u, global_v], dim=1)))
+
+        dec_in = torch.cat(dec_parts, dim=1)
+        return self.decoder(dec_in)
+
+
+class SixSheetForwardMap(nn.Module):
+    """Six-face cube atlas forward map with shared edge/corner features."""
+    def __init__(self, n_rows: int, n_cols: int, d_features: int = 64,
+                 L: int = 8, W: int = 256, D: int = 6, beta: float = 5.0,
+                 n_faces: int = 6):
+        super().__init__()
+        if n_faces != 6:
+            raise ValueError(f"SixSheetForwardMap currently supports n_faces=6, got {n_faces}")
+
+        self.n_rows = n_rows
+        self.n_cols = n_cols
+        self.n_sides = n_faces
+        self.n_faces = n_faces
+        self.patches_per_side = n_rows * n_cols
+        self.n_patches = self.patches_per_side * n_faces
+        self.d_features = d_features
+        self.L = L
+
+        self.complex = SixSheetFeatureComplex(n_rows=n_rows, n_cols=n_cols, d_features=d_features)
+
+        if L > 0:
+            self.pe = PositionalEncoding(2, L)
+            d_pe = self.pe.d_out
+        else:
+            self.pe = None
+            d_pe = 0
+
+        self.decoder = SkipMLP(d_features + d_pe, 3, W, D, beta=beta)
+        self.register_buffer('face_uv_transforms', torch.tensor([
+            [0, 0, 0],  # +X: identity
+            [0, 1, 0],  # -X: flip u
+            [1, 0, 0],  # +Y: swap
+            [1, 1, 0],  # -Y: swap + flip u
+            [0, 0, 0],  # +Z: identity
+            [0, 1, 1],  # -Z: flip u and v
+        ], dtype=torch.long))
+
+    def patch_idx_to_face_rowcol(self, patch_idx):
+        face = patch_idx // self.patches_per_side
+        local_patch_idx = patch_idx % self.patches_per_side
+        row = local_patch_idx // self.n_cols
+        col = local_patch_idx % self.n_cols
+        return face, row, col
+
+    def forward(self, patch_idx, uv: torch.Tensor):
+        B = uv.shape[0]
+        if not torch.is_tensor(patch_idx):
+            patch_idx = torch.full((B,), int(patch_idx), dtype=torch.long, device=uv.device)
+        else:
+            patch_idx = patch_idx.to(device=uv.device, dtype=torch.long)
+
+        face, row, col = self.patch_idx_to_face_rowcol(patch_idx)
+        uv_oriented = uv.clone()
+        transforms = self.face_uv_transforms[face]
+        swap_mask = transforms[:, 0] == 1
+        flip_u_mask = transforms[:, 1] == 1
+        flip_v_mask = transforms[:, 2] == 1
+
+        if swap_mask.any():
+            uv_oriented[swap_mask] = uv_oriented[swap_mask][:, [1, 0]]
+        if flip_u_mask.any():
+            uv_oriented[flip_u_mask, 0] = 1.0 - uv_oriented[flip_u_mask, 0]
+        if flip_v_mask.any():
+            uv_oriented[flip_v_mask, 1] = 1.0 - uv_oriented[flip_v_mask, 1]
+
+        features = self.complex.interpolate(face, row, col, uv_oriented)
 
         u = uv_oriented[:, 0:1]
         v = uv_oriented[:, 1:2]
