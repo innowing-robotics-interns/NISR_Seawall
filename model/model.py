@@ -802,6 +802,14 @@ class SixSheetForwardMap(nn.Module):
             [0, 0, 0],  # +Z: identity
             [0, 1, 1],  # -Z: flip u and v
         ], dtype=torch.long))
+        self.register_buffer('face_orientation_sign', torch.tensor([
+            -1,   # +X
+            1,   # -X
+            -1,  # +Y
+            1,  # -Y
+            1,   # +Z
+            1,   # -Z
+        ], dtype=torch.long))
 
     def patch_idx_to_face_rowcol(self, patch_idx):
         face = patch_idx // self.patches_per_side
@@ -830,6 +838,11 @@ class SixSheetForwardMap(nn.Module):
             uv_oriented[flip_u_mask, 0] = 1.0 - uv_oriented[flip_u_mask, 0]
         if flip_v_mask.any():
             uv_oriented[flip_v_mask, 1] = 1.0 - uv_oriented[flip_v_mask, 1]
+
+        orientation_sign = self.face_orientation_sign[face]
+        flipped_faces = orientation_sign < 0
+        if flipped_faces.any():
+            uv_oriented[flipped_faces, 0] = 1.0 - uv_oriented[flipped_faces, 0]
 
         features = self.complex.interpolate(face, row, col, uv_oriented)
 

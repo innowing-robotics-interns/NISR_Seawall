@@ -862,10 +862,14 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
     actual_n_patches = atlas_info['actual_n_patches']
 
     if atlas_mode == 'six_sheet' and face_aware_box_supervision:
-        face_names = ['+X', '-X', '+Y', '-Y', '+Z', '-Z']
         face_points_np = synthetic_meta.get('face_points')
         if face_points_np is None:
             raise ValueError("Synthetic box metadata is missing face_points required for face-aware supervision")
+        patch_face_points_np = utils._box_face_points_to_patch_targets(
+            face_points=face_points_np,
+            n_rows=n_rows,
+            n_cols=n_cols,
+        )
         active_ids = list(range(actual_n_patches))
         K = len(active_ids)
         active_idx_dev = torch.tensor(active_ids, dtype=torch.long, device=device)
@@ -921,7 +925,7 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
     print(f"  d_features={d_features}  W={W}  D={D}  L={L}  β={beta}")
     print(f"  M_per_patch={M_per_patch}  active_patches={K}/{actual_n_patches}")
     if atlas_mode == 'six_sheet' and face_aware_box_supervision:
-        print("  Pretraining mode: direct face-aware supervision on cube faces")
+        print("  Pretraining mode: direct face-aware, patch-wise supervision on cube faces")
     elif no_presplit:
         print("  Pretraining mode: no-presplit global Chamfer over full synthetic cloud")
     print(f"  μ={mu}  Epochs={epochs}  lr={lr}  device={device}")
@@ -936,11 +940,9 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
         if atlas_mode == 'six_sheet' and face_aware_box_supervision:
             tgt_batches = []
             for patch_id in active_ids:
-                face_idx = patch_id // (n_rows * n_cols)
-                face_name = face_names[face_idx]
-                pts_face = face_points_np[face_name]
-                ridx = np.random.randint(0, pts_face.shape[0], size=M_per_patch)
-                tgt_batches.append(torch.tensor(pts_face[ridx], dtype=torch.float32))
+                pts_patch = patch_face_points_np[int(patch_id)]
+                ridx = np.random.randint(0, pts_patch.shape[0], size=M_per_patch)
+                tgt_batches.append(torch.tensor(pts_patch[ridx], dtype=torch.float32))
             tgt = torch.stack(tgt_batches, dim=0).to(device)
             tgt_flat = tgt.reshape(-1, 3)
         elif no_presplit:

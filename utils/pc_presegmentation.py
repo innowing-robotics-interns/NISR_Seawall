@@ -416,151 +416,6 @@ def two_sheet_axis_aligned_segmentation(points,
     return assignments, grid_topology, patch_params, side_assignments
 
 
-def _infer_box_face_assignments(points):
-    """Infer cube-face ids from the dominant absolute coordinate per point."""
-    points = np.asarray(points)
-    abs_points = np.abs(points)
-    dominant_axis = np.argmax(abs_points, axis=1)
-
-    face_assignments = np.empty(points.shape[0], dtype=np.int32)
-
-    x_mask = dominant_axis == 0
-    y_mask = dominant_axis == 1
-    z_mask = dominant_axis == 2
-
-    face_assignments[x_mask] = np.where(points[x_mask, 0] >= 0.0, 0, 1)
-    face_assignments[y_mask] = np.where(points[y_mask, 1] >= 0.0, 2, 3)
-    face_assignments[z_mask] = np.where(points[z_mask, 2] >= 0.0, 4, 5)
-
-    return face_assignments
-
-
-def _box_face_local_uv(points, face_assignments):
-    """Compute face-local UV coordinates consistent with cube atlas embeddings."""
-    points = np.asarray(points)
-    face_assignments = np.asarray(face_assignments)
-
-    patch_params = np.zeros((points.shape[0], 2), dtype=np.float32)
-
-    for face_id in range(6):
-        mask = face_assignments == face_id
-        if not np.any(mask):
-            continue
-
-        pts_face = points[mask]
-        x = pts_face[:, 0]
-        y = pts_face[:, 1]
-        z = pts_face[:, 2]
-
-        if face_id == 0:      # +X
-            u = 0.5 * (z + 1.0)
-            v = 0.5 * (1.0 - y)
-        elif face_id == 1:    # -X
-            u = 0.5 * (z + 1.0)
-            v = 0.5 * (y + 1.0)
-        elif face_id == 2:    # +Y
-            u = 0.5 * (x + 1.0)
-            v = 0.5 * (z + 1.0)
-        elif face_id == 3:    # -Y
-            u = 0.5 * (x + 1.0)
-            v = 0.5 * (1.0 - z)
-        elif face_id == 4:    # +Z
-            u = 0.5 * (x + 1.0)
-            v = 0.5 * (1.0 - y)
-        elif face_id == 5:    # -Z
-            u = 0.5 * (x + 1.0)
-            v = 0.5 * (y + 1.0)
-        else:
-            raise ValueError(f"Unknown face_id: {face_id}")
-
-        patch_params[mask, 0] = np.clip(u, 0.0, 1.0).astype(np.float32)
-        patch_params[mask, 1] = np.clip(v, 0.0, 1.0).astype(np.float32)
-
-    return patch_params
-
-
-def six_sheet_axis_aligned_segmentation(points,
-                                        n_patches_u=2,
-                                        n_patches_v=2,
-                                        face_assignments=None,
-                                        assignment_mode='argmax_abs'):
-    """
-    Segment a point cloud into six cube-like atlas faces, each with its own
-    axis-aligned patch grid.
-
-    Args:
-        points: (N, 3) point positions.
-        n_patches_u: grid rows per face.
-        n_patches_v: grid cols per face.
-        face_assignments: optional (N,) face ids in {0, ..., 5}. If provided,
-            these are used directly.
-        assignment_mode: method used to infer face ids when face_assignments is
-            None. Currently supports 'argmax_abs'.
-
-    Returns:
-        assignments: (N,) global patch ids in [0, 6*n_patches_u*n_patches_v).
-        grid_topology: (6, n_patches_u, n_patches_v) patch ids per face.
-        patch_params: (N, 2) local UV coordinates within each face.
-        face_assignments: (N,) face ids in {0, ..., 5}.
-    """
-    points = np.asarray(points)
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError(f"points must have shape (N, 3), got {points.shape}")
-    if n_patches_u < 1 or n_patches_v < 1:
-        raise ValueError(
-            f"n_patches_u and n_patches_v must both be >= 1, got {(n_patches_u, n_patches_v)}"
-        )
-
-    if face_assignments is None:
-        if assignment_mode != 'argmax_abs':
-            raise ValueError(
-                f"Unknown assignment_mode: {assignment_mode}. Use 'argmax_abs'."
-            )
-        face_assignments = _infer_box_face_assignments(points)
-    else:
-        face_assignments = np.asarray(face_assignments, dtype=np.int32)
-        if face_assignments.shape != (points.shape[0],):
-            raise ValueError(
-                f"face_assignments must have shape ({points.shape[0]},), got {face_assignments.shape}"
-            )
-        if np.any((face_assignments < 0) | (face_assignments > 5)):
-            raise ValueError("face_assignments values must lie in {0, 1, 2, 3, 4, 5}")
-
-    patches_per_face = n_patches_u * n_patches_v
-    assignments = np.full(points.shape[0], -1, dtype=np.int32)
-    patch_params = _box_face_local_uv(points, face_assignments)
-    grid_topology = np.stack([
-        np.arange(face_id * patches_per_face,
-                  (face_id + 1) * patches_per_face,
-                  dtype=np.int32).reshape(n_patches_u, n_patches_v)
-        for face_id in range(6)
-    ], axis=0)
-
-    for face_id in range(6):
-        mask = face_assignments == face_id
-        if not np.any(mask):
-            continue
-
-        uv_face = patch_params[mask]
-        u = uv_face[:, 0]
-        v = uv_face[:, 1]
-
-        u_bins = np.clip((u * n_patches_u).astype(int), 0, n_patches_u - 1)
-        v_bins = np.clip((v * n_patches_v).astype(int), 0, n_patches_v - 1)
-        local_patch_ids = u_bins * n_patches_v + v_bins
-        assignments[mask] = (local_patch_ids + face_id * patches_per_face).astype(np.int32)
-
-    counts = np.bincount(assignments, minlength=6 * patches_per_face)
-    empty_patches = np.where(counts == 0)[0]
-    if len(empty_patches) > 0:
-        print(
-            f"[Warning] {len(empty_patches)} empty six-sheet patches detected. "
-            f"Consider reducing patch count or using a different face assignment strategy."
-        )
-
-    return assignments, grid_topology, patch_params, face_assignments
-
-
 
 # Helper functions
 def _normalize_01(x):
@@ -761,13 +616,9 @@ def presegment(points, normals=None, method='poisson_spectral',
         assignments, grid, params, side_assignments = two_sheet_axis_aligned_segmentation(
             points, n_patches_u, n_patches_v, **kwargs
         )
-    elif method == 'six_sheet_axis_aligned':
-        assignments, grid, params, face_assignments = six_sheet_axis_aligned_segmentation(
-            points, n_patches_u, n_patches_v, **kwargs
-        )
     else:
         raise ValueError(f"Unknown method: {method}. "
-                        f"Choose from: poisson_spectral, spectral_direct, pca_grid, axis_aligned_grid, two_sheet_axis_aligned, six_sheet_axis_aligned")
+                        f"Choose from: poisson_spectral, spectral_direct, pca_grid, axis_aligned_grid, two_sheet_axis_aligned")
 
     # Print statistics
     n_patches = int(assignments.max()) + 1 if assignments.size > 0 else n_patches_u * n_patches_v
@@ -778,13 +629,6 @@ def presegment(points, normals=None, method='poisson_spectral',
         print(f"  Two sheets: 2 × ({n_patches_u} × {n_patches_v}) = {n_patches} patches")
         side_counts = np.bincount(side_assignments, minlength=2)
         print(f"  Side split counts: side0={side_counts[0]}, side1={side_counts[1]}")
-    elif method == 'six_sheet_axis_aligned':
-        print(f"  Six sheets: 6 × ({n_patches_u} × {n_patches_v}) = {n_patches} patches")
-        face_counts = np.bincount(face_assignments, minlength=6)
-        print("  Face split counts: "
-              + ", ".join([
-                  f"face{face_id}={face_counts[face_id]}" for face_id in range(6)
-              ]))
     else:
         print(f"  Grid: {n_patches_u} × {n_patches_v} = {n_patches} patches")
     print(f"  Points per patch: min={counts[counts>0].min()}, "
@@ -799,8 +643,6 @@ def presegment(points, normals=None, method='poisson_spectral',
     }
     if method == 'two_sheet_axis_aligned':
         result['side_assignments'] = side_assignments
-    if method == 'six_sheet_axis_aligned':
-        result['face_assignments'] = face_assignments
     return result
 
 
