@@ -32,6 +32,7 @@ from model.losses import (boundary_chamfer_loss, chamfer_1d,
 from model.model import (FeatureComplex, ForwardMap, InverseMap, MultiPatchForwardMap,
            MultiPatchInverseMap, PositionalEncoding, SkipMLP,
        TwoSheetForwardMap, SixSheetForwardMap)
+from model.correspondence import build_hard_correspondence
 try:
     import open3d as o3d
 except ImportError:
@@ -172,12 +173,21 @@ def train_multi_patch(pts3n: np.ndarray,
                       two_sheet_split_axis: int = 2,
                       two_sheet_side_axes=(0, 1),
                       six_sheet_face_rows: int = 2,
-                      six_sheet_face_cols: int = 2):
+                      six_sheet_face_cols: int = 2,
+                      corr_switch_epoch: int = 0,
+                      corr_search_resolution: int = 64,
+                      corr_refine_steps: int = 200,
+                      corr_refine_lr: float = 1e-2):
     """
     Train the multi-patch model and inverse map.
 
     Expensive regularizers can be evaluated every `reg_every` steps instead of
     every iteration.
+
+    If `corr_switch_epoch > 0`, training runs on Chamfer distance until that
+    epoch, then builds a fixed point -> (patch_id, u, v) correspondence via
+    `build_hard_correspondence` and switches to direct pointwise MSE
+    regression against it for the remainder of training.
     """
     F, atlas_info = _build_forward_model(
         atlas_mode=atlas_mode,
@@ -212,6 +222,25 @@ def train_multi_patch(pts3n: np.ndarray,
 
     if no_presplit and atlas_mode not in ('two_sheet', 'six_sheet'):
         raise ValueError("--no_presplit is currently supported only with atlas_mode='two_sheet' or 'six_sheet'")
+
+    if corr_switch_epoch > 0:
+        if not no_presplit:
+            raise ValueError(
+                "--corr_switch_epoch currently requires --no_presplit: the correspondence "
+                "table is built against the full point cloud, not per-patch pre-assigned subsets."
+            )
+        if lam > 0 or lam2 > 0:
+            raise NotImplementedError(
+                "Cycle consistency (--lam/--lam2) is not supported together with "
+                "--corr_switch_epoch: cycle consistency assumes per-patch grouped batches "
+                "(K, M_per_patch, 3), which the flat correspondence-sampled MSE batch doesn't have."
+            )
+        if gamma > 0:
+            raise NotImplementedError(
+                "Normal consistency (--gamma) is not supported together with "
+                "--corr_switch_epoch yet: the normal-loss nearest-neighbor lookup assumes "
+                "the Chamfer distance matrix D, which isn't computed during the MSE phase."
+            )
 
     if no_presplit:
         assignments = np.arange(pts3n.shape[0], dtype=np.int32) % actual_n_patches
@@ -359,7 +388,7 @@ def train_multi_patch(pts3n: np.ndarray,
 
     history = {'cd': [], 'cycle': [], 'param': [], 'tangent': [], 'normal': [],
                'outer_boundary': [],
-               'mu_eff': [], 'total': [], 'epoch': []}
+               'mu_eff': [], 'total': [], 'epoch': [], 'phase': []}
     
 
     print(f"\n{'─'*60}")
@@ -386,6 +415,9 @@ def train_multi_patch(pts3n: np.ndarray,
     boundary_debug_dir = os.path.join(checkpoint_dir, 'boundary_debug')
     if save_boundary_debug_every > 0:
         os.makedirs(boundary_debug_dir, exist_ok=True)
+    correspondence_debug_dir = os.path.join(checkpoint_dir, 'correspondence_debug')
+    if corr_switch_epoch > 0:
+        os.makedirs(correspondence_debug_dir, exist_ok=True)
 
     def _save_epoch_checkpoint(epoch: int):
         if checkpoint_every <= 0 or epoch % checkpoint_every != 0:
@@ -429,6 +461,10 @@ def train_multi_patch(pts3n: np.ndarray,
                 'two_sheet_side_axes': list(two_sheet_side_axes),
                 'six_sheet_face_rows': six_sheet_face_rows,
                 'six_sheet_face_cols': six_sheet_face_cols,
+                'corr_switch_epoch': corr_switch_epoch,
+                'corr_search_resolution': corr_search_resolution,
+                'corr_refine_steps': corr_refine_steps,
+                'corr_refine_lr': corr_refine_lr,
             }),
             'grid_dims': (n_rows, n_cols),
             'atlas_info': atlas_info,
@@ -438,6 +474,11 @@ def train_multi_patch(pts3n: np.ndarray,
             for key in ('normalization', 'input_file', 'result_dir'):
                 if key in checkpoint_payload:
                     payload[key] = checkpoint_payload[key]
+        if correspondence is not None:
+            payload['correspondence'] = {
+                'patch_ids': correspondence['patch_ids'].detach().cpu(),
+                'uv': correspondence['uv'].detach().cpu(),
+            }
 
         torch.save(payload, epoch_ckpt_path)
         print(f"    Checkpoint → {epoch_ckpt_path}")
@@ -502,46 +543,94 @@ def train_multi_patch(pts3n: np.ndarray,
 
     zero = torch.tensor(0.0, device=device)
     vertex_features_init = F.complex.vertex_features.detach().clone()
-
+    correspondence = None
 
     # Optimize the forward and inverse maps.
     for epoch in range(1, epochs + 1):
         opt.zero_grad()
 
+        if corr_switch_epoch > 0 and epoch == corr_switch_epoch:
+            print(f"  Building point correspondence at epoch {epoch} (Chamfer → MSE switch)...")
+            all_points_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
+            corr_patch_ids, corr_uv = build_hard_correspondence(
+                F, all_points_dev,
+                search_resolution=corr_search_resolution,
+                refine_steps=corr_refine_steps,
+                refine_lr=corr_refine_lr,
+                device=device,
+            )
+            correspondence = {
+                'patch_ids': corr_patch_ids,
+                'uv': corr_uv,
+                'points': all_points_dev,
+            }
+            print(f"    Correspondence fixed for {all_points_dev.shape[0]} points "
+                  f"across {F.n_patches} patches")
+
+            with torch.no_grad():
+                corr_pred = F(correspondence['patch_ids'], correspondence['uv'])
+            correspondence_vis.export_global_correspondence_ply(
+                q_points=corr_pred.detach().cpu().numpy(),
+                t_points=correspondence['points'].detach().cpu().numpy(),
+                output_ply_path=os.path.join(correspondence_debug_dir,
+                                             f'correspondence_epoch_{epoch}.ply'),
+                plot_direction='both',
+            )
+
         # Build the target batch on CPU, then transfer once to the device.
-        if no_presplit:
-            target_batch_size = K * M_per_patch
-            ridx = torch.randint(0, pts3n.shape[0], (target_batch_size,))
-            tgt_flat = torch.tensor(pts3n[ridx], dtype=torch.float32, device=device)
-            tgt = tgt_flat.reshape(1, target_batch_size, 3)
-            if gamma > 0:
-                tgt_nrm = torch.tensor(normals[ridx], dtype=torch.float32, device=device).reshape(1, target_batch_size, 3)
-        else:
-            pts_batch = torch.empty(K, M_per_patch, 3)
-            nrm_batch = torch.empty(K, M_per_patch, 3) if gamma > 0 else None
-            for i in range(K):
-                ridx = torch.randint(0, lengths[i], (M_per_patch,))
-                pts_batch[i] = active_pts[i][ridx]
-                if gamma > 0:
-                    nrm_batch[i] = active_nrm[i][ridx]
+        if correspondence is not None:
+            idx = torch.randint(0, correspondence['points'].shape[0],
+                                (K * M_per_patch,), device=device)
+            pidx_flat = correspondence['patch_ids'][idx]
+            # Fresh differentiable leaf each step: the table itself stays frozen
+            # (no gradient flows back into it), but the tangent/ARAP loss below
+            # still needs a UV tensor with a live autograd graph to Q_flat.
+            uv_flat = correspondence['uv'][idx].clone().requires_grad_(True)
+            Q_flat = F(pidx_flat, uv_flat)
+            Q = Q_flat.reshape(K, M_per_patch, 3)
+            tgt_flat = correspondence['points'][idx]
+            tgt = tgt_flat.reshape(1, K * M_per_patch, 3)
 
-            tgt = pts_batch.to(device)
-            tgt_flat = tgt.reshape(-1, 3)
-            if gamma > 0:
-                tgt_nrm = nrm_batch.to(device)
-
-        # Single batched forward pass.
-        uv_flat = torch.rand(K * M_per_patch, 2, device=device, requires_grad=True)
-        Q_flat = F(pidx_flat, uv_flat)
-        Q = Q_flat.reshape(K, M_per_patch, 3)
-
-        # Loss 1: Chamfer distance.
-        if no_presplit:
-            cd_loss = chamfer_distance_chunked(Q_flat, tgt_flat, chunk_size=min(2048, K * M_per_patch))
+            # Loss 1: direct pointwise regression against the fixed correspondence.
+            # Mean Euclidean distance (not squared) so the gradient doesn't vanish
+            # as residuals shrink -- keeps the same scale/units as the Chamfer
+            # term it replaces, so mu_eff * tangent_loss doesn't end up dominating.
+            cd_loss = torch.norm(Q_flat - tgt_flat, dim=-1).mean()
             D = None
         else:
-            D = torch.cdist(tgt, Q)
-            cd_loss = D.min(dim=2).values.mean() + D.min(dim=1).values.mean()
+            if no_presplit:
+                target_batch_size = K * M_per_patch
+                ridx = torch.randint(0, pts3n.shape[0], (target_batch_size,))
+                tgt_flat = torch.tensor(pts3n[ridx], dtype=torch.float32, device=device)
+                tgt = tgt_flat.reshape(1, target_batch_size, 3)
+                if gamma > 0:
+                    tgt_nrm = torch.tensor(normals[ridx], dtype=torch.float32, device=device).reshape(1, target_batch_size, 3)
+            else:
+                pts_batch = torch.empty(K, M_per_patch, 3)
+                nrm_batch = torch.empty(K, M_per_patch, 3) if gamma > 0 else None
+                for i in range(K):
+                    ridx = torch.randint(0, lengths[i], (M_per_patch,))
+                    pts_batch[i] = active_pts[i][ridx]
+                    if gamma > 0:
+                        nrm_batch[i] = active_nrm[i][ridx]
+
+                tgt = pts_batch.to(device)
+                tgt_flat = tgt.reshape(-1, 3)
+                if gamma > 0:
+                    tgt_nrm = nrm_batch.to(device)
+
+            # Single batched forward pass.
+            uv_flat = torch.rand(K * M_per_patch, 2, device=device, requires_grad=True)
+            Q_flat = F(pidx_flat, uv_flat)
+            Q = Q_flat.reshape(K, M_per_patch, 3)
+
+            # Loss 1: Chamfer distance.
+            if no_presplit:
+                cd_loss = chamfer_distance_chunked(Q_flat, tgt_flat, chunk_size=min(2048, K * M_per_patch))
+                D = None
+            else:
+                D = torch.cdist(tgt, Q)
+                cd_loss = D.min(dim=2).values.mean() + D.min(dim=1).values.mean()
         # cd_loss = D.min(dim=2).values.mean() # Map only xyz ->  uv
 
 
@@ -636,11 +725,13 @@ def train_multi_patch(pts3n: np.ndarray,
             history['outer_boundary'].append(float(outer_boundary_loss))
             # history['mu_eff'].append(float(mu_eff))
             history['total'].append(float(loss))
+            history['phase'].append('mse' if correspondence is not None else 'chamfer')
 
             elapsed = time.time() - t0
             # mu_str = f"  μ_eff={float(mu_eff):.4f}" if (mu_warmup_epochs > 0 and mu > 0) else ""
+            recon_label = 'MSE' if correspondence is not None else 'CD '
             print(f"  Epoch {epoch:5d}/{epochs}  |  "
-                  f"CD={float(cd_loss):.5f}  "
+                  f"{recon_label}={float(cd_loss):.5f}  "
                   f"Cycle={float(cycle_loss):.5f}  "
                   f"Param={float(param_loss):.5f}  "
                   f"Tangent={float(tangent_loss):.5f}  "
@@ -1089,7 +1180,7 @@ def main():
                              'epochs (2-5 speeds training with little quality loss)')
     parser.add_argument('--checkpoint_every', type=int, default=50,
                         help='[Multi-patch] Save an intermediate checkpoint every N epochs')
-    parser.add_argument('--save_correspondence_every', type=int, default=5000,
+    parser.add_argument('--save_correspondence_every', type=int, default=0,
                         help='[Multi-patch] Save Chamfer correspondence CSV/PNG every N epochs (0 disables)')
     parser.add_argument('--save_boundary_debug_every', type=int, default=5000,
                         help='[Multi-patch] Save outer-boundary model/rectangle correspondence debug every N epochs (0 disables)')
@@ -1137,6 +1228,19 @@ def main():
                                  help='Cols of patches per face for atlas_mode=six_sheet')
     six_sheet_group.add_argument('--face_aware_box_supervision', action='store_true', default=False,
                                  help='Use direct face-aware supervision during six-sheet box pretraining')
+
+    # Chamfer -> MSE correspondence switch
+    corr_group = parser.add_argument_group('chamfer-to-mse correspondence switch')
+    corr_group.add_argument('--corr_switch_epoch', type=int, default=0,
+                            help='[Multi-patch] Epoch at which to build a fixed point '
+                                 'correspondence and switch from Chamfer distance to direct '
+                                 'MSE regression (0 disables, requires --no_presplit)')
+    corr_group.add_argument('--corr_search_resolution', type=int, default=64,
+                            help='Per-patch UV grid resolution for the initial nearest-neighbor search')
+    corr_group.add_argument('--corr_refine_steps', type=int, default=200,
+                            help="Gradient-descent steps refining each point's UV within its assigned patch")
+    corr_group.add_argument('--corr_refine_lr', type=float, default=1e-3,
+                            help='Learning rate for the per-point UV refinement')
     args = parser.parse_args()
 
     # Load the data
@@ -1359,6 +1463,10 @@ def main():
             two_sheet_side_axes=tuple(args.two_sheet_side_axes),
             six_sheet_face_rows=args.six_sheet_face_rows,
             six_sheet_face_cols=args.six_sheet_face_cols,
+            corr_switch_epoch=args.corr_switch_epoch,
+            corr_search_resolution=args.corr_search_resolution,
+            corr_refine_steps=args.corr_refine_steps,
+            corr_refine_lr=args.corr_refine_lr,
         )
         F_model.eval()
         if G_model is not None:

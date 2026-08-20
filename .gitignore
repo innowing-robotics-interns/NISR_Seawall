@@ -4,6 +4,7 @@ logs/*
 utils/vis_obj.py
 utils/3dModel_to_PC.py
 **/__pycache__/
+inputmodels/*
 
 *.txt
 *.pt

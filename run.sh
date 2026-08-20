@@ -7,9 +7,9 @@
 # INPUT_FILE="data/${FILE}"
 # OUTPUT_DIR="logs/log_bestConfig/${FILE%.*}_D3_W512_M4096_d128_16Patches_bound1"
 
-FILE="bimba.ply"
+FILE="max-planck.ply"
 INPUT_FILE="3d_test_models/${FILE}"
-OUTPUT_DIR="logs/log_3dModelsBoxInit/${FILE%.*}_boxInit_ARAP0.25_noPresplit_24Patches_M1500_6Atlas_pretrain2k"
+OUTPUT_DIR="logs/log_3dModelsMSE/${FILE%.*}_boxInit_ARAP0.25_noPresplit_24Patches_M1500_6Atlas_pretrain2k_MED_FreezeUV_10k"
 
 
 # python main.py \
@@ -114,7 +114,7 @@ python main.py \
     --atlas_mode six_sheet \
     --file ${INPUT_FILE} \
     --result_dir ${OUTPUT_DIR} \
-    --epochs 5000 \
+    --epochs 10000 \
     --d_features 88 \
     --M_per_patch 1500 \
     --W 512 \
@@ -136,11 +136,14 @@ python main.py \
     --six_sheet_face_cols 2 \
     --face_aware_box_supervision \
     --pretrain_then_train \
-    --pretrain_epochs 2000 \
+    --pretrain_epochs 1000 \
     --pretrain_shape box \
     --pretrain_mode closed_shape \
     --no_presplit \
     --correspondence_line_segment q_to_t \
+    --corr_switch_epoch 7500 \
+    --save_boundary_debug 0 \
+
 
 python utils/patch_vis.py \
     --ckpt ${OUTPUT_DIR}/checkpoint.pt \
