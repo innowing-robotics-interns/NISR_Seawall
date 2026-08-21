@@ -494,6 +494,22 @@ def train_multi_patch(pts3n: np.ndarray,
         q_np = q_batch.detach().cpu().numpy()
         tgt_np = tgt_batch.detach().cpu().numpy()
 
+        if correspondence is not None:
+            # q_batch/tgt_batch were built by indexing the same `idx` into the correspondence table, so they're already an exact
+            # 1:1 pairing. Hence, skip the nearest neighbor search entirely.
+            q_flat = q_np.reshape(-1, 3)
+            t_flat = tgt_np.reshape(-1, 3)
+            identity_idx = np.arange(q_flat.shape[0], dtype=np.int32)
+            correspondence_vis.export_correspondence_ply(
+                q_points=q_flat,
+                t_points=t_flat,
+                q_to_t_idx=identity_idx,
+                t_to_q_idx=identity_idx,
+                output_ply_path=os.path.join(epoch_dir, 'global_correspondence.ply'),
+                plot_direction=correspondence_line_segment,
+            )
+            return
+
         if no_presplit:
             correspondence_vis.export_global_correspondence_ply(
                 q_points=q_np.reshape(-1, 3),
@@ -569,9 +585,15 @@ def train_multi_patch(pts3n: np.ndarray,
 
             with torch.no_grad():
                 corr_pred = F(correspondence['patch_ids'], correspondence['uv'])
-            correspondence_vis.export_global_correspondence_ply(
-                q_points=corr_pred.detach().cpu().numpy(),
-                t_points=correspondence['points'].detach().cpu().numpy(),
+            corr_pred_np = corr_pred.detach().cpu().numpy()
+            corr_points_np = correspondence['points'].detach().cpu().numpy()
+            # The pairing is already exact, so skip the NN search
+            identity_idx = np.arange(corr_pred_np.shape[0], dtype=np.int32)
+            correspondence_vis.export_correspondence_ply(
+                q_points=corr_pred_np,
+                t_points=corr_points_np,
+                q_to_t_idx=identity_idx,
+                t_to_q_idx=identity_idx,
                 output_ply_path=os.path.join(correspondence_debug_dir,
                                              f'correspondence_epoch_{epoch}.ply'),
                 plot_direction='both',
