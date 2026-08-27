@@ -494,6 +494,131 @@ __all__ = [
 ]
 
 
+def export_ddf_reference_debug(
+    ref_points: np.ndarray,
+    target_points: np.ndarray,
+    output_dir: str,
+    ref_gt: Optional[np.ndarray] = None,
+    max_vectors: int = 2000,
+) -> None:
+    """Export DDF reference points and optional direction vectors for debugging."""
+    ref_points = np.asarray(ref_points, dtype=np.float32)
+    target_points = np.asarray(target_points, dtype=np.float32)
+
+    if ref_points.ndim != 2 or ref_points.shape[1] != 3:
+        raise ValueError(f"ref_points must have shape (N, 3), got {ref_points.shape}")
+    if target_points.ndim != 2 or target_points.shape[1] != 3:
+        raise ValueError(f"target_points must have shape (M, 3), got {target_points.shape}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    csv_path = os.path.join(output_dir, "ddf_reference_points.csv")
+    ply_path = os.path.join(output_dir, "ddf_reference_points.ply")
+    png_path = os.path.join(output_dir, "ddf_reference_points.png")
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if ref_gt is not None:
+            writer.writerow([
+                "ref_id", "ref_x", "ref_y", "ref_z",
+                "distance", "dir_x", "dir_y", "dir_z",
+                "closest_x", "closest_y", "closest_z",
+            ])
+            ref_gt = np.asarray(ref_gt, dtype=np.float32)
+            if ref_gt.ndim != 2 or ref_gt.shape[1] != 4:
+                raise ValueError(f"ref_gt must have shape (N, 4), got {ref_gt.shape}")
+            closest = ref_points + ref_gt[:, 1:4]
+            for idx, (ref, gt_row, cp) in enumerate(zip(ref_points, ref_gt, closest)):
+                writer.writerow([
+                    idx,
+                    float(ref[0]), float(ref[1]), float(ref[2]),
+                    float(gt_row[0]), float(gt_row[1]), float(gt_row[2]), float(gt_row[3]),
+                    float(cp[0]), float(cp[1]), float(cp[2]),
+                ])
+        else:
+            writer.writerow(["ref_id", "ref_x", "ref_y", "ref_z"])
+            for idx, ref in enumerate(ref_points):
+                writer.writerow([idx, float(ref[0]), float(ref[1]), float(ref[2])])
+
+    vertices = []
+    edges = []
+    for point in ref_points:
+        vertices.append((*point.tolist(), 255, 140, 0))
+    target_offset = len(vertices)
+    for point in target_points:
+        vertices.append((*point.tolist(), *TARGET_POINT_COLOR))
+
+    if ref_gt is not None and ref_points.shape[0] > 0:
+        closest = ref_points + ref_gt[:, 1:4]
+        closest_offset = len(vertices)
+        for point in closest:
+            vertices.append((*point.tolist(), 148, 103, 189))
+
+        if ref_points.shape[0] > max_vectors:
+            sample_idx = np.linspace(0, ref_points.shape[0] - 1, max_vectors, dtype=int)
+        else:
+            sample_idx = np.arange(ref_points.shape[0])
+        for idx in sample_idx:
+            edges.append((idx, closest_offset + int(idx), 80, 80, 80))
+
+    with open(ply_path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(vertices)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write(f"element edge {len(edges)}\n")
+        f.write("property int vertex1\n")
+        f.write("property int vertex2\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+        for x, y, z, r, g, b in vertices:
+            f.write(f"{x:.8f} {y:.8f} {z:.8f} {r} {g} {b}\n")
+        for v1, v2, r, g, b in edges:
+            f.write(f"{v1} {v2} {r} {g} {b}\n")
+
+    fig = plt.figure(figsize=(10, 8), facecolor="white")
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(target_points[:, 0], target_points[:, 1], target_points[:, 2],
+               s=1.5, c="#1f77b4", alpha=0.25, label="Target cloud")
+    ax.scatter(ref_points[:, 0], ref_points[:, 1], ref_points[:, 2],
+               s=4.0, c="#ff8c00", alpha=0.8, label="DDF reference points")
+    if ref_gt is not None and ref_points.shape[0] > 0:
+        closest = ref_points + ref_gt[:, 1:4]
+        ax.scatter(closest[:, 0], closest[:, 1], closest[:, 2],
+                   s=3.0, c="#9467bd", alpha=0.5, label="Approx. closest surface points")
+        if ref_points.shape[0] > max_vectors:
+            sample_idx = np.linspace(0, ref_points.shape[0] - 1, max_vectors, dtype=int)
+        else:
+            sample_idx = np.arange(ref_points.shape[0])
+        for idx in sample_idx:
+            ref = ref_points[idx]
+            cp = closest[idx]
+            ax.plot([ref[0], cp[0]], [ref[1], cp[1]], [ref[2], cp[2]],
+                    color="#555555", alpha=0.2, linewidth=0.6)
+    all_points = np.vstack([target_points, ref_points]) if ref_points.size else target_points
+    _set_equal_3d_axes(ax, all_points)
+    ax.set_title("DDF reference-point debug view")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    ax.legend(loc="upper right")
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"    DDF reference CSV → {csv_path}")
+    print(f"    DDF reference PLY → {ply_path}")
+    print(f"    DDF reference PNG → {png_path}")
+
+
 def export_boundary_correspondence_debug(
     model_batches: np.ndarray,
     target_batches: np.ndarray,
@@ -579,3 +704,4 @@ def export_boundary_correspondence_debug(
 
 
 __all__.append("export_boundary_correspondence_debug")
+__all__.append("export_ddf_reference_debug")

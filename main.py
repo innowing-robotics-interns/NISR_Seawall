@@ -22,6 +22,9 @@ import utils.utils as utils
 from model.losses import (boundary_chamfer_loss, chamfer_1d,
                                        chamfer_distance,
                                        chamfer_distance_chunked,
+                                       directional_distance_field,
+                                       directional_distance_loss,
+                                       sample_ddf_reference_points,
                                        mu_warmup_schedule,
                                        normal_consistency_loss,
                                outer_boundary_rectangle_loss,
@@ -177,17 +180,27 @@ def train_multi_patch(pts3n: np.ndarray,
                       corr_switch_epoch: int = 0,
                       corr_search_resolution: int = 64,
                       corr_refine_steps: int = 200,
-                      corr_refine_lr: float = 1e-2):
+                      corr_refine_lr: float = 1e-2,
+                      surface_loss_type: str = 'chamfer',
+                      ddf_n_reference_points: int = 20000,
+                      ddf_k_neighbors: int = 5,
+                      ddf_sigma: float = 0.05,
+                      ddf_beta: float = 20.0,
+                      ddf_resample_every: int = 500,
+                      ddf_chunk_size: int = 2048,
+                      save_ddf_reference_every: int = 0):
     """
     Train the multi-patch model and inverse map.
 
     Expensive regularizers can be evaluated every `reg_every` steps instead of
     every iteration.
 
-    If `corr_switch_epoch > 0`, training runs on Chamfer distance until that
-    epoch, then builds a fixed point -> (patch_id, u, v) correspondence via
+    If `corr_switch_epoch > 0`, training runs on the surface-fitting loss
+    (Chamfer distance or DDF, see `surface_loss_type`) until that epoch, then
+    builds a fixed point -> (patch_id, u, v) correspondence via
     `build_hard_correspondence` and switches to direct pointwise MSE
-    regression against it for the remainder of training.
+    regression against it for the remainder of training. `surface_loss_type`
+    only affects this pre-switch phase; the MSE phase is unaffected.
     """
     F, atlas_info = _build_forward_model(
         atlas_mode=atlas_mode,
@@ -222,6 +235,14 @@ def train_multi_patch(pts3n: np.ndarray,
 
     if no_presplit and atlas_mode not in ('two_sheet', 'six_sheet'):
         raise ValueError("--no_presplit is currently supported only with atlas_mode='two_sheet' or 'six_sheet'")
+
+    if surface_loss_type not in ('chamfer', 'ddf'):
+        raise ValueError(f"Unknown surface_loss_type: {surface_loss_type}. Use 'chamfer' or 'ddf'.")
+    if surface_loss_type == 'ddf' and not no_presplit:
+        raise ValueError(
+            "--surface_loss_type ddf currently requires --no_presplit: the DDF loss is "
+            "evaluated against the full target cloud, not per-patch pre-assigned subsets."
+        )
 
     if corr_switch_epoch > 0:
         if not no_presplit:
@@ -398,6 +419,10 @@ def train_multi_patch(pts3n: np.ndarray,
         print("  Training mode: no-presplit global Chamfer over full target cloud")
     print(f"  d_features={d_features}  W={W}  D={D}  L(fwd/global-UV)={L}  L_inv={L_inv}  β={beta}")
     print(f"  M_per_patch={M_per_patch}  batch/step={K*M_per_patch}  reg_every={reg_every}")
+    print(f"  Surface-fitting loss (pre-correspondence-switch): {surface_loss_type}")
+    if surface_loss_type == 'ddf':
+        print(f"    DDF: n_ref={ddf_n_reference_points}  k={ddf_k_neighbors}  "
+              f"σ={ddf_sigma}  β={ddf_beta}  resample_every={ddf_resample_every}")
     print(f"  μ={mu}  γ={gamma}  λ₁={lam}  λ₂={lam2}  λ_outer={lambda_outer_boundary}")
     if mu_warmup_epochs > 0 and mu > 0:
         print(f"  μ warmup: {mu_warmup_schedule} ramp over {mu_warmup_epochs} epochs "
@@ -418,6 +443,9 @@ def train_multi_patch(pts3n: np.ndarray,
     correspondence_debug_dir = os.path.join(checkpoint_dir, 'correspondence_debug')
     if corr_switch_epoch > 0:
         os.makedirs(correspondence_debug_dir, exist_ok=True)
+    ddf_debug_dir = os.path.join(checkpoint_dir, 'ddf_debug')
+    if save_ddf_reference_every > 0:
+        os.makedirs(ddf_debug_dir, exist_ok=True)
 
     def _save_epoch_checkpoint(epoch: int):
         if checkpoint_every <= 0 or epoch % checkpoint_every != 0:
@@ -557,9 +585,31 @@ def train_multi_patch(pts3n: np.ndarray,
             max_lines=min(correspondence_max_lines, outer_boundary_samples),
         )
 
+    def _save_ddf_reference_snapshot(epoch: int):
+        if save_ddf_reference_every <= 0 or epoch % save_ddf_reference_every != 0:
+            return
+        if ddf_ref_points is None:
+            return
+
+        epoch_dir = os.path.join(ddf_debug_dir, f'epoch_{epoch:05d}')
+        correspondence_vis.export_ddf_reference_debug(
+            ref_points=ddf_ref_points.detach().cpu().numpy(),
+            target_points=pts3n_dev.detach().cpu().numpy(),
+            ref_gt=ddf_ref_gt.detach().cpu().numpy() if ddf_ref_gt is not None else None,
+            output_dir=epoch_dir,
+            max_vectors=min(2000, ddf_ref_points.shape[0]),
+        )
+
     zero = torch.tensor(0.0, device=device)
     vertex_features_init = F.complex.vertex_features.detach().clone()
     correspondence = None
+
+    # DDF state: reference points + their fixed ground-truth DDF, refreshed
+    # periodically (target cloud is static, so its DDF only needs to be
+    # recomputed when the reference points themselves are resampled).
+    pts3n_dev = torch.tensor(pts3n, dtype=torch.float32, device=device) if surface_loss_type == 'ddf' else None
+    ddf_ref_points = None
+    ddf_ref_gt = None
 
     # Optimize the forward and inverse maps.
     for epoch in range(1, epochs + 1):
@@ -646,9 +696,23 @@ def train_multi_patch(pts3n: np.ndarray,
             Q_flat = F(pidx_flat, uv_flat)
             Q = Q_flat.reshape(K, M_per_patch, 3)
 
-            # Loss 1: Chamfer distance.
+            # Loss 1: surface-fitting term (Chamfer distance or DDF).
             if no_presplit:
-                cd_loss = chamfer_distance_chunked(Q_flat, tgt_flat, chunk_size=min(2048, K * M_per_patch))
+                if surface_loss_type == 'ddf':
+                    if ddf_ref_points is None or (
+                            ddf_resample_every > 0 and (epoch - 1) % ddf_resample_every == 0):
+                        ddf_ref_points = sample_ddf_reference_points(
+                            pts3n_dev, sigma=ddf_sigma, n_points=ddf_n_reference_points)
+                        with torch.no_grad():
+                            ddf_ref_gt = directional_distance_field(
+                                ddf_ref_points, pts3n_dev,
+                                k=ddf_k_neighbors, chunk_size=ddf_chunk_size)
+                        _save_ddf_reference_snapshot(epoch)
+                    cd_loss = directional_distance_loss(
+                        Q_flat, ddf_ref_points, ddf_ref_gt,
+                        k=ddf_k_neighbors, beta=ddf_beta, chunk_size=ddf_chunk_size)
+                else:
+                    cd_loss = chamfer_distance_chunked(Q_flat, tgt_flat, chunk_size=min(2048, K * M_per_patch))
                 D = None
             else:
                 D = torch.cdist(tgt, Q)
@@ -751,7 +815,12 @@ def train_multi_patch(pts3n: np.ndarray,
 
             elapsed = time.time() - t0
             # mu_str = f"  μ_eff={float(mu_eff):.4f}" if (mu_warmup_epochs > 0 and mu > 0) else ""
-            recon_label = 'MSE' if correspondence is not None else 'CD '
+            if correspondence is not None:
+                recon_label = 'MSE'
+            elif surface_loss_type == 'ddf':
+                recon_label = 'DDF'
+            else:
+                recon_label = 'CD '
             print(f"  Epoch {epoch:5d}/{epochs}  |  "
                   f"{recon_label}={float(cd_loss):.5f}  "
                   f"Cycle={float(cycle_loss):.5f}  "
@@ -775,6 +844,7 @@ def train_multi_patch(pts3n: np.ndarray,
 
             _save_correspondence_snapshot(epoch, Q, tgt, D)
             _save_boundary_debug_snapshot(epoch)
+            _save_ddf_reference_snapshot(epoch)
             _save_epoch_checkpoint(epoch)
 
     print(f"{'─'*60}\n")
@@ -1263,6 +1333,29 @@ def main():
                             help="Gradient-descent steps refining each point's UV within its assigned patch")
     corr_group.add_argument('--corr_refine_lr', type=float, default=1e-3,
                             help='Learning rate for the per-point UV refinement')
+
+    # Chamfer vs. Directional Distance Field (DDF) surface-fitting loss
+    ddf_group = parser.add_argument_group('directional distance field (DDF) loss')
+    ddf_group.add_argument('--surface_loss_type', type=str, default='chamfer', choices=['chamfer', 'ddf'],
+                           help='[Multi-patch, no_presplit] Loss driving the pre-correspondence-switch '
+                                'surface-fitting phase: plain Chamfer distance, or Directional Distance '
+                                'Field (DDM, Ren et al. 2024, arXiv:2401.09736). Does not affect the '
+                                'post-corr_switch_epoch MSE phase.')
+    ddf_group.add_argument('--ddf_n_reference_points', type=int, default=50000,
+                           help='[DDF] Number of reference points sampled near the target surface')
+    ddf_group.add_argument('--ddf_k_neighbors', type=int, default=5,
+                           help='[DDF] Number of nearest neighbors used to approximate the closest surface point')
+    ddf_group.add_argument('--ddf_sigma', type=float, default=0.05,
+                           help='[DDF] Std-dev of the Gaussian noise displacing reference points off the target surface')
+    ddf_group.add_argument('--ddf_beta', type=float, default=0.0,
+                           help='[DDF] Confidence-weighting sharpness exp(-beta*d) (0 disables weighting)')
+    ddf_group.add_argument('--ddf_resample_every', type=int, default=0,
+                           help='[DDF] Epochs between refreshing the reference-point set and its ground-truth DDF '
+                                '(0 = sample once at the start and never refresh)')
+    ddf_group.add_argument('--ddf_chunk_size', type=int, default=2048,
+                           help='[DDF] Chunk size for the reference-point K-NN search (memory/speed tradeoff)')
+    ddf_group.add_argument('--save_ddf_reference_every', type=int, default=1000,
+                           help='[DDF] Save reference-point debug CSV/PLY/PNG every N epochs (0 disables)')
     args = parser.parse_args()
 
     # Load the data
@@ -1489,6 +1582,14 @@ def main():
             corr_search_resolution=args.corr_search_resolution,
             corr_refine_steps=args.corr_refine_steps,
             corr_refine_lr=args.corr_refine_lr,
+            surface_loss_type=args.surface_loss_type,
+            ddf_n_reference_points=args.ddf_n_reference_points,
+            ddf_k_neighbors=args.ddf_k_neighbors,
+            ddf_sigma=args.ddf_sigma,
+            ddf_beta=args.ddf_beta,
+            ddf_resample_every=args.ddf_resample_every,
+            ddf_chunk_size=args.ddf_chunk_size,
+            save_ddf_reference_every=args.save_ddf_reference_every,
         )
         F_model.eval()
         if G_model is not None:

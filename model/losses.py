@@ -251,6 +251,81 @@ def chamfer_distance_chunked(P: torch.Tensor, Q: torch.Tensor,
     return loss_P + loss_Q
 
 
+def _ddf_closest_point(query: torch.Tensor, candidates: torch.Tensor,
+                       k: int = 5, chunk_size: int = 2048,
+                       eps: float = 1e-8) -> torch.Tensor:
+    """
+    Approximate each query point's closest point on a point-cloud surface as
+    an inverse-squared-distance weighted average of its k nearest neighbors. 
+    Differentiable w.r.t. "candidates".
+    """
+    k = min(k, candidates.shape[0])
+    closest_chunks = []
+    for i in range(0, query.shape[0], chunk_size):
+        q = query[i:i + chunk_size]
+        d = torch.cdist(q, candidates)
+        knn_dist, knn_idx = torch.topk(d, k, dim=1, largest=False)
+        knn_pts = candidates[knn_idx]
+        w = 1.0 / (knn_dist ** 2 + eps)
+        w = w / w.sum(dim=1, keepdim=True)
+        closest_chunks.append((w.unsqueeze(-1) * knn_pts).sum(dim=1))
+    return torch.cat(closest_chunks, dim=0)
+
+
+def directional_distance_field(query: torch.Tensor, candidates: torch.Tensor,
+                               k: int = 5, chunk_size: int = 2048) -> torch.Tensor:
+    """
+    Directional Distance Field
+    for each query (reference) point, the unsigned distance to a point-cloud surface
+    concatenated with the direction toward its closest point.
+
+    Returns:
+        (M, 4) tensor: [distance, direction_x, direction_y, direction_z].
+    """
+    closest = _ddf_closest_point(query, candidates, k=k, chunk_size=chunk_size)
+    direction = closest - query
+    dist = direction.norm(dim=-1, keepdim=True)
+    return torch.cat([dist, direction], dim=-1)
+
+
+def sample_ddf_reference_points(points: torch.Tensor, sigma: float = 0.05,
+                                n_points: int = None) -> torch.Tensor:
+    """
+    Generate DDM reference points near a surface by adding Gaussian noise to
+    a (sub)sample of its points.
+    """
+    if n_points is None or n_points >= points.shape[0]:
+        base = points
+    else:
+        idx = torch.randint(0, points.shape[0], (n_points,), device=points.device)
+        base = points[idx]
+    return base + sigma * torch.randn_like(base)
+
+
+def directional_distance_loss(pred_points: torch.Tensor, ref_points: torch.Tensor,
+                              ref_ddf_gt: torch.Tensor, k: int = 5,
+                              beta: float = 20.0, chunk_size: int = 2048) -> torch.Tensor:
+    """
+    DDM surface-fitting loss: compares the DDF of
+    the current predicted point cloud against a precomputed ground-truth DDF,
+    both evaluated at the same fixed `ref_points`.
+
+    `ref_ddf_gt` is expected to be precomputed once (target is static) via
+    `directional_distance_field(ref_points, target_points, ...)`.
+
+    The confidence weight `s(q) = exp(-beta * d(q))` is detached from the
+    graph before weighting, so the model can't reduce the loss by driving a
+    reference point's distance past 1/beta (where s(q)*d(q) would otherwise
+    start decreasing with larger d).
+    """
+    ddf_pred = directional_distance_field(ref_points, pred_points, k=k, chunk_size=chunk_size)
+    d = (ddf_pred - ref_ddf_gt).abs().sum(dim=-1)
+    if beta > 0:
+        s = torch.exp(-beta * d.detach())
+        return (s * d).sum() / s.sum().clamp_min(1e-8)
+    return d.mean()
+
+
 def surface_jacobian(Q, uv):
     """
     Compute tangent vectors with autograd.
@@ -270,7 +345,7 @@ def surface_jacobian(Q, uv):
     return t_u, t_v
 
 
-def tangent_loss_from_jac(t_u, t_v, mode='arap', eps=1e-4, scale_invariant=True):
+def tangent_loss_from_jac(t_u, t_v, mode='dirichlet', eps=1e-4, scale_invariant=True):
     """
     Compute Jacobian-based tangent regularization with optional scale normalization.
     """
@@ -292,7 +367,7 @@ def tangent_loss_from_jac(t_u, t_v, mode='arap', eps=1e-4, scale_invariant=True)
     ## dirichlet
     ### \int_S(||df/du||^2 + ||df/dv||^2)
 
-    # e_dirichlet = 1.0*torch.mean(0.5*torch.sum(J ** 2, dim=1))
+    e_dirichlet = 1.0*torch.mean(0.5*torch.sum(J ** 2, dim=1))
 
     if mode == 'conformal_fff':
         E = (t_u * t_u).sum(dim=-1)
@@ -317,6 +392,8 @@ def tangent_loss_from_jac(t_u, t_v, mode='arap', eps=1e-4, scale_invariant=True)
         energy = (S[:, 0] - S[:, 1]).pow(2).mean()
     elif mode == 'collapse':
         energy = torch.zeros((), device=J.device, dtype=J.dtype)
+    elif mode == 'dirichlet':
+        return e_dirichlet + collapse
     else:
         raise ValueError(f"unknown tangent mode: {mode}")
 
