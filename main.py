@@ -182,6 +182,9 @@ def train_multi_patch(pts3n: np.ndarray,
                       corr_refine_steps: int = 200,
                       corr_refine_lr: float = 1e-2,
                       surface_loss_type: str = 'chamfer',
+                      ddf_mu_decay: float = 0.5,
+                      ddf_start_epoch: int = 0,
+                      chamfer_resume_epoch: int = 0,
                       ddf_n_reference_points: int = 20000,
                       ddf_k_neighbors: int = 5,
                       ddf_sigma: float = 0.05,
@@ -201,6 +204,15 @@ def train_multi_patch(pts3n: np.ndarray,
     `build_hard_correspondence` and switches to direct pointwise MSE
     regression against it for the remainder of training. `surface_loss_type`
     only affects this pre-switch phase; the MSE phase is unaffected.
+
+    When `surface_loss_type == 'ddf'`, the pre-switch phase can be split into
+    up to three stages: plain Chamfer distance first (epoch < ddf_start_epoch),
+    then DDF (ddf_start_epoch <= epoch < chamfer_resume_epoch), then optional
+    Chamfer again from `chamfer_resume_epoch` onward. This allows DDF to pull
+    predictions close to the target surface first, then lets Chamfer take over
+    later if the tangent regularizer becomes too restrictive during the DDF
+    phase. During the DDF phase, the tangent-loss weight is scaled by
+    `ddf_mu_decay`.
     """
     F, atlas_info = _build_forward_model(
         atlas_mode=atlas_mode,
@@ -242,6 +254,27 @@ def train_multi_patch(pts3n: np.ndarray,
         raise ValueError(
             "--surface_loss_type ddf currently requires --no_presplit: the DDF loss is "
             "evaluated against the full target cloud, not per-patch pre-assigned subsets."
+        )
+    if ddf_start_epoch < 0:
+        raise ValueError(f"--ddf_start_epoch must be >= 0, got {ddf_start_epoch}")
+    if chamfer_resume_epoch < 0:
+        raise ValueError(f"--chamfer_resume_epoch must be >= 0, got {chamfer_resume_epoch}")
+    if ddf_mu_decay < 0:
+        raise ValueError(f"--ddf_mu_decay must be >= 0, got {ddf_mu_decay}")
+    if corr_switch_epoch > 0 and ddf_start_epoch >= corr_switch_epoch:
+        raise ValueError(
+            f"--ddf_start_epoch ({ddf_start_epoch}) must be < --corr_switch_epoch "
+            f"({corr_switch_epoch}), otherwise the DDF phase never runs."
+        )
+    if chamfer_resume_epoch > 0 and chamfer_resume_epoch <= ddf_start_epoch:
+        raise ValueError(
+            f"--chamfer_resume_epoch ({chamfer_resume_epoch}) must be > --ddf_start_epoch "
+            f"({ddf_start_epoch}) so the DDF phase has time to run."
+        )
+    if corr_switch_epoch > 0 and chamfer_resume_epoch >= corr_switch_epoch:
+        raise ValueError(
+            f"--chamfer_resume_epoch ({chamfer_resume_epoch}) must be < --corr_switch_epoch "
+            f"({corr_switch_epoch}) when correspondence switching is enabled."
         )
 
     if corr_switch_epoch > 0:
@@ -421,6 +454,14 @@ def train_multi_patch(pts3n: np.ndarray,
     print(f"  M_per_patch={M_per_patch}  batch/step={K*M_per_patch}  reg_every={reg_every}")
     print(f"  Surface-fitting loss (pre-correspondence-switch): {surface_loss_type}")
     if surface_loss_type == 'ddf':
+        if ddf_start_epoch > 0:
+            if chamfer_resume_epoch > 0:
+                print(f"    Chamfer for epochs 1-{ddf_start_epoch - 1}, DDF for epochs {ddf_start_epoch}-{chamfer_resume_epoch - 1}, then Chamfer again from epoch {chamfer_resume_epoch}")
+            else:
+                print(f"    Chamfer for epochs 1-{ddf_start_epoch - 1}, then DDF from epoch {ddf_start_epoch}")
+        elif chamfer_resume_epoch > 0:
+            print(f"    DDF for epochs 1-{chamfer_resume_epoch - 1}, then Chamfer again from epoch {chamfer_resume_epoch}")
+        print(f"    Tangent μ scaling during DDF: ×{ddf_mu_decay}")
         print(f"    DDF: n_ref={ddf_n_reference_points}  k={ddf_k_neighbors}  "
               f"σ={ddf_sigma}  β={ddf_beta}  resample_every={ddf_resample_every}")
     print(f"  μ={mu}  γ={gamma}  λ₁={lam}  λ₂={lam2}  λ_outer={lambda_outer_boundary}")
@@ -615,6 +656,13 @@ def train_multi_patch(pts3n: np.ndarray,
     for epoch in range(1, epochs + 1):
         opt.zero_grad()
 
+        use_ddf_phase = (
+            surface_loss_type == 'ddf'
+            and correspondence is None
+            and epoch >= ddf_start_epoch
+            and (chamfer_resume_epoch <= 0 or epoch < chamfer_resume_epoch)
+        )
+
         if corr_switch_epoch > 0 and epoch == corr_switch_epoch:
             print(f"  Building point correspondence at epoch {epoch} (Chamfer → MSE switch)...")
             all_points_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
@@ -698,7 +746,8 @@ def train_multi_patch(pts3n: np.ndarray,
 
             # Loss 1: surface-fitting term (Chamfer distance or DDF).
             if no_presplit:
-                if surface_loss_type == 'ddf':
+                lambda_ddf = 1
+                if use_ddf_phase:
                     if ddf_ref_points is None or (
                             ddf_resample_every > 0 and (epoch - 1) % ddf_resample_every == 0):
                         ddf_ref_points = sample_ddf_reference_points(
@@ -708,7 +757,7 @@ def train_multi_patch(pts3n: np.ndarray,
                                 ddf_ref_points, pts3n_dev,
                                 k=ddf_k_neighbors, chunk_size=ddf_chunk_size)
                         _save_ddf_reference_snapshot(epoch)
-                    cd_loss = directional_distance_loss(
+                    cd_loss = lambda_ddf * directional_distance_loss(
                         Q_flat, ddf_ref_points, ddf_ref_gt,
                         k=ddf_k_neighbors, beta=ddf_beta, chunk_size=ddf_chunk_size)
                 else:
@@ -752,6 +801,8 @@ def train_multi_patch(pts3n: np.ndarray,
         do_reg = (mu > 0 or gamma > 0) and (epoch % reg_every == 0)
         mu_eff = mu_warmup_schedule(epoch, mu_warmup_epochs, mu,
                                     schedule=schedule, delay_epochs=mu_warmup_delay) if mu > 0 else 0.0
+        if use_ddf_phase:
+            mu_eff *= ddf_mu_decay
         if do_reg:
             t_u, t_v = surface_jacobian(Q_flat, uv_flat)
 
@@ -811,16 +862,17 @@ def train_multi_patch(pts3n: np.ndarray,
             history['outer_boundary'].append(float(outer_boundary_loss))
             # history['mu_eff'].append(float(mu_eff))
             history['total'].append(float(loss))
-            history['phase'].append('mse' if correspondence is not None else 'chamfer')
+            if correspondence is not None:
+                phase = 'mse'
+            elif use_ddf_phase:
+                phase = 'ddf'
+            else:
+                phase = 'chamfer'
+            history['phase'].append(phase)
 
             elapsed = time.time() - t0
             # mu_str = f"  μ_eff={float(mu_eff):.4f}" if (mu_warmup_epochs > 0 and mu > 0) else ""
-            if correspondence is not None:
-                recon_label = 'MSE'
-            elif surface_loss_type == 'ddf':
-                recon_label = 'DDF'
-            else:
-                recon_label = 'CD '
+            recon_label = {'mse': 'MSE', 'ddf': 'DDF', 'chamfer': 'CD '}[phase]
             print(f"  Epoch {epoch:5d}/{epochs}  |  "
                   f"{recon_label}={float(cd_loss):.5f}  "
                   f"Cycle={float(cycle_loss):.5f}  "
@@ -1341,11 +1393,24 @@ def main():
                                 'surface-fitting phase: plain Chamfer distance, or Directional Distance '
                                 'Field (DDM, Ren et al. 2024, arXiv:2401.09736). Does not affect the '
                                 'post-corr_switch_epoch MSE phase.')
+    ddf_group.add_argument('--ddf_start_epoch', type=int, default=0,
+                           help="[DDF] Epoch at which to switch surface_loss_type='ddf' runs from Chamfer to "
+                                'DDF (0 = DDF from epoch 1). Chamfer first resolves coarse geometry/concavities '
+                                "(DDF's K-NN-averaged closest point can blend across nearby-but-distinct surface "
+                                'sheets there); DDF then refines fine detail once points are already close. '
+                                'Must be < --corr_switch_epoch when the latter is set.')
+    ddf_group.add_argument('--chamfer_resume_epoch', type=int, default=0,
+                          help='[DDF] Optional epoch at which to stop using DDF and switch back to Chamfer '
+                              'for the rest of training (0 disables the switch-back). Useful when DDF gets '
+                              'the surface close enough but later Chamfer is less constrained by the tangent loss.')
+    ddf_group.add_argument('--ddf_mu_decay', type=float, default=0.5,
+                           help='[DDF] Multiplier applied to tangent-loss weight μ once training switches '
+                                'from Chamfer to DDF (e.g. 0.5 halves μ during the DDF phase)')
     ddf_group.add_argument('--ddf_n_reference_points', type=int, default=50000,
                            help='[DDF] Number of reference points sampled near the target surface')
     ddf_group.add_argument('--ddf_k_neighbors', type=int, default=5,
                            help='[DDF] Number of nearest neighbors used to approximate the closest surface point')
-    ddf_group.add_argument('--ddf_sigma', type=float, default=0.05,
+    ddf_group.add_argument('--ddf_sigma', type=float, default=0.005,
                            help='[DDF] Std-dev of the Gaussian noise displacing reference points off the target surface')
     ddf_group.add_argument('--ddf_beta', type=float, default=0.0,
                            help='[DDF] Confidence-weighting sharpness exp(-beta*d) (0 disables weighting)')
@@ -1583,6 +1648,9 @@ def main():
             corr_refine_steps=args.corr_refine_steps,
             corr_refine_lr=args.corr_refine_lr,
             surface_loss_type=args.surface_loss_type,
+            ddf_mu_decay=args.ddf_mu_decay,
+            ddf_start_epoch=args.ddf_start_epoch,
+            chamfer_resume_epoch=args.chamfer_resume_epoch,
             ddf_n_reference_points=args.ddf_n_reference_points,
             ddf_k_neighbors=args.ddf_k_neighbors,
             ddf_sigma=args.ddf_sigma,
