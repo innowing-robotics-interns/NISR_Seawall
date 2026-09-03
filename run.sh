@@ -7,9 +7,9 @@
 # INPUT_FILE="data/${FILE}"
 # OUTPUT_DIR="logs/log_bestConfig/${FILE%.*}_D3_W512_M4096_d128_16Patches_bound1"
 
-FILE="max-planck.ply"
-INPUT_FILE="3d_test_models/${FILE}"
-OUTPUT_DIR="logs/log_3dModelsMSE/${FILE%.*}_boxInit_ARAP0.25_noPresplit_24Patches_M1500_6Atlas_pretrain2k_MED_FreezeUV_10k"
+FILE="stanford-bunny.ply"
+INPUT_FILE="data/${FILE}"
+OUTPUT_DIR="logs/3dModel/${FILE%.*}_Experiment_midtraining-subdivision"
 
 
 # python main.py \
@@ -38,7 +38,7 @@ OUTPUT_DIR="logs/log_3dModelsMSE/${FILE%.*}_boxInit_ARAP0.25_noPresplit_24Patche
 #     --mu_warmup_epochs 1000 \
 #     --mu_warmup_delay 300 \
 #     --schedule cosine \
-#     --checkpoint_every  5000\
+#     --checkpoint_every  5000
 
 # python main.py \
 #     --multi_patch \
@@ -109,44 +109,52 @@ OUTPUT_DIR="logs/log_3dModelsMSE/${FILE%.*}_boxInit_ARAP0.25_noPresplit_24Patche
 # initialize the model as a box
 # 2x2 patches per sheet, 6 sheets (24 patches), M = 1500
 # 3x3 patches per sheet, 6 sheets (54 patches), M = 700
-python main.py \
-    --multi_patch \
-    --atlas_mode six_sheet \
-    --file ${INPUT_FILE} \
-    --result_dir ${OUTPUT_DIR} \
-    --epochs 10000 \
-    --d_features 88 \
-    --M_per_patch 1500 \
-    --W 512 \
-    --D 6 \
-    --L 0 \
-    --beta 100 \
-    --mu 0.08 \
-    --gamma 0 \
-    --lam 0 \
-    --lam2 0 \
-    --lambda_outer_boundary 0 \
-    --log_every 100 \
-    --mu_warmup_epochs 1000 \
-    --mu_warmup_delay 300 \
-    --schedule cosine \
-    --N 5000 \
-    --checkpoint_every 5000 \
-    --six_sheet_face_rows 2 \
-    --six_sheet_face_cols 2 \
-    --face_aware_box_supervision \
-    --pretrain_then_train \
-    --pretrain_epochs 1000 \
-    --pretrain_shape box \
-    --pretrain_mode closed_shape \
-    --no_presplit \
-    --correspondence_line_segment q_to_t \
-    --corr_switch_epoch 7500 \
-    --save_boundary_debug 0 \
+# python main.py \
+    # --multi_patch \
+    # --atlas_mode six_sheet \
+    # --file ${INPUT_FILE} \
+    # --result_dir ${OUTPUT_DIR} \
+    # --epochs 10000 \
+    # --d_features 88 \
+    # --M_per_patch 1500 \
+    # --W 512 \
+    # --D 6 \
+    # --L 0 \
+    # --beta 100 \
+    # --mu 0.08 \
+    # --gamma 0 \
+    # --lam 0 \
+    # --lam2 0 \
+    # --lambda_outer_boundary 0 \
+    # --log_every 100 \
+    # --mu_warmup_epochs 1000 \
+    # --mu_warmup_delay 300 \
+    # --schedule cosine \
+    # --N 5000 \
+    # --checkpoint_every 5000 \
+    # --six_sheet_face_rows 2 \
+    # --six_sheet_face_cols 2 \
+    # --face_aware_box_supervision \
+    # --pretrain_then_train \
+    # --pretrain_epochs 1000 \
+    # --pretrain_shape box \
+    # --pretrain_mode closed_shape \
+    # --no_presplit \
+    # --correspondence_line_segment q_to_t \
+    # --corr_switch_epoch 7500 \
+    # --save_boundary_debug 0 \
 
+
+
+# python utils/patch_vis.py \
+#     --ckpt ${OUTPUT_DIR}/checkpoint_100_before_subdivision.pt \
+#     --out_dir ${OUTPUT_DIR} \
+#     --n_images 1 \
+#     --subdivision_depth "-1" \
+#     # --input_file ${INPUT_FILE} \
 
 python utils/patch_vis.py \
-    --ckpt ${OUTPUT_DIR}/checkpoint.pt \
+    --ckpt checkpoint_subdivided.pt \
     --out_dir ${OUTPUT_DIR} \
     --n_images 1 \
     --subdivision_depth "-1" \

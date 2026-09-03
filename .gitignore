@@ -5,11 +5,12 @@ utils/vis_obj.py
 utils/3dModel_to_PC.py
 **/__pycache__/
 inputmodels/*
-
+demo/*
 *.txt
 *.pt
 *.png
 *.ply
 *.obj
 *.json
+*.log
 run.sh
