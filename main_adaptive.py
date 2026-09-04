@@ -45,6 +45,80 @@ def _save_ckpt(model, path, extra=None):
     print(f"    Checkpoint → {path}")
 
 
+@torch.no_grad()
+def export_pretrain_box_samples(model, path, samples_per_patch: int, device: str):
+    """Export the exact cube target samples used by box pretraining, with normals."""
+    was_training = model.training
+    model.eval()
+
+    K = model.n_patches
+    pids = torch.arange(K, device=device).repeat_interleave(samples_per_patch)
+    uv = torch.rand(K * samples_per_patch, 2, device=device)
+    xyz = model.cube_xyz(pids, uv)
+
+    normals = torch.zeros_like(xyz)
+    face_ids = model.complex.leaf_face[pids]
+    normals[face_ids == 0, 0] = 1.0   # +X
+    normals[face_ids == 1, 0] = -1.0  # -X
+    normals[face_ids == 2, 1] = 1.0   # +Y
+    normals[face_ids == 3, 1] = -1.0  # -Y
+    normals[face_ids == 4, 2] = 1.0   # +Z
+    normals[face_ids == 5, 2] = -1.0  # -Z
+
+    utils.export_point_cloud_ply(
+        xyz.detach().cpu().numpy(),
+        path,
+        normals=normals.detach().cpu().numpy(),
+    )
+
+    if was_training:
+        model.train()
+
+
+@torch.no_grad()
+def export_pretrain_box_prediction_samples(model, path, samples_per_patch: int, device: str):
+    """Export predicted pretrain box samples with normals forced outward wrt origin."""
+    was_training = model.training
+    model.eval()
+
+    K = model.n_patches
+    pids = torch.arange(K, device=device).repeat_interleave(samples_per_patch)
+    uv = torch.rand(K * samples_per_patch, 2, device=device)
+    xyz = model(pids, uv)
+
+    face_ids = model.complex.leaf_face[pids]
+    normals = torch.zeros_like(xyz)
+    normals[face_ids == 0, 0] = 1.0   # +X
+    normals[face_ids == 1, 0] = -1.0  # -X
+    normals[face_ids == 2, 1] = 1.0   # +Y
+    normals[face_ids == 3, 1] = -1.0  # -Y
+    normals[face_ids == 4, 2] = 1.0   # +Z
+    normals[face_ids == 5, 2] = -1.0  # -Z
+
+    utils.export_point_cloud_ply(
+        xyz.detach().cpu().numpy(),
+        path,
+        normals=normals.detach().cpu().numpy(),
+    )
+
+    if was_training:
+        model.train()
+
+
+def orient_patch_faces_outward(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Flip triangle winding so each face normal points away from the origin."""
+    if faces.size == 0:
+        return faces
+
+    oriented = faces.copy()
+    tri = verts[oriented]
+    normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    centers = tri.mean(axis=1)
+    inward = np.einsum('ij,ij->i', normals, centers) < 0.0
+    oriented[inward] = oriented[inward][:, [0, 2, 1]]
+    return oriented
+
+
 def pretrain_box(model, epochs, M_per_patch, lr, device, log_every,
                  loss_type='mse'):
     """Fit every leaf patch to its own piece of the reference cube."""
@@ -211,7 +285,7 @@ def main():
     ap.add_argument('--file', type=str, default=None)
     ap.add_argument('--shape', type=str, default='box')
     ap.add_argument('--N', type=int, default=50000)
-    ap.add_argument('--result_dir', type=str, default='logs/adaptive/test_pretrain')
+    ap.add_argument('--result_dir', type=str, default='logs/adaptive')
     ap.add_argument('--device', type=str,
                     default='cuda' if torch.cuda.is_available() else 'cpu')
     ap.add_argument('--log_every', type=int, default=100)
@@ -299,14 +373,27 @@ def main():
     # ── phase 1: box pretraining ─────────────────────────────────────────
     pretrain_history = None
     if not args.skip_pretrain and not args.load_ckpt:
+        export_pretrain_box_samples(
+            model,
+            os.path.join(result_dir, 'pretrain_box_target_samples.ply'),
+            samples_per_patch=args.M_per_patch,
+            device=args.device,
+        )
         pretrain_history = pretrain_box(
             model, epochs=args.pretrain_epochs, M_per_patch=args.M_per_patch,
             lr=args.lr, device=args.device, log_every=args.log_every,
             loss_type=args.pretrain_loss)
+        export_pretrain_box_prediction_samples(
+            model,
+            os.path.join(result_dir, 'pretrain_box_pred_samples.ply'),
+            samples_per_patch=args.M_per_patch,
+            device=args.device,
+        )
         visualize_patch_configuration(
             model, os.path.join(result_dir, 'patch_config_pretrain.png'))
         verts, faces = utils.sample_multi_patch_grid(
             model, resolution=args.mesh_res, device=args.device)
+        faces = orient_patch_faces_outward(verts, faces)
         utils.export_ply(verts, faces,
                          os.path.join(result_dir, 'pretrain_box.ply'))
         _save_ckpt(model, os.path.join(result_dir, 'pretrain_checkpoint.pt'),
@@ -370,6 +457,7 @@ def main():
 
     verts, faces = utils.sample_multi_patch_grid(
         model, resolution=args.mesh_res, device=args.device)
+    faces = orient_patch_faces_outward(verts, faces)
     utils.export_ply(verts, faces,
                      os.path.join(result_dir, 'learned_sheet_normalized.ply'))
     verts_orig = utils.unnormalize_vertices(verts, meta)
