@@ -50,6 +50,7 @@ def mvc_weights_torch(points: torch.Tensor,
         interpolation along it; Case B just evaluates that limit robustly.
     """
     B, K, _ = polys.shape
+    print("mvc points", points.shape, "polys", polys.shape)
 
     s = polys - points.unsqueeze(1)                    # (B, K, 2) vectors p->v_i
     r = torch.linalg.norm(s, dim=-1)                   # (B, K) distances
@@ -108,6 +109,7 @@ def mvc_weights_torch(points: torch.Tensor,
     # priority: vertex  >  edge  >  interior
     out = torch.where(any_edge.unsqueeze(1), w_edge, w_interior)
     out = torch.where(any_vertex.unsqueeze(1), w_vert, out)
+    # print("mvc out", out.shape)
     return out
 
 
