@@ -169,6 +169,95 @@ class AdaptiveCubeComplex(nn.Module):
             self._collect_hanging(p, c[i], c[(i + 1) % 4], ids, uvs)
         return ids, uvs
 
+    def validate_leaf_polygons(self, atol: float = 1e-8):
+        """Return diagnostics for leaf MVC polygons after subdivision.
+
+        Checks:
+        - duplicate non-consecutive vertices
+        - signed area <= 0
+        - vertices outside local [0,1]^2
+        - edge vertices not lying on the expected boundary edge
+        - non-monotone ordering along each boundary edge
+        """
+        reports = []
+        for leaf_idx, p in enumerate([q for q in self.patches if q.is_leaf]):
+            ids, uvs = self._polygon(p)
+            uv_t = torch.tensor(uvs, dtype=torch.float64)
+
+            issues = []
+
+            # signed area
+            x = uv_t[:, 0]
+            y = uv_t[:, 1]
+            area2 = torch.sum(x * torch.roll(y, -1) - torch.roll(x, -1) * y).item()
+            if area2 <= atol:
+                issues.append(f"non_positive_signed_area:{area2:.3e}")
+
+            # bounds
+            if ((uv_t < -atol) | (uv_t > 1.0 + atol)).any():
+                issues.append("vertex_out_of_local_bounds")
+
+            # duplicate non-consecutive vertices
+            seen = {}
+            n = len(uvs)
+            for i, uv in enumerate(uvs):
+                key = (round(float(uv[0]), 12), round(float(uv[1]), 12))
+                if key in seen:
+                    j = seen[key]
+                    if not (abs(i - j) == 1 or {i, j} == {0, n - 1}):
+                        issues.append(f"duplicate_nonconsecutive_vertex:{j}->{i}:{key}")
+                else:
+                    seen[key] = i
+
+            # per-edge checks against expected square boundary walk
+            edge_specs = [
+                (0.0, 'u', 1.0),  # bottom: v=0, u increasing
+                (1.0, 'v', 1.0),  # right:  u=1, v increasing
+                (1.0, 'u', -1.0), # top:    v=1, u decreasing
+                (0.0, 'v', -1.0), # left:   u=0, v decreasing
+            ]
+            cursor = 0
+            for edge_idx in range(4):
+                start = cursor
+                end = start + 1
+                while end < len(uvs):
+                    if end < len(uvs) - 1 and ids[end] == p.corner_ids[(edge_idx + 1) % 4]:
+                        break
+                    end += 1
+                segment = uvs[start:end + 1]
+                const_val, axis, direction = edge_specs[edge_idx]
+
+                vals = []
+                for uv in segment:
+                    u, v = float(uv[0]), float(uv[1])
+                    if edge_idx == 0 and abs(v - 0.0) > atol:
+                        issues.append(f"edge{edge_idx}_off_boundary:{uv}")
+                    elif edge_idx == 1 and abs(u - 1.0) > atol:
+                        issues.append(f"edge{edge_idx}_off_boundary:{uv}")
+                    elif edge_idx == 2 and abs(v - 1.0) > atol:
+                        issues.append(f"edge{edge_idx}_off_boundary:{uv}")
+                    elif edge_idx == 3 and abs(u - 0.0) > atol:
+                        issues.append(f"edge{edge_idx}_off_boundary:{uv}")
+                    vals.append(u if axis == 'u' else v)
+
+                diffs = [direction * (vals[i + 1] - vals[i]) for i in range(len(vals) - 1)]
+                if any(d < -atol for d in diffs):
+                    issues.append(f"edge{edge_idx}_nonmonotone:{vals}")
+                cursor = end
+
+            if issues:
+                reports.append({
+                    'leaf_idx': leaf_idx,
+                    'face': int(p.face),
+                    'depth': int(p.depth),
+                    'rect': (int(p.u0), int(p.v0), int(p.size)),
+                    'corner_ids': list(map(int, p.corner_ids)),
+                    'polygon_ids': list(map(int, ids)),
+                    'polygon_uv': [tuple(map(float, uv)) for uv in uvs],
+                    'issues': issues,
+                })
+        return reports
+
     # ── subdivision ─────────────────────────────────────────────────────
     @torch.no_grad()
     def _interp_feature_at(self, p, local_uv):

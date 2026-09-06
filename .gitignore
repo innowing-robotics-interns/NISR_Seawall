@@ -13,4 +13,5 @@ demo/*
 *.obj
 *.json
 *.log
+*.mtl
 run.sh

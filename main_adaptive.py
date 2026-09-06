@@ -45,6 +45,17 @@ def _save_ckpt(model, path, extra=None):
     print(f"    Checkpoint → {path}")
 
 
+def _save_polygon_validation_report(model, path):
+    reports = model.complex.validate_leaf_polygons()
+    payload = {
+        'n_reports': len(reports),
+        'reports': reports,
+    }
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2)
+    print(f"    Polygon validation JSON → {path}  (issues={len(reports)})")
+
+
 @torch.no_grad()
 def export_pretrain_box_samples(model, path, samples_per_patch: int, device: str):
     """Export the exact cube target samples used by box pretraining, with normals."""
@@ -119,8 +130,103 @@ def orient_patch_faces_outward(verts: np.ndarray, faces: np.ndarray) -> np.ndarr
     return oriented
 
 
+def _clone_adaptive_model(model, device: str):
+    clone = AdaptiveCubeForwardMap(
+        d_features=model.d_features,
+        base_subdivisions=0,
+        L=model.L,
+        W=model.W,
+        D=model.D,
+        beta=model.beta,
+    ).to(device)
+    clone.complex.replay(model.complex.serialize())
+    clone.load_state_dict(model.state_dict())
+    return clone
+
+
+def export_forced_subdivided_pretrain_box(model, path, resolution: int, device: str,
+                                          ckpt_path: str = None):
+    """Clone the pretrained adaptive box, subdivide every leaf once via the normal subdivision path, and export it."""
+    clone = _clone_adaptive_model(model, device)
+    distortion = torch.ones(clone.n_patches)
+    subdivide_by_distortion(
+        clone,
+        threshold=0.0,
+        max_depth=max(p.depth for p in clone.complex.leaf_patches) + 1,
+        max_splits_per_round=0,
+        distortion=distortion,
+    )
+    clone.eval()
+
+    verts, faces = utils.sample_multi_patch_grid(clone, resolution=resolution, device=device)
+    faces = orient_patch_faces_outward(verts, faces)
+    utils.export_ply(verts, faces, path)
+    if ckpt_path is not None:
+        torch.save(
+            clone.checkpoint_payload({
+                'phase': 'pretrain_subdivided',
+                'source_phase': 'pretrain',
+            }),
+            ckpt_path,
+        )
+        print(f"    Subdivided pretrain checkpoint → {ckpt_path}")
+
+
+def retrain_forced_subdivided_box(model, epochs: int, M_per_patch: int, lr: float,
+                                  device: str, log_every: int, loss_type: str,
+                                  result_dir: str, mesh_res: int):
+    """Clone pretrained model, subdivide every leaf once, then fit the box again."""
+    clone = _clone_adaptive_model(model, device)
+    distortion = torch.ones(clone.n_patches)
+    subdivide_by_distortion(
+        clone,
+        threshold=0.0,
+        max_depth=max(p.depth for p in clone.complex.leaf_patches) + 1,
+        max_splits_per_round=0,
+        distortion=distortion,
+    )
+
+    loss_fn = nn.MSELoss() if loss_type == 'mse' else nn.L1Loss()
+    opt, sched = _make_optim(clone, lr, epochs)
+    t0 = time.time()
+    clone.train()
+    print("  Diagnostic — retraining forced-subdivided box")
+    print(f"  leaves={clone.n_patches}  vertices={clone.complex.n_vertices}  epochs={epochs}")
+
+    for epoch in range(1, epochs + 1):
+        K = clone.n_patches
+        pids = torch.arange(K, device=device).repeat_interleave(M_per_patch)
+        uv = torch.rand(K * M_per_patch, 2, device=device)
+        with torch.no_grad():
+            target = clone.cube_xyz(pids, uv)
+        pred = clone(pids, uv)
+        loss = loss_fn(pred, target)
+
+        opt.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(list(clone.parameters()), 1.0)
+        opt.step()
+        sched.step()
+
+        if epoch % log_every == 0 or epoch == 1 or epoch == epochs:
+            print(f"    Retrain epoch {epoch:5d}/{epochs} | Box={float(loss):.6f} [{time.time() - t0:.1f}s]")
+
+    clone.eval()
+    verts, faces = utils.sample_multi_patch_grid(clone, resolution=mesh_res, device=device)
+    faces = orient_patch_faces_outward(verts, faces)
+    utils.export_ply(verts, faces, os.path.join(result_dir, 'pretrain_subdivided_trained.ply'))
+    torch.save(
+        clone.checkpoint_payload({
+            'phase': 'pretrain_subdivided_trained',
+            'source_phase': 'pretrain',
+        }),
+        os.path.join(result_dir, 'pretrain_subdivided_trained.pt'),
+    )
+    print(f"    Retrained subdivided pretrain checkpoint → {os.path.join(result_dir, 'pretrain_subdivided_trained.pt')}")
+
+
 def pretrain_box(model, epochs, M_per_patch, lr, device, log_every,
-                 loss_type='mse'):
+                 loss_type='mse', result_dir: str = None, mesh_res: int = 40):
     """Fit every leaf patch to its own piece of the reference cube."""
     loss_fn = nn.MSELoss() if loss_type == 'mse' else nn.L1Loss()
     opt, sched = _make_optim(model, lr, epochs)
@@ -155,6 +261,29 @@ def pretrain_box(model, epochs, M_per_patch, lr, device, log_every,
             history['loss'].append(float(loss))
             print(f"  Epoch {epoch:5d}/{epochs}  |  Box={float(loss):.6f}  "
                   f"[{time.time() - t0:.1f}s]")
+
+
+    # subdivision on box
+    if result_dir is not None:
+        export_forced_subdivided_pretrain_box(
+            model,
+            path=os.path.join(result_dir, 'pretrain_box_subdivided.ply'),
+            resolution=mesh_res,
+            device=device,
+            ckpt_path=os.path.join(result_dir, 'pretrain_subdivided_checkpoint.pt'),
+        )
+        retrain_forced_subdivided_box(
+            model,
+            epochs=epochs,
+            M_per_patch=M_per_patch,
+            lr=lr,
+            device=device,
+            log_every=log_every,
+            loss_type=loss_type,
+            result_dir=result_dir,
+            mesh_res=mesh_res,
+        )
+    
 
     seam = check_seam_continuity(model)
     print(f"  Seam check: max gap={seam['max_gap']:.3e}  "
@@ -215,6 +344,10 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 events.append({'epoch': epoch,
                                'n_subdivided': rep['n_subdivided'],
                                'n_leaves': rep['n_leaves']})
+                _save_polygon_validation_report(
+                    model,
+                    os.path.join(vis_dir, f'polygon_validation_{epoch:05d}.json')
+                )
             visualize_patch_configuration(
                 model, os.path.join(vis_dir, f'patch_config_{epoch:05d}.png'),
                 pts=pts3n)
@@ -290,7 +423,7 @@ def main():
                     default='cuda' if torch.cuda.is_available() else 'cpu')
     ap.add_argument('--log_every', type=int, default=100)
     ap.add_argument('--mesh_res', type=int, default=40)
-    ap.add_argument('--checkpoint_every', type=int, default=1000)
+    ap.add_argument('--checkpoint_every', type=int, default=500)
 
     # model
     ap.add_argument('--d_features', type=int, default=88)
@@ -382,7 +515,12 @@ def main():
         pretrain_history = pretrain_box(
             model, epochs=args.pretrain_epochs, M_per_patch=args.M_per_patch,
             lr=args.lr, device=args.device, log_every=args.log_every,
-            loss_type=args.pretrain_loss)
+            loss_type=args.pretrain_loss, result_dir=result_dir,
+            mesh_res=args.mesh_res)
+        _save_polygon_validation_report(
+            model,
+            os.path.join(result_dir, 'polygon_validation_pretrain.json')
+        )
         export_pretrain_box_prediction_samples(
             model,
             os.path.join(result_dir, 'pretrain_box_pred_samples.ply'),
@@ -454,6 +592,10 @@ def main():
     visualize_patch_configuration(
         model, os.path.join(result_dir, 'patch_config_final.png'), pts=pts3n)
     plot_history(history, os.path.join(result_dir, 'history.png'))
+    _save_polygon_validation_report(
+        model,
+        os.path.join(result_dir, 'polygon_validation_final.json')
+    )
 
     verts, faces = utils.sample_multi_patch_grid(
         model, resolution=args.mesh_res, device=args.device)
