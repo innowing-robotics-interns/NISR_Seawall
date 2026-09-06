@@ -400,6 +400,63 @@ def tangent_loss_from_jac(t_u, t_v, mode='dirichlet', eps=1e-4, scale_invariant=
     return energy + collapse
 
 
+def tangent_loss(model=None,
+                 pids: torch.Tensor = None,
+                 t_u: torch.Tensor = None,
+                 t_v: torch.Tensor = None,
+                 mode: str = 'dirichlet',
+                 eps: float = 1e-4,
+                 scale_invariant: bool = True,
+                 patch_sizes: torch.Tensor = None,
+                 normalize_patch_scale: bool = False,
+                 target: float = 1.0) -> torch.Tensor:
+    """
+    Unified tangent/Jacobian regularization for both uniform and adaptive atlases.
+
+    When `normalize_patch_scale` is enabled, tangents are rescaled by the leaf
+    size so singular values are comparable across adaptive subdivision depths.
+    This matches the previous adaptive SVD behavior while keeping the actual
+    energy families in one shared implementation.
+    """
+    if t_u is None or t_v is None:
+        raise ValueError("t_u and t_v must be provided")
+
+    if normalize_patch_scale:
+        if patch_sizes is None:
+            if model is None or pids is None:
+                raise ValueError(
+                    "patch_sizes or (model, pids) must be provided when "
+                    "normalize_patch_scale=True"
+                )
+            model.complex._sync_device()
+            patch_sizes = model.complex.leaf_rect[pids, 2]
+        s = patch_sizes.clamp_min(1e-12).unsqueeze(-1)
+        t_u = t_u / s
+        t_v = t_v / s
+
+    if mode == 'dirichlet':
+        return tangent_loss_from_jac(
+            t_u, t_v, mode=mode, eps=eps, scale_invariant=scale_invariant)
+
+    J = torch.stack([t_u, t_v], dim=2)
+    S = torch.linalg.svdvals(J)
+    collapse = torch.relu(eps - S).pow(2).sum(dim=-1).mean()
+
+    if mode == 'arap':
+        energy = ((S - target) ** 2).sum(dim=-1).mean()
+    elif mode == 'arap_si':
+        s_mean = S.mean(dim=-1, keepdim=True).detach()
+        energy = ((S - s_mean) ** 2).sum(dim=-1).mean()
+    elif mode == 'conformal':
+        energy = (S[:, 0] - S[:, 1]).pow(2).mean()
+    elif mode == 'collapse':
+        energy = torch.zeros((), device=J.device, dtype=J.dtype)
+    else:
+        raise ValueError(f"unknown tangent mode: {mode}")
+
+    return energy + collapse
+
+
 def tangent_fold_loss(Q, uv):
     """Wrapper that computes its own Jacobian."""
     t_u, t_v = surface_jacobian(Q, uv)

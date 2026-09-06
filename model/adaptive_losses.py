@@ -20,6 +20,8 @@ and a single target / threshold is meaningful across the whole atlas.
 
 import torch
 
+from .losses import tangent_loss
+
 
 def svd_tangent_loss(t_u: torch.Tensor,
                      t_v: torch.Tensor,
@@ -87,5 +89,14 @@ def adaptive_svd_loss(model, pids: torch.Tensor,
     """
     model.complex._sync_device()
     sizes = model.complex.leaf_rect[pids, 2]                # (B,) size fraction
-    return svd_tangent_loss(t_u, t_v, patch_sizes=sizes,
-                            mode=mode, target=target, eps=eps)
+    return tangent_loss(
+        model=model,
+        pids=pids,
+        t_u=t_u,
+        t_v=t_v,
+        mode=mode,
+        target=target,
+        eps=eps,
+        patch_sizes=sizes,
+        normalize_patch_scale=True,
+    )
