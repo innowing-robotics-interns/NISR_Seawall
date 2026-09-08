@@ -74,7 +74,7 @@ def svd_tangent_loss(t_u: torch.Tensor,
     else:
         raise ValueError(f"unknown svd loss mode: {mode}")
 
-    return energy + collapse
+    return energy 
 
 
 def adaptive_svd_loss(model, pids: torch.Tensor,
@@ -89,14 +89,9 @@ def adaptive_svd_loss(model, pids: torch.Tensor,
     """
     model.complex._sync_device()
     sizes = model.complex.leaf_rect[pids, 2]                # (B,) size fraction
-    return tangent_loss(
-        model=model,
-        pids=pids,
-        t_u=t_u,
-        t_v=t_v,
-        mode=mode,
-        target=target,
-        eps=eps,
-        patch_sizes=sizes,
-        normalize_patch_scale=True,
-    )
+
+    J = torch.stack([t_u, t_v], dim=2)
+
+    e_dirichlet = 1.0*torch.mean(0.5*torch.sum(J ** 2, dim=1))
+
+    return e_dirichlet

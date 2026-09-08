@@ -456,7 +456,7 @@ def main():
     ap.add_argument('--D', type=int, default=6)
     ap.add_argument('--beta', type=float, default=100.0)
     ap.add_argument('--lr', type=float, default=1e-3)
-    ap.add_argument('--M_per_patch', type=int, default=256)
+    ap.add_argument('--M_per_patch', type=int, default=128)
 
     # pretrain
     ap.add_argument('--pretrain_epochs', type=int, default=2000)

@@ -434,11 +434,13 @@ def tangent_loss(model=None,
         t_u = t_u / s
         t_v = t_v / s
 
-    if mode == 'dirichlet':
-        return tangent_loss_from_jac(
-            t_u, t_v, mode=mode, eps=eps, scale_invariant=scale_invariant)
-
     J = torch.stack([t_u, t_v], dim=2)
+
+    if mode == 'dirichlet':
+        e_dirichlet = 1.0*torch.mean(0.5*torch.sum(J ** 2, dim=1))
+    
+        return e_dirichlet
+   
     S = torch.linalg.svdvals(J)
     collapse = torch.relu(eps - S).pow(2).sum(dim=-1).mean()
 

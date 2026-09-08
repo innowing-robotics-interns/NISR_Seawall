@@ -15,6 +15,7 @@ import torch.nn as nn
 # ─────────────────────────────────────────────────────────────────────────────
 def mvc_weights_torch(points: torch.Tensor,
                       polys: torch.Tensor,
+                      valid_mask: torch.Tensor = None,
                       eps: float = 1e-7,
                       edge_eps: float = 1e-6) -> torch.Tensor:
     """
@@ -50,9 +51,25 @@ def mvc_weights_torch(points: torch.Tensor,
         interpolation along it; Case B just evaluates that limit robustly.
     """
     B, K, _ = polys.shape
-    print("mvc points", points.shape, "polys", polys.shape)
 
-    s = polys - points.unsqueeze(1)                    # (B, K, 2) vectors p->v_i
+    if valid_mask is not None:
+        valid_mask = valid_mask.to(device=polys.device, dtype=torch.bool)
+        if valid_mask.shape != (B, K):
+            raise ValueError(
+                f"valid_mask must have shape {(B, K)}, got {tuple(valid_mask.shape)}"
+            )
+        if (~valid_mask).all(dim=1).any():
+            raise ValueError("Each polygon must have at least one valid vertex")
+
+        polys_eff = polys.clone()
+        first_valid_idx = valid_mask.to(torch.int64).argmax(dim=1)
+        first_valid = polys[torch.arange(B, device=polys.device), first_valid_idx]
+        polys_eff[~valid_mask] = first_valid.unsqueeze(1).expand(-1, K, -1)[~valid_mask]
+    else:
+        polys_eff = polys
+        valid_mask = torch.ones((B, K), dtype=torch.bool, device=polys.device)
+
+    s = polys_eff - points.unsqueeze(1)                # (B, K, 2) vectors p->v_i
     r = torch.linalg.norm(s, dim=-1)                   # (B, K) distances
 
     # "next" vertex (i -> i+1), wrapping around the polygon.
@@ -66,13 +83,17 @@ def mvc_weights_torch(points: torch.Tensor,
     # tan(alpha_i / 2). Clamp the denominator so degenerate rows stay FINITE
     # (never inf/nan): those rows are overwritten below via Case A / Case B, but
     # keeping them finite avoids the classic torch.where 0*inf=nan grad trap.
+    edge_valid = valid_mask & torch.roll(valid_mask, shifts=-1, dims=1)
+
     safe_cross = torch.where(cross.abs() < eps,
                              torch.full_like(cross, eps), cross)
     tan_half = (r * r_nxt - dot) / safe_cross          # (B, K), edge i
+    tan_half = torch.where(edge_valid, tan_half, torch.zeros_like(tan_half))
     tan_half_prev = torch.roll(tan_half, shifts=1, dims=1)  # tan(alpha_{i-1}/2)
 
     r_safe = torch.where(r < eps, torch.full_like(r, eps), r)
     w = (tan_half_prev + tan_half) / r_safe            # (B, K) unnormalized
+    w = torch.where(valid_mask, w, torch.zeros_like(w))
 
     # --- interior (generic) case: normalize ---------------------------------
     w_sum = w.sum(dim=1, keepdim=True)
@@ -82,7 +103,7 @@ def mvc_weights_torch(points: torch.Tensor,
     # --- Case B: query on an edge -> linear interpolation on that edge -------
     # An edge (i, i+1) contains p iff p is collinear (cross≈0) AND between the
     # endpoints (dot<0, i.e. the vectors to the two endpoints point opposite).
-    on_edge = (cross.abs() < edge_eps) & (dot < 0.0)   # (B, K) flagged at edge i
+    on_edge = edge_valid & (cross.abs() < edge_eps) & (dot < 0.0)   # (B, K) flagged at edge i
     any_edge = on_edge.any(dim=1)                      # (B,)
 
     ei = on_edge.to(w.dtype)
@@ -98,7 +119,7 @@ def mvc_weights_torch(points: torch.Tensor,
     w_edge = w_edge / w_edge_sum
 
     # --- Case A: query on a vertex -> one-hot -------------------------------
-    on_vertex = r < eps                                # (B, K)
+    on_vertex = valid_mask & (r < eps)                 # (B, K)
     any_vertex = on_vertex.any(dim=1)                  # (B,)
     w_vert = on_vertex.to(w.dtype)
     w_vert_sum = w_vert.sum(dim=1, keepdim=True)

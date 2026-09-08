@@ -329,15 +329,15 @@ class AdaptiveCubeComplex(nn.Module):
         polys = [self._polygon(p) for p in self.leaf_patches]
         k_max = max(len(ids) for ids, _ in polys)
         vid_rows, uv_rows = [], []
+        mask_rows = []
         for ids, uvs in polys:
             pad = k_max - len(ids)
-            # Padding by repeating the last vertex is EXACT under MVC:
-            # zero-length edges get zero half-angle tangents, and duplicated
-            # positions gather the same feature row.
             vid_rows.append(ids + [ids[-1]] * pad)
             uv_rows.append(uvs + [uvs[-1]] * pad)
+            mask_rows.append([True] * len(ids) + [False] * pad)
         self.leaf_poly_vid = torch.tensor(vid_rows, dtype=torch.long, device=device)
         self.leaf_poly_uv = torch.tensor(uv_rows, dtype=torch.float32, device=device)
+        self.leaf_poly_mask = torch.tensor(mask_rows, dtype=torch.bool, device=device)
         self.leaf_face = torch.tensor([p.face for p in self.leaf_patches],
                                       dtype=torch.long, device=device)
         self.leaf_rect = torch.tensor(
@@ -362,9 +362,21 @@ class AdaptiveCubeComplex(nn.Module):
         self._sync_device()
         polys = self.leaf_poly_uv[leaf_idx]           # (B, K, 2)
         vids = self.leaf_poly_vid[leaf_idx]           # (B, K)
+        mask = self.leaf_poly_mask[leaf_idx]          # (B, K)
         z = self.vertex_features[vids]                # (B, K, d)
-        w = mvc_weights_torch(uv, polys)              # (B, K)
-        return torch.einsum('bk,bkd->bd', w, z)
+
+        out = torch.empty((uv.shape[0], self.d_features),
+                          dtype=z.dtype, device=z.device)
+        valid_counts = mask.sum(dim=1)
+
+        for k in torch.unique(valid_counts).tolist():
+            sel = valid_counts == k
+            polys_k = polys[sel, :k]
+            z_k = z[sel, :k]
+            w_k = mvc_weights_torch(uv[sel], polys_k)
+            out[sel] = torch.einsum('bk,bkd->bd', w_k, z_k)
+
+        return out
 
     def face_uv(self, leaf_idx, uv):
         self._sync_device()
