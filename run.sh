@@ -1,4 +1,5 @@
 #!/bin/bash
+# run.sh
 
 # SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # cd "$SCRIPT_DIR"
@@ -7,9 +8,9 @@
 # INPUT_FILE="data/${FILE}"
 # OUTPUT_DIR="logs/log_bestConfig/${FILE%.*}_D3_W512_M4096_d128_16Patches_bound1"
 
-FILE="max-planck.ply"
+FILE="bimba_pc.ply"
 INPUT_FILE="3d_test_models/${FILE}"
-OUTPUT_DIR="logs/log_3dModelsMSE/${FILE%.*}_boxInit_ARAP0.25_noPresplit_24Patches_M1500_6Atlas_pretrain2k_MED_FreezeUV_10k"
+OUTPUT_DIR="logs/log_collapse/${FILE%.*}_CD_24Patches_M1100_6Atlas_5k_mu0.08_dirichlet_refP25k_ddfBeta0_ddfSigma0.05_lamDDF1_muDecay1_noCollapse_1"
 
 
 # python main.py \
@@ -114,9 +115,9 @@ python main.py \
     --atlas_mode six_sheet \
     --file ${INPUT_FILE} \
     --result_dir ${OUTPUT_DIR} \
-    --epochs 10000 \
+    --epochs 5000 \
     --d_features 88 \
-    --M_per_patch 1500 \
+    --M_per_patch 1100 \
     --W 512 \
     --D 6 \
     --L 0 \
@@ -130,8 +131,8 @@ python main.py \
     --mu_warmup_epochs 1000 \
     --mu_warmup_delay 300 \
     --schedule cosine \
-    --N 5000 \
-    --checkpoint_every 5000 \
+    --N 100000 \
+    --checkpoint_every 1000 \
     --six_sheet_face_rows 2 \
     --six_sheet_face_cols 2 \
     --face_aware_box_supervision \
@@ -141,13 +142,22 @@ python main.py \
     --pretrain_mode closed_shape \
     --no_presplit \
     --correspondence_line_segment q_to_t \
-    --corr_switch_epoch 7500 \
+    --corr_switch_epoch 0 \
     --save_boundary_debug 0 \
+    --save_correspondence_every 5000 \
+    --surface_loss_type chamfer \
+    --ddf_start_epoch 0 \
+    --ddf_sigma 0.05 \
+    --ddf_mu_decay 1 \
+    --chamfer_resume_epoch 0 \
+    --lambda_chamfer 1 \
+    --lambda_ddf 1 \
 
 
 python utils/patch_vis.py \
-    --ckpt ${OUTPUT_DIR}/checkpoint.pt \
+    --ckpt ${OUTPUT_DIR}/checkpoint_4000.pt \
     --out_dir ${OUTPUT_DIR} \
-    --n_images 1 \
+    --n_images 4 \
     --subdivision_depth "-1" \
+    # --no_unnormalize \
     # --input_file ${INPUT_FILE} \

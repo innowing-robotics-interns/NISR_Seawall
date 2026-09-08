@@ -171,13 +171,17 @@ def _load_point_file(path):
                        f"  Supported: .ply, .xyz, .txt, .csv, .pts, .npy")
 
 
-def load_point_cloud(filepath, downsample_n=None):
+def load_point_cloud(filepath, downsample_n=None, center=None, scale=None):
     """
     Load and normalize a 3D point cloud.
 
     The returned metadata stores the transform needed to recover original
     coordinates. Normals, when present, are re-normalized to unit length.
-    
+
+    center/scale wiill override the per-file normalization. Pass the values of an
+    earlier run to keep a whole sequence of point clouds in one shared
+    normalized coordinate frame.
+
     Returns:
         Tuple `(pts_norm, meta)`.
     """
@@ -207,11 +211,24 @@ def load_point_cloud(filepath, downsample_n=None):
             normals = normals[idx]
 
     # Normalize positions to roughly [-1, 1].
-    center = pts.mean(axis=0)
+    # Currently use normalization for each training and not based on the first frame.
+    center = None 
+    scale = None
+
+    reused_normalization = center is not None or scale is not None
+    if center is None:
+        center = pts.mean(axis=0)
+    else:
+        center = np.asarray(center, dtype=np.float64).reshape(3)
     pts_centered = pts - center
-    scale = np.abs(pts_centered).max()
-    if scale < 1e-8:
-        scale = 1.0
+    if scale is None:
+        scale = np.abs(pts_centered).max()
+        if scale < 1e-8:
+            scale = 1.0
+    else:
+        scale = float(scale)
+        if scale < 1e-8:
+            raise ValueError(f"Normalization scale override must be positive, got {scale}")
     pts_norm = pts_centered / scale
 
     # Re-normalize normals to unit length.
@@ -227,7 +244,8 @@ def load_point_cloud(filepath, downsample_n=None):
         'normals': normals,
     }
     print(f"  After dedup/downsample: {pts_norm.shape[0]} points")
-    print(f"  Normalization: center={center}, scale={scale:.6f}")
+    norm_src = "reused from previous run" if reused_normalization else "computed from this file"
+    print(f"  Normalization ({norm_src}): center={center}, scale={scale:.6f}")
     print(f"  To recover original coords: p_orig = p_norm * {scale:.6f} + center")
     return pts_norm.astype(np.float32), meta
 

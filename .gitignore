@@ -3,6 +3,9 @@ data/*
 logs/*
 utils/vis_obj.py
 utils/3dModel_to_PC.py
+utils/mask.sh
+run_oneSeq.sh
+run_sequence.sh
 **/__pycache__/
 inputmodels/*
 

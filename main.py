@@ -178,10 +178,13 @@ def train_multi_patch(pts3n: np.ndarray,
                       six_sheet_face_rows: int = 2,
                       six_sheet_face_cols: int = 2,
                       corr_switch_epoch: int = 0,
+                      corr_from_init: bool = False,
                       corr_search_resolution: int = 64,
                       corr_refine_steps: int = 200,
                       corr_refine_lr: float = 1e-2,
                       surface_loss_type: str = 'chamfer',
+                      lambda_chamfer: float = 1.0,
+                      lambda_ddf: float = 1.0,
                       ddf_mu_decay: float = 0.5,
                       ddf_start_epoch: int = 0,
                       chamfer_resume_epoch: int = 0,
@@ -199,11 +202,23 @@ def train_multi_patch(pts3n: np.ndarray,
     every iteration.
 
     If `corr_switch_epoch > 0`, training runs on the surface-fitting loss
-    (Chamfer distance or DDF, see `surface_loss_type`) until that epoch, then
+    (Chamfer distance, DDF, or a weighted combination of both; see
+    `surface_loss_type`) until that epoch, then
     builds a fixed point -> (patch_id, u, v) correspondence via
     `build_hard_correspondence` and switches to direct pointwise MSE
     regression against it for the remainder of training. `surface_loss_type`
     only affects this pre-switch phase; the MSE phase is unaffected.
+
+    If `corr_from_init` is set, the same correspondence table is instead built
+    ONCE at epoch 0, before any optimization, against the warm-start model
+    loaded from `pretrained_F_state` (i.e. the previous frame's converged
+    surface). Training then runs on pointwise regression for the whole run and
+    never uses Chamfer/DDF. This is the sequential-tracking mode: because
+    frame k's cloud is spatially very close to frame k-1's fitted surface, the
+    closest-point projection onto that surface defines a UV assignment
+    anchored to the previous frame, so the parameterization cannot slide the
+    way it does under a set-to-set loss. `corr_from_init` overrides
+    `corr_switch_epoch`.
 
     When `surface_loss_type == 'ddf'`, the pre-switch phase can be split into
     up to three stages: plain Chamfer distance first (epoch < ddf_start_epoch),
@@ -213,6 +228,10 @@ def train_multi_patch(pts3n: np.ndarray,
     later if the tangent regularizer becomes too restrictive during the DDF
     phase. During the DDF phase, the tangent-loss weight is scaled by
     `ddf_mu_decay`.
+
+    When `surface_loss_type == 'cd_ddf'`, both Chamfer and DDF are evaluated
+    together during the DDF-active phase and combined as
+    `lambda_chamfer * CD + lambda_ddf * DDF`.
     """
     F, atlas_info = _build_forward_model(
         atlas_mode=atlas_mode,
@@ -248,13 +267,49 @@ def train_multi_patch(pts3n: np.ndarray,
     if no_presplit and atlas_mode not in ('two_sheet', 'six_sheet'):
         raise ValueError("--no_presplit is currently supported only with atlas_mode='two_sheet' or 'six_sheet'")
 
-    if surface_loss_type not in ('chamfer', 'ddf'):
-        raise ValueError(f"Unknown surface_loss_type: {surface_loss_type}. Use 'chamfer' or 'ddf'.")
-    if surface_loss_type == 'ddf' and not no_presplit:
+    if corr_from_init:
+        # Epoch-0 correspondence supersedes the mid-training switch: zero it here
+        # so the surface-loss phase validations below don't police a switch epoch
+        # that will never be reached.
+        if corr_switch_epoch > 0:
+            print(f"  [warn] --corr_from_init overrides --corr_switch_epoch "
+                  f"({corr_switch_epoch}); the mid-training rebuild is disabled.")
+            corr_switch_epoch = 0
+        if pretrained_F_state is None:
+            raise ValueError(
+                "--corr_from_init builds the correspondence table against the warm-start "
+                "surface, but no pretrained weights were supplied. Pass --init_ckpt "
+                "pointing at the previous frame's checkpoint.")
+        if not no_presplit:
+            raise ValueError(
+                "--corr_from_init requires --no_presplit: the correspondence table is "
+                "built against the full point cloud, not per-patch pre-assigned subsets.")
+        if lam > 0 or lam2 > 0:
+            raise NotImplementedError(
+                "Cycle consistency (--lam/--lam2) is not supported together with "
+                "--corr_from_init: cycle consistency assumes per-patch grouped batches "
+                "(K, M_per_patch, 3), which the flat correspondence-sampled batch doesn't have.")
+        if gamma > 0:
+            raise NotImplementedError(
+                "Normal consistency (--gamma) is not supported together with "
+                "--corr_from_init: the normal-loss nearest-neighbor lookup assumes the "
+                "Chamfer distance matrix D, which isn't computed during the MSE phase.")
+
+    if surface_loss_type not in ('chamfer', 'ddf', 'cd_ddf'):
         raise ValueError(
-            "--surface_loss_type ddf currently requires --no_presplit: the DDF loss is "
+            f"Unknown surface_loss_type: {surface_loss_type}. Use 'chamfer', 'ddf', or 'cd_ddf'."
+        )
+    if surface_loss_type in ('ddf', 'cd_ddf') and not no_presplit:
+        raise ValueError(
+            "--surface_loss_type ddf/cd_ddf currently requires --no_presplit: the DDF loss is "
             "evaluated against the full target cloud, not per-patch pre-assigned subsets."
         )
+    if lambda_chamfer < 0:
+        raise ValueError(f"--lambda_chamfer must be >= 0, got {lambda_chamfer}")
+    if lambda_ddf < 0:
+        raise ValueError(f"--lambda_ddf must be >= 0, got {lambda_ddf}")
+    if surface_loss_type == 'cd_ddf' and lambda_chamfer == 0 and lambda_ddf == 0:
+        raise ValueError("--surface_loss_type cd_ddf requires at least one of --lambda_chamfer or --lambda_ddf to be > 0")
     if ddf_start_epoch < 0:
         raise ValueError(f"--ddf_start_epoch must be >= 0, got {ddf_start_epoch}")
     if chamfer_resume_epoch < 0:
@@ -453,7 +508,9 @@ def train_multi_patch(pts3n: np.ndarray,
     print(f"  d_features={d_features}  W={W}  D={D}  L(fwd/global-UV)={L}  L_inv={L_inv}  β={beta}")
     print(f"  M_per_patch={M_per_patch}  batch/step={K*M_per_patch}  reg_every={reg_every}")
     print(f"  Surface-fitting loss (pre-correspondence-switch): {surface_loss_type}")
-    if surface_loss_type == 'ddf':
+    if surface_loss_type == 'cd_ddf':
+        print(f"    Combined weights: λ_cd={lambda_chamfer}  λ_ddf={lambda_ddf}")
+    if surface_loss_type in ('ddf', 'cd_ddf'):
         if ddf_start_epoch > 0:
             if chamfer_resume_epoch > 0:
                 print(f"    Chamfer for epochs 1-{ddf_start_epoch - 1}, DDF for epochs {ddf_start_epoch}-{chamfer_resume_epoch - 1}, then Chamfer again from epoch {chamfer_resume_epoch}")
@@ -464,6 +521,11 @@ def train_multi_patch(pts3n: np.ndarray,
         print(f"    Tangent μ scaling during DDF: ×{ddf_mu_decay}")
         print(f"    DDF: n_ref={ddf_n_reference_points}  k={ddf_k_neighbors}  "
               f"σ={ddf_sigma}  β={ddf_beta}  resample_every={ddf_resample_every}")
+    if corr_from_init:
+        print("  Correspondence: built ONCE at epoch 0 against the warm-start surface; "
+              "pointwise mean-Euclidean regression for the whole run (no Chamfer/DDF)")
+    elif corr_switch_epoch > 0:
+        print(f"  Correspondence: built at epoch {corr_switch_epoch} (surface loss → pointwise switch)")
     print(f"  μ={mu}  γ={gamma}  λ₁={lam}  λ₂={lam2}  λ_outer={lambda_outer_boundary}")
     if mu_warmup_epochs > 0 and mu > 0:
         print(f"  μ warmup: {mu_warmup_schedule} ramp over {mu_warmup_epochs} epochs "
@@ -482,7 +544,7 @@ def train_multi_patch(pts3n: np.ndarray,
     if save_boundary_debug_every > 0:
         os.makedirs(boundary_debug_dir, exist_ok=True)
     correspondence_debug_dir = os.path.join(checkpoint_dir, 'correspondence_debug')
-    if corr_switch_epoch > 0:
+    if corr_switch_epoch > 0 or corr_from_init:
         os.makedirs(correspondence_debug_dir, exist_ok=True)
     ddf_debug_dir = os.path.join(checkpoint_dir, 'ddf_debug')
     if save_ddf_reference_every > 0:
@@ -531,6 +593,7 @@ def train_multi_patch(pts3n: np.ndarray,
                 'six_sheet_face_rows': six_sheet_face_rows,
                 'six_sheet_face_cols': six_sheet_face_cols,
                 'corr_switch_epoch': corr_switch_epoch,
+                'corr_from_init': corr_from_init,
                 'corr_search_resolution': corr_search_resolution,
                 'corr_refine_steps': corr_refine_steps,
                 'corr_refine_lr': corr_refine_lr,
@@ -641,6 +704,65 @@ def train_multi_patch(pts3n: np.ndarray,
             max_vectors=min(2000, ddf_ref_points.shape[0]),
         )
 
+    def _build_correspondence(epoch: int, reason: str):
+        """
+        Freeze a point -> (patch_id, u, v) table against F's CURRENT geometry.
+
+        Every target point is projected onto the surface F currently represents
+        (dense per-patch UV search, then per-point gradient refinement of uv),
+        and that assignment is held fixed for the rest of training. From then on
+        the loss is pointwise, so the parameterization has no freedom left to
+        slide -- unlike Chamfer/DDF, which are invariant to any reparameterization
+        of the UV domain and therefore cannot pin correspondence at all.
+        """
+        print(f"  Building point correspondence at epoch {epoch} ({reason})...")
+        t_corr = time.time()
+        all_points_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
+        corr_patch_ids, corr_uv = build_hard_correspondence(
+            F, all_points_dev,
+            search_resolution=corr_search_resolution,
+            refine_steps=corr_refine_steps,
+            refine_lr=corr_refine_lr,
+            device=device,
+        )
+        corr = {
+            'patch_ids': corr_patch_ids,
+            'uv': corr_uv,
+            'points': all_points_dev,
+        }
+
+        with torch.no_grad():
+            corr_pred = F(corr['patch_ids'], corr['uv'])
+            residual = torch.norm(corr_pred - all_points_dev, dim=-1)
+
+        n_used = int(torch.unique(corr_patch_ids).numel())
+        print(f"    Correspondence fixed for {all_points_dev.shape[0]} points "
+              f"across {n_used}/{F.n_patches} patches  [{time.time() - t_corr:.1f}s]")
+        # Residual = how far each point sits from the surface it was projected
+        # onto. Small + tight => the warm-start model really is close to this
+        # frame and the projection is trustworthy. A heavy tail means some points
+        # projected across a fold onto the wrong sheet; those assignments are
+        # frozen too, so a large p95/max here is the first thing to suspect if
+        # the fit misbehaves.
+        print(f"    Projection residual |F(u,v) - p|:  "
+              f"mean={residual.mean():.6f}  median={residual.median():.6f}  "
+              f"p95={torch.quantile(residual, 0.95):.6f}  max={residual.max():.6f}")
+
+        corr_pred_np = corr_pred.detach().cpu().numpy()
+        corr_points_np = all_points_dev.detach().cpu().numpy()
+        # The pairing is already exact, so skip the NN search
+        identity_idx = np.arange(corr_pred_np.shape[0], dtype=np.int32)
+        correspondence_vis.export_correspondence_ply(
+            q_points=corr_pred_np,
+            t_points=corr_points_np,
+            q_to_t_idx=identity_idx,
+            t_to_q_idx=identity_idx,
+            output_ply_path=os.path.join(correspondence_debug_dir,
+                                         f'correspondence_epoch_{epoch}.ply'),
+            plot_direction='both',
+        )
+        return corr
+
     zero = torch.tensor(0.0, device=device)
     vertex_features_init = F.complex.vertex_features.detach().clone()
     correspondence = None
@@ -648,54 +770,30 @@ def train_multi_patch(pts3n: np.ndarray,
     # DDF state: reference points + their fixed ground-truth DDF, refreshed
     # periodically (target cloud is static, so its DDF only needs to be
     # recomputed when the reference points themselves are resampled).
-    pts3n_dev = torch.tensor(pts3n, dtype=torch.float32, device=device) if surface_loss_type == 'ddf' else None
+    pts3n_dev = torch.tensor(pts3n, dtype=torch.float32, device=device) if surface_loss_type in ('ddf', 'cd_ddf') else None
     ddf_ref_points = None
     ddf_ref_gt = None
+
+    # Sequential-tracking mode: anchor the parameterization to the warm-start
+    # (previous frame's) surface BEFORE any optimization, so every epoch of this
+    # frame is trained against a UV assignment inherited from the last frame.
+    if corr_from_init:
+        correspondence = _build_correspondence(
+            0, 'warm-start template → pointwise regression from epoch 1')
 
     # Optimize the forward and inverse maps.
     for epoch in range(1, epochs + 1):
         opt.zero_grad()
 
         use_ddf_phase = (
-            surface_loss_type == 'ddf'
+            surface_loss_type in ('ddf', 'cd_ddf')
             and correspondence is None
             and epoch >= ddf_start_epoch
             and (chamfer_resume_epoch <= 0 or epoch < chamfer_resume_epoch)
         )
 
         if corr_switch_epoch > 0 and epoch == corr_switch_epoch:
-            print(f"  Building point correspondence at epoch {epoch} (Chamfer → MSE switch)...")
-            all_points_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
-            corr_patch_ids, corr_uv = build_hard_correspondence(
-                F, all_points_dev,
-                search_resolution=corr_search_resolution,
-                refine_steps=corr_refine_steps,
-                refine_lr=corr_refine_lr,
-                device=device,
-            )
-            correspondence = {
-                'patch_ids': corr_patch_ids,
-                'uv': corr_uv,
-                'points': all_points_dev,
-            }
-            print(f"    Correspondence fixed for {all_points_dev.shape[0]} points "
-                  f"across {F.n_patches} patches")
-
-            with torch.no_grad():
-                corr_pred = F(correspondence['patch_ids'], correspondence['uv'])
-            corr_pred_np = corr_pred.detach().cpu().numpy()
-            corr_points_np = correspondence['points'].detach().cpu().numpy()
-            # The pairing is already exact, so skip the NN search
-            identity_idx = np.arange(corr_pred_np.shape[0], dtype=np.int32)
-            correspondence_vis.export_correspondence_ply(
-                q_points=corr_pred_np,
-                t_points=corr_points_np,
-                q_to_t_idx=identity_idx,
-                t_to_q_idx=identity_idx,
-                output_ply_path=os.path.join(correspondence_debug_dir,
-                                             f'correspondence_epoch_{epoch}.ply'),
-                plot_direction='both',
-            )
+            correspondence = _build_correspondence(epoch, 'surface loss → pointwise switch')
 
         # Build the target batch on CPU, then transfer once to the device.
         if correspondence is not None:
@@ -746,7 +844,6 @@ def train_multi_patch(pts3n: np.ndarray,
 
             # Loss 1: surface-fitting term (Chamfer distance or DDF).
             if no_presplit:
-                lambda_ddf = 1
                 if use_ddf_phase:
                     if ddf_ref_points is None or (
                             ddf_resample_every > 0 and (epoch - 1) % ddf_resample_every == 0):
@@ -757,9 +854,15 @@ def train_multi_patch(pts3n: np.ndarray,
                                 ddf_ref_points, pts3n_dev,
                                 k=ddf_k_neighbors, chunk_size=ddf_chunk_size)
                         _save_ddf_reference_snapshot(epoch)
-                    cd_loss = lambda_ddf * directional_distance_loss(
+                    ddf_loss = directional_distance_loss(
                         Q_flat, ddf_ref_points, ddf_ref_gt,
                         k=ddf_k_neighbors, beta=ddf_beta, chunk_size=ddf_chunk_size)
+                    if surface_loss_type == 'cd_ddf':
+                        chamfer_loss = chamfer_distance_chunked(
+                            Q_flat, tgt_flat, chunk_size=min(2048, K * M_per_patch))
+                        cd_loss = lambda_chamfer * chamfer_loss + lambda_ddf * ddf_loss
+                    else:
+                        cd_loss = lambda_ddf * ddf_loss
                 else:
                     cd_loss = chamfer_distance_chunked(Q_flat, tgt_flat, chunk_size=min(2048, K * M_per_patch))
                 D = None
@@ -864,6 +967,8 @@ def train_multi_patch(pts3n: np.ndarray,
             history['total'].append(float(loss))
             if correspondence is not None:
                 phase = 'mse'
+            elif surface_loss_type == 'cd_ddf':
+                phase = 'cd_ddf'
             elif use_ddf_phase:
                 phase = 'ddf'
             else:
@@ -872,7 +977,7 @@ def train_multi_patch(pts3n: np.ndarray,
 
             elapsed = time.time() - t0
             # mu_str = f"  μ_eff={float(mu_eff):.4f}" if (mu_warmup_epochs > 0 and mu > 0) else ""
-            recon_label = {'mse': 'MSE', 'ddf': 'DDF', 'chamfer': 'CD '}[phase]
+            recon_label = {'mse': 'MSE', 'ddf': 'DDF', 'chamfer': 'CD ', 'cd_ddf': 'CD & DDF'}[phase]
             print(f"  Epoch {epoch:5d}/{epochs}  |  "
                   f"{recon_label}={float(cd_loss):.5f}  "
                   f"Cycle={float(cycle_loss):.5f}  "
@@ -1248,6 +1353,60 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
 
 
 
+# Architecture-defining args that must agree between a warm-start checkpoint and
+# the current run, otherwise F's parameter shapes (or their meaning) won't match.
+_INIT_ARCH_KEYS = ('atlas_mode', 'd_features', 'W', 'D', 'L', 'n_patches',
+                   'two_sheet_side_rows', 'two_sheet_side_cols',
+                   'six_sheet_face_rows', 'six_sheet_face_cols')
+
+
+def load_init_checkpoint(ckpt_path: str, args):
+    """
+    Load forward-map weights from a previous run's checkpoint, to be used as the
+    initialization of this run instead of synthetic (box/sphere/flat) pretraining.
+
+    This is what makes sequential training over a motion sequence possible: frame
+    k+1 starts from the model fitted to frame k rather than from a fresh box.
+
+    Returns:
+        Tuple `(F_state, normalization)` where `normalization` is the stored
+        `{'center', 'scale'}` dict of the source run (or None if absent).
+    """
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"--init_ckpt not found: {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    F_state = ckpt.get('F_state')
+    if F_state is None:
+        raise ValueError(f"--init_ckpt has no 'F_state' entry: {ckpt_path}")
+
+    ckpt_args = ckpt.get('args') or {}
+    mismatches = []
+    for key in _INIT_ARCH_KEYS:
+        if key in ckpt_args and hasattr(args, key):
+            if ckpt_args[key] != getattr(args, key):
+                mismatches.append(f"{key}: checkpoint={ckpt_args[key]}  current={getattr(args, key)}")
+    if mismatches:
+        raise ValueError(
+            "--init_ckpt was trained with a different model configuration, so its "
+            "weights cannot initialize this run:\n    " + "\n    ".join(mismatches))
+
+    if 'beta' in ckpt_args and float(ckpt_args['beta']) != float(args.beta):
+        print(f"  [warn] --init_ckpt used beta={ckpt_args['beta']} but this run uses "
+              f"beta={args.beta}; the loaded weights will behave differently.")
+
+    F_state = {k: v.detach().cpu().clone() if torch.is_tensor(v) else v
+               for k, v in F_state.items()}
+
+    print(f"\n  Warm start: initializing F from {ckpt_path}")
+    if 'epoch' in ckpt:
+        print(f"    Source epoch: {ckpt['epoch']}")
+    if ckpt.get('input_file') is not None:
+        print(f"    Source input: {ckpt['input_file']}")
+
+    return F_state, ckpt.get('normalization')
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Chamfer Distance Sheet Fitting — Single-Patch or Multi-Patch Feature Complex')
@@ -1351,6 +1510,17 @@ def main():
     parser.add_argument('--mu_warmup_delay', type=int, default=0,
                         help='Epochs to delay μ warmup (μ=0) before ramping up')
 
+    # Sequential warm start (previous frame's model as this frame's initialization)
+    parser.add_argument('--init_ckpt', type=str, default=None,
+                        help='Initialize F from this checkpoint instead of running synthetic '
+                             '(box/sphere/flat) pretraining. Used to train a motion sequence '
+                             'frame by frame, each frame starting from the previous frame\'s '
+                             'model. Disables --pretrain_init/--pretrain_then_train.')
+    parser.add_argument('--init_ckpt_reuse_normalization', action='store_true', default=False,
+                        help='Normalize the input cloud with the center/scale stored in '
+                             '--init_ckpt instead of recomputing them for this file, so every '
+                             'frame of a sequence is trained in the same coordinate frame.')
+
     # Two sheet specific args
     two_sheet_group = parser.add_argument_group('two-sheet configuration')
     two_sheet_group.add_argument('--two_sheet_side_rows', type=int, default=2,
@@ -1379,6 +1549,14 @@ def main():
                             help='[Multi-patch] Epoch at which to build a fixed point '
                                  'correspondence and switch from Chamfer distance to direct '
                                  'MSE regression (0 disables, requires --no_presplit)')
+    corr_group.add_argument('--corr_from_init', action='store_true', default=False,
+                            help='[Multi-patch, sequential tracking] Build the fixed point '
+                                 'correspondence ONCE at epoch 0 against the --init_ckpt '
+                                 "(previous frame's) surface, then train on pointwise mean-"
+                                 'Euclidean regression for the whole run. Anchors this frame\'s '
+                                 'UV parameterization to the previous frame instead of letting '
+                                 'Chamfer/DDF re-parameterize it freely. Requires --init_ckpt '
+                                 'and --no_presplit; overrides --corr_switch_epoch.')
     corr_group.add_argument('--corr_search_resolution', type=int, default=64,
                             help='Per-patch UV grid resolution for the initial nearest-neighbor search')
     corr_group.add_argument('--corr_refine_steps', type=int, default=200,
@@ -1388,11 +1566,16 @@ def main():
 
     # Chamfer vs. Directional Distance Field (DDF) surface-fitting loss
     ddf_group = parser.add_argument_group('directional distance field (DDF) loss')
-    ddf_group.add_argument('--surface_loss_type', type=str, default='chamfer', choices=['chamfer', 'ddf'],
+    ddf_group.add_argument('--surface_loss_type', type=str, default='chamfer', choices=['chamfer', 'ddf', 'cd_ddf'],
                            help='[Multi-patch, no_presplit] Loss driving the pre-correspondence-switch '
-                                'surface-fitting phase: plain Chamfer distance, or Directional Distance '
-                                'Field (DDM, Ren et al. 2024, arXiv:2401.09736). Does not affect the '
+                                'surface-fitting phase: plain Chamfer distance, Directional Distance '
+                                'Field (DDM, Ren et al. 2024, arXiv:2401.09736), or a weighted '
+                                'combination of both. Does not affect the '
                                 'post-corr_switch_epoch MSE phase.')
+    ddf_group.add_argument('--lambda_chamfer', type=float, default=1.0,
+                           help='[CD+DDF] Weight for the Chamfer term when --surface_loss_type=cd_ddf')
+    ddf_group.add_argument('--lambda_ddf', type=float, default=1.0,
+                           help='[CD+DDF] Weight for the DDF term when --surface_loss_type=ddf or cd_ddf')
     ddf_group.add_argument('--ddf_start_epoch', type=int, default=0,
                            help="[DDF] Epoch at which to switch surface_loss_type='ddf' runs from Chamfer to "
                                 'DDF (0 = DDF from epoch 1). Chamfer first resolves coarse geometry/concavities '
@@ -1406,7 +1589,7 @@ def main():
     ddf_group.add_argument('--ddf_mu_decay', type=float, default=0.5,
                            help='[DDF] Multiplier applied to tangent-loss weight μ once training switches '
                                 'from Chamfer to DDF (e.g. 0.5 halves μ during the DDF phase)')
-    ddf_group.add_argument('--ddf_n_reference_points', type=int, default=50000,
+    ddf_group.add_argument('--ddf_n_reference_points', type=int, default=25000,
                            help='[DDF] Number of reference points sampled near the target surface')
     ddf_group.add_argument('--ddf_k_neighbors', type=int, default=5,
                            help='[DDF] Number of nearest neighbors used to approximate the closest surface point')
@@ -1423,6 +1606,33 @@ def main():
                            help='[DDF] Save reference-point debug CSV/PLY/PNG every N epochs (0 disables)')
     args = parser.parse_args()
 
+    if args.corr_from_init and not args.init_ckpt:
+        parser.error(
+            "--corr_from_init requires --init_ckpt: the correspondence table is built at "
+            "epoch 0 against the warm-start surface, which must be the previous frame's "
+            "trained checkpoint. Without it, F is either random or a synthetic box and the "
+            "projection would be meaningless.")
+
+    # Warm start from a previous run (e.g. the previous frame of a sequence).
+    init_F_state = None
+    init_normalization = None
+    if args.init_ckpt:
+        init_F_state, init_normalization = load_init_checkpoint(args.init_ckpt, args)
+        if args.pretrain_init or args.pretrain_then_train:
+            print("  [warn] --init_ckpt overrides --pretrain_init/--pretrain_then_train; "
+                  "synthetic pretraining is skipped.")
+            args.pretrain_init = False
+            args.pretrain_then_train = False
+
+    if args.init_ckpt_reuse_normalization:
+        if init_normalization is None:
+            print("  [warn] --init_ckpt_reuse_normalization requested but the checkpoint "
+                  "stores no normalization; falling back to per-file normalization.")
+        else:
+            print("Reusing normalization from previous checkpoint")
+            norm_center = np.asarray(init_normalization['center'], dtype=np.float64)
+            norm_scale = float(init_normalization['scale'])
+
     # Load the data
     input_file_name = None
     downsample_n = None if args.N is not None and args.N < 0 else args.N
@@ -1430,7 +1640,8 @@ def main():
     if args.file:
         print(f"\n  Loading point cloud from: {args.file}")
         input_file_name = args.file
-        pts3n, meta = utils.load_point_cloud(args.file, downsample_n=downsample_n)
+        pts3n, meta = utils.load_point_cloud(args.file, downsample_n=downsample_n,
+                                             center=norm_center, scale=norm_scale)
     else:
         print(f"\n  No file given → generating synthetic '{args.shape}' surface (N={args.N})")
         input_file_name = f'synthetic_{args.shape}'
@@ -1486,7 +1697,8 @@ def main():
     print(f"  Starting training ({mode_str})...")
     print(f"{'='*60}")
 
-    pretrained_F_state = None
+    pretrained_F_state = init_F_state
+    pretrained_source_path = args.init_ckpt if init_F_state is not None else None
     pretrain_history = None
 
     if args.pretrain_init or args.pretrain_then_train:
@@ -1551,6 +1763,7 @@ def main():
             k: v.detach().cpu().clone()
             for k, v in F_model.state_dict().items()
         }
+        pretrained_source_path = pretrain_ckpt_path
 
         verts, faces = utils.sample_multi_patch_grid(
             F_model,
@@ -1629,7 +1842,7 @@ def main():
             normals=normals,
             reg_every=args.reg_every,
             pretrained_F_state=pretrained_F_state,
-            pretrained_ckpt_path=pretrain_ckpt_path if pretrained_F_state is not None else None,
+            pretrained_ckpt_path=pretrained_source_path,
             correspondence_dir=os.path.join(result_dir, 'correspondences'),
             save_correspondence_every=args.save_correspondence_every,
             save_boundary_debug_every=args.save_boundary_debug_every,
@@ -1644,10 +1857,13 @@ def main():
             six_sheet_face_rows=args.six_sheet_face_rows,
             six_sheet_face_cols=args.six_sheet_face_cols,
             corr_switch_epoch=args.corr_switch_epoch,
+            corr_from_init=args.corr_from_init,
             corr_search_resolution=args.corr_search_resolution,
             corr_refine_steps=args.corr_refine_steps,
             corr_refine_lr=args.corr_refine_lr,
             surface_loss_type=args.surface_loss_type,
+            lambda_chamfer=args.lambda_chamfer,
+            lambda_ddf=args.lambda_ddf,
             ddf_mu_decay=args.ddf_mu_decay,
             ddf_start_epoch=args.ddf_start_epoch,
             chamfer_resume_epoch=args.chamfer_resume_epoch,
