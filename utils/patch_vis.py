@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # patch_vis.py
 
+"""
+Notes:
+- To change the pattern to several images, edit the argument `pattern` in `load_checkerboard_textures()` and `export_checkerboard_patches` to "Slide{}.jpg".
+- To change the number of images, edit the argument --n_images in the Command line
+
+"""
 import os
 import argparse
 import importlib.util
@@ -14,7 +20,7 @@ import pc_presegmentation as pc_presegmentation
 import utils as utils
 
 # Load the texture
-def load_checkerboard_textures(texture_path, pattern="Slide5.jpg", n_images=1):
+def load_checkerboard_textures(texture_path, pattern="Slide{}.jpg", n_images=4):
     """
     Load checkerboard textures from a file or directory.
 
@@ -53,6 +59,7 @@ def load_checkerboard_textures(texture_path, pattern="Slide5.jpg", n_images=1):
             if not os.path.exists(p):
                 raise FileNotFoundError(f"Missing checkerboard texture: {p}")
             textures.append(Image.open(p).convert("RGB"))
+            print(f"  Loaded checkerboard texture: {p}")
         print(f"  Loaded {len(textures)} checkerboard texture(s) from {texture_path}")
         return textures
 
@@ -205,7 +212,7 @@ def _filter_patch_mesh_by_occupancy(verts, uv, faces, occ_mask):
 def export_checkerboard_patches(F, meta, save_dir, texture_path,
                                  resolution=100, device='cuda',
                                  epoch='10k', name=None,
-                                 texture_pattern="Slide5.jpg", n_images=1,
+                                 texture_pattern="Slide{}.jpg", n_images=4,
                                  unnormalize=True, debug_uv_png=True,
                                  export_ply=True, double_sided=True,
                                  active_patch_ids=None,
@@ -509,9 +516,9 @@ def main():
                              'images for a distinct texture per patch')
     parser.add_argument('--out_dir', type=str, default='checkerboard_export',
                         help='Output directory for textured OBJ/PLY files')
-    parser.add_argument('--resolution', type=int, default=500,
+    parser.add_argument('--resolution', type=int, default=100,
                         help='Per-patch UV grid resolution')
-    parser.add_argument('--n_images', type=int, default=1,
+    parser.add_argument('--n_images', type=int, default=4,
                         help='Number of checkerboard texture images to load '
                              '(only used if --texture_path is a directory)')
     parser.add_argument('--device', type=str,
