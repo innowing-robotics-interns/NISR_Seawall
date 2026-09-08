@@ -345,43 +345,42 @@ def surface_jacobian(Q, uv):
     return t_u, t_v
 
 
-def tangent_loss_from_jac(t_u, t_v, mode='dirichlet', eps=1e-4, scale_invariant=True):
+def tangent_loss_from_jac(model=None,
+                 pids: torch.Tensor = None,
+                 t_u: torch.Tensor = None,
+                 t_v: torch.Tensor = None,
+                 mode: str = 'dirichlet',
+                 eps: float = 1e-4,
+                 scale_invariant: bool = True,
+                 patch_sizes: torch.Tensor = None,
+                 normalize_patch_scale: bool = False,
+                 target: float = 1.0) -> torch.Tensor:
     """
     Compute Jacobian-based tangent regularization with optional scale normalization.
     """
-    # # 1. OPTIONAL: Normalize the scale of the Jacobian vectors per-sample/patch
-    # if scale_invariant:
-    #     # Calculate the local patch scale (Frobenius norm of the Jacobian)
-    #     # This represents the average "stretch" factor of this specific point
-    #     local_scale = torch.sqrt((t_u ** 2).sum(dim=-1) + (t_v ** 2).sum(dim=-1) + 1e-8)
-        
-    #     # Keep dimensions aligned for broadcasting [batch, 1]
-    #     local_scale = local_scale.unsqueeze(-1) 
-        
-    #     # Normalize vectors so the local metric scale is 1.0
-    #     t_u = t_u / local_scale
-    #     t_v = t_v / local_scale
+
+    if t_u is None or t_v is None:
+            raise ValueError("t_u and t_v must be provided")
+
+    if normalize_patch_scale:
+        if patch_sizes is None:
+            if model is None or pids is None:
+                raise ValueError(
+                    "patch_sizes or (model, pids) must be provided when "
+                    "normalize_patch_scale=True"
+                )
+            model.complex._sync_device()
+            patch_sizes = model.complex.leaf_rect[pids, 2]
+        s = patch_sizes.clamp_min(1e-12).unsqueeze(-1)
+        t_u = t_u / s
+        t_v = t_v / s
 
     J = torch.stack([t_u, t_v], dim=2)
 
     ## dirichlet
     ### \int_S(||df/du||^2 + ||df/dv||^2)
 
-    e_dirichlet = 1.0*torch.mean(0.5*torch.sum(J ** 2, dim=1))
-
-    if mode == 'conformal_fff':
-        E = (t_u * t_u).sum(dim=-1)
-        G = (t_v * t_v).sum(dim=-1)
-        Fd = (t_u * t_v).sum(dim=-1)
-        energy = ((E - G) ** 2 + 4.0 * Fd ** 2).mean()
-        area2 = torch.clamp(E * G - Fd ** 2, min=0.0)
-        collapse = torch.relu(eps ** 2 - area2).mean()
-        return energy + collapse
-
     S = torch.linalg.svdvals(J)
-
-    # If scaled to 1, a hardcoded eps (like 1e-4) is now safe and universally meaningful
-    # collapse = torch.relu(eps - S).pow(2).sum(dim=-1).mean()
 
     if mode == 'arap':
         energy = ((S - 0.25) ** 2).sum(dim=-1).mean()
@@ -393,7 +392,7 @@ def tangent_loss_from_jac(t_u, t_v, mode='dirichlet', eps=1e-4, scale_invariant=
     elif mode == 'collapse':
         energy = torch.zeros((), device=J.device, dtype=J.dtype)
     elif mode == 'dirichlet':
-        energy = e_dirichlet
+        energy = 1.0*torch.mean(0.5*torch.sum(J ** 2, dim=1))
     else:
         raise ValueError(f"unknown tangent mode: {mode}")
 

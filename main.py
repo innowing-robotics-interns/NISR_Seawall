@@ -904,7 +904,7 @@ def train_multi_patch(pts3n: np.ndarray,
             t_u, t_v = surface_jacobian(Q_flat, uv_flat)
 
             if mu_eff > 0:
-                tangent_loss = tangent_loss_from_jac(t_u, t_v)
+                tangent_loss = tangent_loss_from_jac(None, None, t_u, t_v)
             else:
                 tangent_loss = torch.zeros((), device=Q.device, dtype=Q.dtype)
 
@@ -1108,8 +1108,8 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
             ]).mean()
 
             if lam_jac > 0:
-                t_u, t_v = surface_jacobian(pred, uv_flat, "arap")
-                jac_loss = tangent_loss_from_jac(t_u, t_v)
+                t_u, t_v = surface_jacobian(pred, uv_flat)
+                jac_loss = tangent_loss_from_jac(None, None, t_u, t_v)
                 plane_loss = plane_loss + lam_jac * jac_loss
         else:
             plane_loss = point_loss_fn(pred, target)
@@ -1314,7 +1314,7 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
 
         if mu_eff > 0:
             t_u, t_v = surface_jacobian(Q_flat, uv_flat)
-            tangent_loss = tangent_loss_from_jac(t_u, t_v)
+            tangent_loss = tangent_loss_from_jac(None, None, t_u, t_v)
         else:
             tangent_loss = zero
 
@@ -1631,6 +1631,8 @@ def main():
     input_file_name = None
     downsample_n = None if args.N is not None and args.N < 0 else args.N
 
+    norm_center = None
+    norm_scale = None
     if args.file:
         print(f"\n  Loading point cloud from: {args.file}")
         input_file_name = args.file

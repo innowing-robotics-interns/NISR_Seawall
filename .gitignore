@@ -8,11 +8,13 @@ run_oneSeq.sh
 run_sequence.sh
 **/__pycache__/
 inputmodels/*
-
+demo/*
 *.txt
 *.pt
 *.png
 *.ply
 *.obj
 *.json
+*.log
+*.mtl
 run.sh

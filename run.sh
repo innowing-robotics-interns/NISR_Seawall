@@ -8,9 +8,9 @@
 # INPUT_FILE="data/${FILE}"
 # OUTPUT_DIR="logs/log_bestConfig/${FILE%.*}_D3_W512_M4096_d128_16Patches_bound1"
 
-FILE="bimba_pc.ply"
+FILE="max-planck.ply"
 INPUT_FILE="3d_test_models/${FILE}"
-OUTPUT_DIR="logs/log_collapse/${FILE%.*}_CD_24Patches_M1100_6Atlas_5k_mu0.08_dirichlet_refP25k_ddfBeta0_ddfSigma0.05_lamDDF1_muDecay1_noCollapse_1"
+OUTPUT_DIR="logs/log_collapse/${FILE%.*}_CD_24Patches_M1100_6Atlas_5k_mu0.08_dirichlet_refP25k_ddfBeta0_ddfSigma0.05_lamDDF1_muDecay1_noCollapse_1_1"
 
 
 # python main.py \
@@ -39,7 +39,7 @@ OUTPUT_DIR="logs/log_collapse/${FILE%.*}_CD_24Patches_M1100_6Atlas_5k_mu0.08_dir
 #     --mu_warmup_epochs 1000 \
 #     --mu_warmup_delay 300 \
 #     --schedule cosine \
-#     --checkpoint_every  5000\
+#     --checkpoint_every  5000
 
 # python main.py \
 #     --multi_patch \
@@ -154,8 +154,16 @@ python main.py \
     --lambda_ddf 1 \
 
 
+
+# python utils/patch_vis.py \
+#     --ckpt ${OUTPUT_DIR}/checkpoint_100_before_subdivision.pt \
+#     --out_dir ${OUTPUT_DIR} \
+#     --n_images 1 \
+#     --subdivision_depth "-1" \
+#     # --input_file ${INPUT_FILE} \
+
 python utils/patch_vis.py \
-    --ckpt ${OUTPUT_DIR}/checkpoint_4000.pt \
+    --ckpt ${OUTPUT_DIR}/checkpoint_5000.pt \
     --out_dir ${OUTPUT_DIR} \
     --n_images 4 \
     --subdivision_depth "-1" \
