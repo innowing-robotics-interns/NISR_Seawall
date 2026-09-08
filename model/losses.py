@@ -381,7 +381,7 @@ def tangent_loss_from_jac(t_u, t_v, mode='dirichlet', eps=1e-4, scale_invariant=
     S = torch.linalg.svdvals(J)
 
     # If scaled to 1, a hardcoded eps (like 1e-4) is now safe and universally meaningful
-    collapse = torch.relu(eps - S).pow(2).sum(dim=-1).mean()
+    # collapse = torch.relu(eps - S).pow(2).sum(dim=-1).mean()
 
     if mode == 'arap':
         energy = ((S - 0.25) ** 2).sum(dim=-1).mean()
@@ -393,11 +393,11 @@ def tangent_loss_from_jac(t_u, t_v, mode='dirichlet', eps=1e-4, scale_invariant=
     elif mode == 'collapse':
         energy = torch.zeros((), device=J.device, dtype=J.dtype)
     elif mode == 'dirichlet':
-        return e_dirichlet + collapse
+        energy = e_dirichlet
     else:
         raise ValueError(f"unknown tangent mode: {mode}")
 
-    return energy + collapse
+    return energy
 
 
 def tangent_fold_loss(Q, uv):
