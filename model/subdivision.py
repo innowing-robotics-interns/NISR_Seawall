@@ -4,8 +4,7 @@
 
 import torch
 
-from .losses import surface_jacobian
-
+from . import losses
 
 def compute_patch_distortion(model, samples_per_patch: int = 128,
                              mode: str = 'area', chunk_leaves: int = 128):
@@ -31,7 +30,7 @@ def compute_patch_distortion(model, samples_per_patch: int = 128,
             uv = torch.rand(k * samples_per_patch, 2, device=device,
                             requires_grad=True)
             Q = model(pids, uv)
-            t_u, t_v = surface_jacobian(Q, uv)
+            t_u, t_v = losses.surface_jacobian(Q, uv)
         E = (t_u * t_u).sum(-1)
         G = (t_v * t_v).sum(-1)
         Fd = (t_u * t_v).sum(-1)

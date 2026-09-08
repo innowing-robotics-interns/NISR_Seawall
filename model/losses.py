@@ -345,62 +345,7 @@ def surface_jacobian(Q, uv):
     return t_u, t_v
 
 
-def tangent_loss_from_jac(t_u, t_v, mode='dirichlet', eps=1e-4, scale_invariant=True):
-    """
-    Compute Jacobian-based tangent regularization with optional scale normalization.
-    """
-    # # 1. OPTIONAL: Normalize the scale of the Jacobian vectors per-sample/patch
-    # if scale_invariant:
-    #     # Calculate the local patch scale (Frobenius norm of the Jacobian)
-    #     # This represents the average "stretch" factor of this specific point
-    #     local_scale = torch.sqrt((t_u ** 2).sum(dim=-1) + (t_v ** 2).sum(dim=-1) + 1e-8)
-        
-    #     # Keep dimensions aligned for broadcasting [batch, 1]
-    #     local_scale = local_scale.unsqueeze(-1) 
-        
-    #     # Normalize vectors so the local metric scale is 1.0
-    #     t_u = t_u / local_scale
-    #     t_v = t_v / local_scale
-
-    J = torch.stack([t_u, t_v], dim=2)
-
-    ## dirichlet
-    ### \int_S(||df/du||^2 + ||df/dv||^2)
-
-    e_dirichlet = 1.0*torch.mean(0.5*torch.sum(J ** 2, dim=1))
-
-    if mode == 'conformal_fff':
-        E = (t_u * t_u).sum(dim=-1)
-        G = (t_v * t_v).sum(dim=-1)
-        Fd = (t_u * t_v).sum(dim=-1)
-        energy = ((E - G) ** 2 + 4.0 * Fd ** 2).mean()
-        area2 = torch.clamp(E * G - Fd ** 2, min=0.0)
-        collapse = torch.relu(eps ** 2 - area2).mean()
-        return energy + collapse
-
-    S = torch.linalg.svdvals(J)
-
-    # If scaled to 1, a hardcoded eps (like 1e-4) is now safe and universally meaningful
-    collapse = torch.relu(eps - S).pow(2).sum(dim=-1).mean()
-
-    if mode == 'arap':
-        energy = ((S - 0.25) ** 2).sum(dim=-1).mean()
-    elif mode == 'arap_si':
-        s_mean = S.mean(dim=-1, keepdim=True).detach()
-        energy = ((S - s_mean) ** 2).sum(dim=-1).mean()
-    elif mode == 'conformal':
-        energy = (S[:, 0] - S[:, 1]).pow(2).mean()
-    elif mode == 'collapse':
-        energy = torch.zeros((), device=J.device, dtype=J.dtype)
-    elif mode == 'dirichlet':
-        return e_dirichlet + collapse
-    else:
-        raise ValueError(f"unknown tangent mode: {mode}")
-
-    return energy + collapse
-
-
-def tangent_loss(model=None,
+def tangent_loss_from_jac(model=None,
                  pids: torch.Tensor = None,
                  t_u: torch.Tensor = None,
                  t_v: torch.Tensor = None,
@@ -411,15 +356,11 @@ def tangent_loss(model=None,
                  normalize_patch_scale: bool = False,
                  target: float = 1.0) -> torch.Tensor:
     """
-    Unified tangent/Jacobian regularization for both uniform and adaptive atlases.
-
-    When `normalize_patch_scale` is enabled, tangents are rescaled by the leaf
-    size so singular values are comparable across adaptive subdivision depths.
-    This matches the previous adaptive SVD behavior while keeping the actual
-    energy families in one shared implementation.
+    Compute Jacobian-based tangent regularization with optional scale normalization.
     """
+
     if t_u is None or t_v is None:
-        raise ValueError("t_u and t_v must be provided")
+            raise ValueError("t_u and t_v must be provided")
 
     if normalize_patch_scale:
         if patch_sizes is None:
@@ -436,16 +377,13 @@ def tangent_loss(model=None,
 
     J = torch.stack([t_u, t_v], dim=2)
 
-    if mode == 'dirichlet':
-        e_dirichlet = 1.0*torch.mean(0.5*torch.sum(J ** 2, dim=1))
-    
-        return e_dirichlet
-   
+    ## dirichlet
+    ### \int_S(||df/du||^2 + ||df/dv||^2)
+
     S = torch.linalg.svdvals(J)
-    collapse = torch.relu(eps - S).pow(2).sum(dim=-1).mean()
 
     if mode == 'arap':
-        energy = ((S - target) ** 2).sum(dim=-1).mean()
+        energy = ((S - 0.25) ** 2).sum(dim=-1).mean()
     elif mode == 'arap_si':
         s_mean = S.mean(dim=-1, keepdim=True).detach()
         energy = ((S - s_mean) ** 2).sum(dim=-1).mean()
@@ -453,16 +391,12 @@ def tangent_loss(model=None,
         energy = (S[:, 0] - S[:, 1]).pow(2).mean()
     elif mode == 'collapse':
         energy = torch.zeros((), device=J.device, dtype=J.dtype)
+    elif mode == 'dirichlet':
+        energy = 1.0*torch.mean(0.5*torch.sum(J ** 2, dim=1))
     else:
         raise ValueError(f"unknown tangent mode: {mode}")
 
-    return energy + collapse
-
-
-def tangent_fold_loss(Q, uv):
-    """Wrapper that computes its own Jacobian."""
-    t_u, t_v = surface_jacobian(Q, uv)
-    return tangent_loss_from_jac(t_u, t_v)
+    return energy
 
 
 def normal_consistency_loss(Q, uv, P_data, N_data):
@@ -479,49 +413,3 @@ def normal_consistency_loss(Q, uv, P_data, N_data):
 
     cos = torch.sum(n_surf * n_target, dim=-1)
     return (1.0 - cos).mean()
-
-
-def chamfer_1d(pts_a, pts_b):
-    """Compute Chamfer distance between two boundary point sets."""
-    diff_ab = pts_a.unsqueeze(1) - pts_b.unsqueeze(0)
-    dist_ab = (diff_ab ** 2).sum(dim=2)
-    min_ab = dist_ab.min(dim=1)[0].mean()
-    min_ba = dist_ab.min(dim=0)[0].mean()
-    return min_ab + min_ba
-
-
-def boundary_chamfer_loss(F_model, grid_topology, n_boundary_samples=50, device='cuda'):
-    """
-    Compute boundary Chamfer distance between adjacent patches.
-    """
-    n_rows, n_cols = grid_topology.shape
-    t = torch.linspace(0, 1, n_boundary_samples, device=device).unsqueeze(1)
-
-    total_loss = torch.tensor(0.0, device=device)
-    n_edges = 0
-
-    for r in range(n_rows):
-        for c in range(n_cols):
-            patch_id = int(grid_topology[r, c])
-
-            if c + 1 < n_cols:
-                neighbor_id = int(grid_topology[r, c + 1])
-                uv_i = torch.cat([t, torch.ones_like(t)], dim=1)
-                uv_j = torch.cat([t, torch.zeros_like(t)], dim=1)
-                pts_i = F_model(patch_id, uv_i)
-                pts_j = F_model(neighbor_id, uv_j)
-                total_loss += chamfer_1d(pts_i, pts_j)
-                n_edges += 1
-
-            if r + 1 < n_rows:
-                neighbor_id = int(grid_topology[r + 1, c])
-                uv_i = torch.cat([torch.ones_like(t), t], dim=1)
-                uv_j = torch.cat([torch.zeros_like(t), t], dim=1)
-                pts_i = F_model(patch_id, uv_i)
-                pts_j = F_model(neighbor_id, uv_j)
-                total_loss += chamfer_1d(pts_i, pts_j)
-                n_edges += 1
-
-    if n_edges > 0:
-        total_loss /= n_edges
-    return total_loss
