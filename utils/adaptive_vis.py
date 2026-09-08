@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.patches import Rectangle
 
-from model.adaptive_complex import FACE_NAMES, S_INT
+from model.model import FACE_NAMES, S_INT
 
 
 @torch.no_grad()

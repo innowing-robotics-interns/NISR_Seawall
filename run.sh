@@ -10,7 +10,7 @@
 
 FILE="max-planck.ply"
 INPUT_FILE="3d_test_models/${FILE}"
-OUTPUT_DIR="logs/log_collapse/${FILE%.*}_CD_24Patches_M1100_6Atlas_5k_mu0.08_dirichlet_refP25k_ddfBeta0_ddfSigma0.05_lamDDF1_muDecay1_noCollapse_1_1"
+OUTPUT_DIR="logs/adaptive/${FILE%.*}_CD_24Patches_M1100_6Atlas_5k_mu0.08_dirichlet_refP25k_ddfBeta0_ddfSigma0.05_lamDDF1_muDecay1_noCollapse"
 
 
 # python main.py \
@@ -117,7 +117,7 @@ python main.py \
     --result_dir ${OUTPUT_DIR} \
     --epochs 5000 \
     --d_features 88 \
-    --M_per_patch 1100 \
+    --M_per_patch 500 \
     --W 512 \
     --D 6 \
     --L 0 \

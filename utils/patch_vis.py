@@ -2,6 +2,18 @@
 # patch_vis.py
 
 """
+Checkerboard export for BOTH atlas families:
+
+* fixed-grid checkpoints written by `main.py` (single_sheet / two_sheet /
+  six_sheet), which additionally support point-cloud occupancy filtering via
+  --subdivision_depth, and
+* adaptive quadtree checkpoints written by `main.py --adaptive`
+  (mode='adaptive_cube'), where each leaf is exported with its quadtree depth
+  in the filename.
+
+Which path runs is decided by --adaptive (default 'auto' = read the
+checkpoint's own 'mode' field).
+
 Notes:
 - To change the pattern to several images, edit the argument `pattern` in `load_checkerboard_textures()` and `export_checkerboard_patches` to "Slide{}.jpg".
 - To change the number of images, edit the argument --n_images in the Command line
@@ -11,6 +23,8 @@ import os
 import argparse
 import importlib.util
 import glob
+import sys
+
 import numpy as np
 import torch
 import trimesh
@@ -18,6 +32,13 @@ from PIL import Image
 
 import pc_presegmentation as pc_presegmentation
 import utils as utils
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _root in (os.path.dirname(_HERE), _HERE, os.getcwd()):
+    if os.path.isdir(os.path.join(_root, 'model')) and _root not in sys.path:
+        sys.path.insert(0, _root)
+
+from model.model import AdaptiveCubeForwardMap  # noqa: E402
 
 # Load the texture
 def load_checkerboard_textures(texture_path, pattern="Slide{}.jpg", n_images=4):
@@ -227,6 +248,10 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
                                           n_images=n_images)
     n_textures = len(textures)
 
+    # Adaptive (quadtree) atlases expose their leaf records; fixed grids don't.
+    # When present, each patch's face + quadtree depth goes into its filename.
+    leaf_patches = getattr(F.complex, 'leaf_patches', None)
+
     sample_all_patches = subdivision_depth < 0
 
     if active_patch_ids is None or sample_all_patches:
@@ -275,16 +300,24 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
                                maintain_order=True)
         meshes.append(mesh)
 
-        obj_path = os.path.join(save_dir, f"patch_{cid}_{epoch}.obj")
+        if leaf_patches is not None:
+            leaf = leaf_patches[cid]
+            tag = f"patch_{cid:03d}_d{leaf.depth}_{epoch}"
+            label = f"Patch {cid:03d} (face={leaf.face}, depth={leaf.depth})"
+        else:
+            tag = f"patch_{cid}_{epoch}"
+            label = f"Patch {cid:02d}"
+
+        obj_path = os.path.join(save_dir, tag + ".obj")
         mesh.export(obj_path)
-        print(f"    Patch {cid:02d} textured OBJ → {obj_path}")
+        print(f"    {label} textured OBJ → {obj_path}")
 
         if export_ply:
             colored_mesh = _bake_vertex_colors(mesh)
             colored_meshes.append(colored_mesh)
-            ply_path = os.path.join(save_dir, f"patch_{cid}_{epoch}.ply")
+            ply_path = os.path.join(save_dir, tag + ".ply")
             colored_mesh.export(ply_path)
-            print(f"    Patch {cid:02d} vertex-colored PLY → {ply_path}")
+            print(f"    {label} vertex-colored PLY → {ply_path}")
 
         if debug_uv_png:
             _save_debug_uv_png(uv, tex_img, save_dir, cid)
@@ -383,6 +416,37 @@ def _import_model_module(model_path=None):
     return module
 
 
+def _normalization_meta(ckpt):
+    """Recover the {center, scale} export transform from a checkpoint."""
+    normalization = ckpt.get('normalization')
+    if normalization is None:
+        # Pretrain-only checkpoints may omit normalization metadata.
+        return {'center': np.zeros(3, dtype=np.float32), 'scale': 1.0}
+    return {
+        'center': np.array(normalization['center'], dtype=np.float32),
+        'scale': float(normalization['scale']),
+    }
+
+
+def _load_adaptive_from_checkpoint(ckpt_path, device):
+    """
+    Rebuild an `AdaptiveCubeForwardMap` (quadtree cube atlas) from a checkpoint
+    written by `main.py --adaptive`.
+
+    Returns the same tuple shape as `_load_model_from_checkpoint`; the adaptive
+    atlas has no fixed patch grid, so `active_patch_ids` and `grid_dims` are
+    always None.
+    """
+    ckpt = torch.load(ckpt_path, map_location=device)
+    if ckpt.get('mode') != 'adaptive_cube':
+        raise ValueError(
+            f"Checkpoint mode is '{ckpt.get('mode')}', expected 'adaptive_cube'. "
+            f"Pass --adaptive no (or leave it at 'auto') for fixed-grid checkpoints."
+        )
+    F = AdaptiveCubeForwardMap.from_checkpoint(ckpt, device=device)
+    return F, _normalization_meta(ckpt), ckpt.get('args') or {}, None, None
+
+
 def _load_model_from_checkpoint(ckpt_path, device, model_path=None):
     """
     Rebuild `MultiPatchForwardMap` from a saved checkpoint.
@@ -449,27 +513,22 @@ def _load_model_from_checkpoint(ckpt_path, device, model_path=None):
     F.load_state_dict(ckpt['F_state'])
     F.eval()
 
-    normalization = ckpt.get('normalization')
-    if normalization is None:
-        # Pretrain-only checkpoints may omit normalization metadata.
-        meta = {
-            'center': np.zeros(3, dtype=np.float32),
-            'scale': 1.0,
-        }
-    else:
-        meta = {
-            'center': np.array(normalization['center'], dtype=np.float32),
-            'scale': float(normalization['scale']),
-        }
+    meta = _normalization_meta(ckpt)
     active_patch_ids = ckpt.get('active_patch_ids')
     return F, meta, args, active_patch_ids, ckpt.get('grid_dims')
+
+
+def _is_adaptive_checkpoint(ckpt_path):
+    """Peek at a checkpoint's 'mode' field to pick the export path."""
+    return torch.load(ckpt_path, map_location='cpu').get('mode') == 'adaptive_cube'
 
 
 def _resolve_checkpoint_paths(ckpt_path):
     """Return a sorted list of checkpoint files from a file or directory."""
     ckpt_path = os.path.abspath(ckpt_path)
     if os.path.isdir(ckpt_path):
-        candidates = glob.glob(os.path.join(ckpt_path, 'checkpoint*.pt'))
+        # '*checkpoint*.pt' also catches 'pretrain_checkpoint.pt'.
+        candidates = glob.glob(os.path.join(ckpt_path, '*checkpoint*.pt'))
 
         def _sort_key(path):
             stem = os.path.splitext(os.path.basename(path))[0]
@@ -506,9 +565,15 @@ def _resegment_current_input_points(input_points: np.ndarray, n_rows: int, n_col
 def main():
     parser = argparse.ArgumentParser(
         description='Export checkerboard-textured per-patch meshes from a '
-                   'trained multi-patch checkpoint.')
+                   'trained multi-patch or adaptive-quadtree checkpoint.')
     parser.add_argument('--ckpt', type=str, required=True,
                         help='Path to checkpoint.pt saved by main.py, or a directory containing checkpoint*.pt files')
+    parser.add_argument('--adaptive', type=str, default='auto',
+                        choices=['auto', 'yes', 'no'],
+                        help="Which atlas the checkpoint holds: 'yes' = adaptive "
+                             "quadtree cube atlas (main.py --adaptive), 'no' = "
+                             "fixed patch grid, 'auto' (default) = decide per "
+                             "checkpoint from its stored 'mode' field")
     parser.add_argument('--texture_path', type=str,
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'texture'),
                         help='Path to a SINGLE checkerboard image (used for every '
@@ -559,11 +624,28 @@ def main():
         ckpt_name = os.path.splitext(os.path.basename(ckpt_path))[0]
         export_dir = os.path.join(args.out_dir, ckpt_name)
 
-        F, meta, ckpt_args, active_patch_ids, _ = _load_model_from_checkpoint(
-            ckpt_path, args.device, args.model_path
-        )
+        if args.adaptive == 'auto':
+            is_adaptive = _is_adaptive_checkpoint(ckpt_path)
+        else:
+            is_adaptive = args.adaptive == 'yes'
+
+        if is_adaptive:
+            F, meta, ckpt_args, active_patch_ids, _ = _load_adaptive_from_checkpoint(
+                ckpt_path, args.device
+            )
+            stats = F.complex.stats()
+            print(f"  Loaded adaptive atlas: {F.n_patches} leaves, "
+                  f"{stats['n_vertices']} vertices, depth hist {stats['depth_hist']}")
+        else:
+            F, meta, ckpt_args, active_patch_ids, _ = _load_model_from_checkpoint(
+                ckpt_path, args.device, args.model_path
+            )
+            print(f"  Loaded model: {F.n_rows}x{F.n_cols} = {F.n_patches} patches")
+
+        # Occupancy filtering re-segments the input cloud over the FIXED patch
+        # grid, so it only applies to the non-adaptive atlas.
         patch_points_by_id = None
-        if active_patch_ids is not None and args.subdivision_depth > 0:
+        if not is_adaptive and active_patch_ids is not None and args.subdivision_depth > 0:
             input_file = args.input_file or ckpt_args.get('file')
             if input_file is None:
                 raise ValueError('Occupancy-aware export requires --input_file or checkpoint args[file].')
@@ -571,7 +653,6 @@ def main():
             patch_points_by_id = _resegment_current_input_points(
                 input_points, F.n_rows, F.n_cols, active_patch_ids=active_patch_ids
             )
-        print(f"  Loaded model: {F.n_rows}x{F.n_cols} = {F.n_patches} patches")
         if active_patch_ids is not None:
             print(f"  Active patches in checkpoint: {len(active_patch_ids)}")
         print(f"  Exporting checkpoint {ckpt_name} → {export_dir}")
@@ -586,6 +667,7 @@ def main():
             name=ckpt_name,
             n_images=args.n_images,
             unnormalize=not args.no_unnormalize,
+            debug_uv_png=not is_adaptive,
             export_ply=not args.no_ply,
             double_sided=not args.single_sided,
             active_patch_ids=active_patch_ids,
