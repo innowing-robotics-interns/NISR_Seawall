@@ -19,22 +19,16 @@ from matplotlib import cm
 import utils.pc_presegmentation as pc_presegmentation
 import utils.correspondence_vis as correspondence_vis
 import utils.utils as utils
-from model.losses import (boundary_chamfer_loss, chamfer_1d,
-                                       chamfer_distance,
-                                       chamfer_distance_chunked,
-                                       directional_distance_field,
-                                       directional_distance_loss,
-                                       sample_ddf_reference_points,
-                                       mu_warmup_schedule,
-                                       normal_consistency_loss,
-                               outer_boundary_rectangle_loss,
-                   sample_outer_boundary_correspondence,
+from model.losses import (chamfer_distance, chamfer_distance_chunked, directional_distance_field,
+                                directional_distance_loss,
+                                sample_ddf_reference_points,
+                                mu_warmup_schedule,
+                                normal_consistency_loss,
+                                outer_boundary_rectangle_loss,
+                                sample_outer_boundary_correspondence,
                                              surface_jacobian,
-                                             tangent_fold_loss,
                                              tangent_loss_from_jac)
-from model.model import (FeatureComplex, ForwardMap, InverseMap, MultiPatchForwardMap,
-           MultiPatchInverseMap, PositionalEncoding, SkipMLP,
-       TwoSheetForwardMap, SixSheetForwardMap)
+from model.model import (MultiPatchForwardMap, MultiPatchInverseMap, TwoSheetForwardMap, SixSheetForwardMap)
 from model.correspondence import build_hard_correspondence
 try:
     import open3d as o3d

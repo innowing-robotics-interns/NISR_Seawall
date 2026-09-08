@@ -399,13 +399,6 @@ def tangent_loss_from_jac(t_u, t_v, mode='dirichlet', eps=1e-4, scale_invariant=
 
     return energy
 
-
-def tangent_fold_loss(Q, uv):
-    """Wrapper that computes its own Jacobian."""
-    t_u, t_v = surface_jacobian(Q, uv)
-    return tangent_loss_from_jac(t_u, t_v)
-
-
 def normal_consistency_loss(Q, uv, P_data, N_data):
     """
     Compute single-patch normal consistency loss.
@@ -420,49 +413,3 @@ def normal_consistency_loss(Q, uv, P_data, N_data):
 
     cos = torch.sum(n_surf * n_target, dim=-1)
     return (1.0 - cos).mean()
-
-
-def chamfer_1d(pts_a, pts_b):
-    """Compute Chamfer distance between two boundary point sets."""
-    diff_ab = pts_a.unsqueeze(1) - pts_b.unsqueeze(0)
-    dist_ab = (diff_ab ** 2).sum(dim=2)
-    min_ab = dist_ab.min(dim=1)[0].mean()
-    min_ba = dist_ab.min(dim=0)[0].mean()
-    return min_ab + min_ba
-
-
-def boundary_chamfer_loss(F_model, grid_topology, n_boundary_samples=50, device='cuda'):
-    """
-    Compute boundary Chamfer distance between adjacent patches.
-    """
-    n_rows, n_cols = grid_topology.shape
-    t = torch.linspace(0, 1, n_boundary_samples, device=device).unsqueeze(1)
-
-    total_loss = torch.tensor(0.0, device=device)
-    n_edges = 0
-
-    for r in range(n_rows):
-        for c in range(n_cols):
-            patch_id = int(grid_topology[r, c])
-
-            if c + 1 < n_cols:
-                neighbor_id = int(grid_topology[r, c + 1])
-                uv_i = torch.cat([t, torch.ones_like(t)], dim=1)
-                uv_j = torch.cat([t, torch.zeros_like(t)], dim=1)
-                pts_i = F_model(patch_id, uv_i)
-                pts_j = F_model(neighbor_id, uv_j)
-                total_loss += chamfer_1d(pts_i, pts_j)
-                n_edges += 1
-
-            if r + 1 < n_rows:
-                neighbor_id = int(grid_topology[r + 1, c])
-                uv_i = torch.cat([torch.ones_like(t), t], dim=1)
-                uv_j = torch.cat([torch.zeros_like(t), t], dim=1)
-                pts_i = F_model(patch_id, uv_i)
-                pts_j = F_model(neighbor_id, uv_j)
-                total_loss += chamfer_1d(pts_i, pts_j)
-                n_edges += 1
-
-    if n_edges > 0:
-        total_loss /= n_edges
-    return total_loss
