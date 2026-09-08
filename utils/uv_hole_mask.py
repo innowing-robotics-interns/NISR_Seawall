@@ -2,7 +2,7 @@
 # uv_hole_mask.py
 
 """
-Usage: 
+Usage:
 
     python utils/uv_hole_mask.py \
         --ckpt logs/.../checkpoint_5000.pt \
@@ -10,6 +10,20 @@ Usage:
         --resolution 256
 
 The input cloud defaults to the one recorded in the checkpoint's args.
+
+Supports two atlas configurations:
+
+1.Fixed-Grid Checkpoints (main.py)
+   - Patches are arranged in a uniform `n_rows x n_cols` grid per sheet.
+   - All patches carry equal weight.
+
+2.Adaptive Quadtree Checkpoints (main.py --adaptive)
+   - Leaves are varying-sized dyadic rectangles across 6 cube faces.
+   - Per-Face Mapping: Masks paint directly into their quadtree positions 
+     instead of scattering across uniform tiles.
+   - Area-Weighted Statistics: Metrics are weighted by each leaf's footprint 
+     (size² in the [0,1]² face chart). This prevents tiny, deeply nested leaves 
+     from dominating since all leaves generate the same R x R sample count.
 """
 
 import argparse
@@ -25,9 +39,13 @@ from scipy.spatial import cKDTree
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
 import patch_vis
 import utils as utils
+
+# patch_vis puts the repo root on sys.path so `model` is importable.
+from model.model import FACE_NAMES  # noqa: E402
 
 
 # Colors used for the 3D validation PLY. No correspondence points are drawn red
@@ -113,6 +131,22 @@ def otsu_threshold(values: np.ndarray, n_bins: int = 512) -> float:
     sigma_b[~np.isfinite(sigma_b)] = -1.0
 
     return float(centers[int(np.argmax(sigma_b))])
+
+
+def black_fraction(distances: np.ndarray, tau: float,
+                   weights: np.ndarray = None) -> float:
+    """
+    Fraction of UV AREA whose nearest target point is further than `tau`.
+
+    With `weights=None` (fixed grid: every patch is the same size) this is the
+    plain sample mean. For the adaptive atlas the weights carry each leaf's
+    parametric footprint, so a cloud of deep, tiny leaves cannot outvote the
+    coarse leaves that actually cover most of the surface.
+    """
+    over = distances > tau
+    if weights is None:
+        return float(over.mean())
+    return float(np.sum(weights * over) / np.sum(weights))
 
 
 def resolve_threshold(mode: str, distances: np.ndarray, d_nn: float,
@@ -347,8 +381,142 @@ def save_contact_sheet(path: str, per_patch: dict, F, atlas_mode: str,
     plt.close(fig)
 
 
+def adaptive_leaf_rects(F):
+    """
+    Per-leaf quadtree geometry of an adaptive cube atlas.
+
+    Returns:
+        Tuple `(rects, faces, depths)` where `rects[i]` is `(u0, v0, size)` in the
+        leaf's own face chart, already normalized to `[0, 1]`.
+    """
+    rects = F.complex.leaf_rect.detach().cpu().numpy().astype(np.float64)
+    faces = F.complex.leaf_face.detach().cpu().numpy().astype(np.int32)
+    depths = np.array([p.depth for p in F.complex.leaf_patches], dtype=np.int32)
+    return rects, faces, depths
+
+
+def composite_face_canvases(per_patch: dict, patch_ids: list, rects: np.ndarray,
+                            faces: np.ndarray, face_res: int):
+    """
+    Paint each leaf's UV field into its quadtree rectangle on a per-face canvas.
+
+    Every leaf is evaluated on its own RxR grid regardless of how much of the
+    face it covers, so painting it into its rectangle is a resample: nearest
+    neighbour, which keeps a binary mask binary. Cells no leaf covers stay NaN
+    and render as background.
+
+    Returns:
+        dict `face_index -> (face_res, face_res) array`, indexed `[u_index, v_index]`
+        to match the per-patch convention.
+    """
+    canvases = {f: np.full((face_res, face_res), np.nan, dtype=np.float32)
+                for f in range(len(FACE_NAMES))}
+
+    for patch_id in patch_ids:
+        field = per_patch.get(patch_id)
+        if field is None:
+            continue
+        u0, v0, size = rects[patch_id]
+        r0, r1 = int(round(u0 * face_res)), int(round((u0 + size) * face_res))
+        c0, c1 = int(round(v0 * face_res)), int(round((v0 + size) * face_res))
+        # A leaf finer than one canvas pixel still gets a pixel, so deep
+        # subdivisions never silently vanish from the figure.
+        r1, c1 = max(r1, r0 + 1), max(c1, c0 + 1)
+
+        R = field.shape[0]
+        ri = np.clip((np.linspace(0, R, r1 - r0, endpoint=False)).astype(int), 0, R - 1)
+        ci = np.clip((np.linspace(0, R, c1 - c0, endpoint=False)).astype(int), 0, R - 1)
+        canvases[int(faces[patch_id])][r0:r1, c0:c1] = \
+            field.astype(np.float32)[np.ix_(ri, ci)]
+
+    return canvases
+
+
+def save_adaptive_face_atlas(path: str, per_patch: dict, F, patch_ids: list,
+                             title: str, binary: bool, vmax: float = None,
+                             face_res: int = 512, draw_leaf_edges: bool = True) -> None:
+    """
+    Contact sheet for the adaptive atlas: one panel per cube face, each leaf
+    drawn in its true quadtree rectangle.
+
+    This is the adaptive replacement for `save_contact_sheet`, which assumes a
+    uniform n_rows x n_cols grid the quadtree does not have.
+    """
+    rects, faces, depths = adaptive_leaf_rects(F)
+    canvases = composite_face_canvases(per_patch, patch_ids, rects, faces, face_res)
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10.5), squeeze=False)
+    cmap = plt.get_cmap('gray' if binary else 'inferno').copy()
+    cmap.set_bad(color='0.85')          # uncovered chart area
+
+    for f in range(len(FACE_NAMES)):
+        ax = axes[f // 3][f % 3]
+        data = np.ma.masked_invalid(canvases[f])
+        if binary:
+            ax.imshow(data, cmap=cmap, vmin=0.0, vmax=1.0,
+                      interpolation='nearest', extent=[0, 1, 1, 0])
+        else:
+            ax.imshow(data, cmap=cmap, vmin=0.0, vmax=vmax,
+                      interpolation='nearest', extent=[0, 1, 1, 0])
+
+        n_leaves_here = 0
+        if draw_leaf_edges:
+            for patch_id in patch_ids:
+                if int(faces[patch_id]) != f:
+                    continue
+                n_leaves_here += 1
+                u0, v0, size = rects[patch_id]
+                # imshow extent maps v -> x and u -> y (u down), matching the
+                # "u down, v right" convention used by the fixed-grid sheets.
+                ax.add_patch(Rectangle((v0, u0), size, size, fill=False,
+                                       edgecolor='#2f7fd0', linewidth=0.5))
+        else:
+            n_leaves_here = int((faces[np.asarray(patch_ids)] == f).sum())
+
+        ax.set_xlim(0, 1)
+        ax.set_ylim(1, 0)
+        ax.set_aspect('equal')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(f'face {FACE_NAMES[f]}   ({n_leaves_here} leaves)', fontsize=10)
+
+    fig.suptitle(f'{title}\n(each panel: one cube face, u down, v right; '
+                 f'blue = leaf boundaries, grey = not covered)', fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def save_depth_atlas(path: str, F, patch_ids: list, face_res: int = 512) -> None:
+    """Per-face map of leaf quadtree depth — where the atlas chose to refine."""
+    rects, faces, depths = adaptive_leaf_rects(F)
+    depth_fields = {p: np.full((1, 1), float(depths[p])) for p in patch_ids}
+    canvases = composite_face_canvases(depth_fields, patch_ids, rects, faces, face_res)
+
+    vmax = float(depths.max()) if depths.size else 1.0
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10.5), squeeze=False)
+    cmap = plt.get_cmap('viridis').copy()
+    cmap.set_bad(color='0.85')
+    im = None
+    for f in range(len(FACE_NAMES)):
+        ax = axes[f // 3][f % 3]
+        im = ax.imshow(np.ma.masked_invalid(canvases[f]), cmap=cmap,
+                       vmin=0.0, vmax=max(vmax, 1.0), interpolation='nearest',
+                       extent=[0, 1, 1, 0])
+        ax.set_aspect('equal')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(f'face {FACE_NAMES[f]}', fontsize=10)
+
+    fig.colorbar(im, ax=axes, shrink=0.6, label='leaf depth')
+    fig.suptitle('Quadtree leaf depth per cube face', fontsize=12)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def save_diagnostics(path: str, distances: np.ndarray, tau: float,
-                     d_nn: float, nn_scale: float) -> None:
+                     d_nn: float, nn_scale: float,
+                     weights: np.ndarray = None) -> None:
     """
     Histogram of d(u,v) plus the black-fraction sweep.
 
@@ -360,7 +528,7 @@ def save_diagnostics(path: str, distances: np.ndarray, tau: float,
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
 
-    ax1.hist(safe, bins=400, color='#3b6ea5')
+    ax1.hist(safe, bins=400, color='#3b6ea5', weights=weights)
     ax1.set_xscale('log')
     ax1.set_yscale('log')
     ax1.axvline(tau, color='crimson', lw=2,
@@ -368,12 +536,12 @@ def save_diagnostics(path: str, distances: np.ndarray, tau: float,
     ax1.axvline(d_nn, color='seagreen', lw=1.5, ls='--',
                 label=f'median NN spacing = {d_nn:.5f}')
     ax1.set_xlabel('distance from F(u,v) to nearest target point')
-    ax1.set_ylabel('# UV samples')
+    ax1.set_ylabel('UV area' if weights is not None else '# UV samples')
     ax1.set_title('Distance histogram (want two modes)')
     ax1.legend(fontsize=8)
 
     sweep = np.linspace(0.5, 20.0, 120) * d_nn
-    frac = [(safe > t).mean() for t in sweep]
+    frac = [black_fraction(safe, t, weights) for t in sweep]
     ax2.plot(sweep / d_nn, np.array(frac) * 100.0, color='#3b6ea5')
     ax2.axvline(tau / d_nn, color='crimson', lw=2,
                 label=f'tau = {tau / d_nn:.2f} x median_nn')
@@ -394,7 +562,17 @@ def main():
                     'correspondence in the target cloud) and black (no '
                     'correspondence -> assume hole).')
     parser.add_argument('--ckpt', type=str, required=True,
-                        help='Trained multi-patch checkpoint (checkpoint_N.pt)')
+                        help='Trained multi-patch or adaptive checkpoint (checkpoint_N.pt)')
+    parser.add_argument('--adaptive', type=str, default='auto',
+                        choices=['auto', 'yes', 'no'],
+                        help="Which atlas the checkpoint holds: 'yes' = adaptive "
+                             "quadtree cube atlas (main.py --adaptive), 'no' = fixed "
+                             "patch grid, 'auto' (default) = read the checkpoint's "
+                             "stored 'mode' field")
+    parser.add_argument('--face_resolution', type=int, default=512,
+                        help='[Adaptive] Canvas resolution per cube face for the '
+                             'atlas figures. Should be >= 2^max_leaf_depth so the '
+                             'deepest leaves get more than one pixel.')
     parser.add_argument('--input_file', type=str, default=None,
                         help='Target point cloud. Defaults to the file recorded '
                              'in the checkpoint args.')
@@ -435,11 +613,25 @@ def main():
 
     # Model and checkpoint load
     print(f"\n  Loading checkpoint: {args.ckpt}")
-    F, meta, ckpt_args, active_patch_ids, _ = patch_vis._load_model_from_checkpoint(
-        args.ckpt, args.device, args.model_path
-    )
-    atlas_mode = ckpt_args.get('atlas_mode', 'single_sheet')
-    print(f"  Atlas: {atlas_mode}  grid={F.n_rows}x{F.n_cols}  patches={F.n_patches}")
+    if args.adaptive == 'auto':
+        is_adaptive = patch_vis._is_adaptive_checkpoint(args.ckpt)
+    else:
+        is_adaptive = args.adaptive == 'yes'
+
+    if is_adaptive:
+        F, meta, ckpt_args, active_patch_ids, _ = patch_vis._load_adaptive_from_checkpoint(
+            args.ckpt, args.device
+        )
+        atlas_mode = 'adaptive_cube'
+        stats = F.complex.stats()
+        print(f"  Atlas: adaptive quadtree cube  leaves={F.n_patches}  "
+              f"vertices={stats['n_vertices']}  depth hist={stats['depth_hist']}")
+    else:
+        F, meta, ckpt_args, active_patch_ids, _ = patch_vis._load_model_from_checkpoint(
+            args.ckpt, args.device, args.model_path
+        )
+        atlas_mode = ckpt_args.get('atlas_mode', 'single_sheet')
+        print(f"  Atlas: {atlas_mode}  grid={F.n_rows}x{F.n_cols}  patches={F.n_patches}")
 
     center = np.asarray(meta['center'], dtype=np.float64)
     scale = float(meta['scale'])
@@ -488,6 +680,17 @@ def main():
     print(f"\n  Evaluating {len(patch_ids)} patches on a {R}x{R} UV grid "
           f"({len(patch_ids) * R * R:,} samples)...")
 
+    # Area weight per patch. Fixed grid: all patches are the same size, so the
+    # weights are uniform and every statistic below reduces to a plain mean.
+    # Adaptive: a leaf's parametric footprint is size^2 in its face chart, and
+    # sizes differ by orders of magnitude across depths.
+    if is_adaptive:
+        leaf_rects, leaf_faces, leaf_depths = adaptive_leaf_rects(F)
+        patch_weight = {p: float(leaf_rects[p, 2]) ** 2 for p in patch_ids}
+    else:
+        leaf_rects = leaf_faces = leaf_depths = None
+        patch_weight = {p: 1.0 for p in patch_ids}
+
     dist_fields = {}
     xyz_fields = {}
     for patch_id in patch_ids:
@@ -495,10 +698,16 @@ def main():
         d, _ = tree.query(xyz, k=1, workers=-1)
         dist_fields[patch_id] = d.astype(np.float32).reshape(R, R)   # [u_idx, v_idx]
         xyz_fields[patch_id] = xyz
-        print(f"    Patch {patch_id:02d}  d: mean={d.mean():.6f}  "
+        where = (f"  face={FACE_NAMES[int(leaf_faces[patch_id])]} d{int(leaf_depths[patch_id])}"
+                 if is_adaptive else "")
+        print(f"    Patch {patch_id:03d}{where}  d: mean={d.mean():.6f}  "
               f"median={np.median(d):.6f}  p99={np.quantile(d, 0.99):.6f}  max={d.max():.6f}")
 
-    all_d = np.concatenate([f.ravel() for f in dist_fields.values()])
+    all_d = np.concatenate([dist_fields[p].ravel() for p in patch_ids])
+    # One weight per SAMPLE: each patch's area spread evenly over its R*R grid.
+    all_w = np.concatenate(
+        [np.full(R * R, patch_weight[p] / (R * R), dtype=np.float64) for p in patch_ids])
+    weights = all_w if is_adaptive else None
 
     # threshold
     tau, tau_desc = resolve_threshold(args.threshold, all_d, d_nn, args.nn_scale)
@@ -510,7 +719,8 @@ def main():
     print(f"    {'x median_nn':>12} {'tau':>12} {'% black':>10}")
     for mult in (1, 2, 3, 4, 5, 7, 10, 15, 20):
         t = mult * d_nn
-        print(f"    {mult:>12} {t:>12.6f} {100.0 * (all_d > t).mean():>9.2f}%")
+        print(f"    {mult:>12} {t:>12.6f} "
+              f"{100.0 * black_fraction(all_d, t, weights):>9.2f}%")
 
     # masks
     masks = {}
@@ -521,30 +731,59 @@ def main():
         masks[patch_id] = mask
 
         black_frac = float(1.0 - mask.mean())
-        per_patch_stats[int(patch_id)] = {
+        stats_row = {
             'black_fraction': black_frac,
             'mean_distance': float(dist_fields[patch_id].mean()),
             'max_distance': float(dist_fields[patch_id].max()),
         }
+        if is_adaptive:
+            stats_row.update({
+                'face': FACE_NAMES[int(leaf_faces[patch_id])],
+                'depth': int(leaf_depths[patch_id]),
+                'uv_area': patch_weight[patch_id],
+            })
+        per_patch_stats[int(patch_id)] = stats_row
 
         if not args.no_per_patch_png:
+            stem = (f'patch_{patch_id:03d}_f{int(leaf_faces[patch_id])}'
+                    f'_d{int(leaf_depths[patch_id])}' if is_adaptive
+                    else f'patch_{patch_id:02d}')
             Image.fromarray((mask.astype(np.uint8) * 255), mode='L').save(
-                os.path.join(mask_dir, f'mask_patch_{patch_id:02d}.png'))
-            plt.imsave(os.path.join(dist_dir, f'dist_patch_{patch_id:02d}.png'),
+                os.path.join(mask_dir, f'mask_{stem}.png'))
+            plt.imsave(os.path.join(dist_dir, f'dist_{stem}.png'),
                        dist_fields[patch_id], cmap='inferno',
                        vmin=0.0, vmax=float(np.quantile(all_d, 0.99)))
 
-    total_black = float((all_d > tau).mean())
+    total_black = black_fraction(all_d, tau, weights)
+    total_black_raw = black_fraction(all_d, tau, None)
+    vmax99 = float(np.quantile(all_d, 0.99))
 
     # Figures
-    save_contact_sheet(os.path.join(args.out_dir, 'mask_atlas.png'), masks, F,
-                       atlas_mode, 'White = has correspondence   |   Black = no correspondence',
-                       binary=True)
-    save_contact_sheet(os.path.join(args.out_dir, 'distance_atlas.png'), dist_fields, F,
-                       atlas_mode, 'Distance from F(u,v) to nearest target point',
-                       binary=False, vmax=float(np.quantile(all_d, 0.99)))
+    if is_adaptive:
+        max_depth = int(leaf_depths.max()) if leaf_depths.size else 0
+        if args.face_resolution < (1 << max_depth):
+            print(f"  [warn] --face_resolution {args.face_resolution} < 2^{max_depth} "
+                  f"= {1 << max_depth}; the deepest leaves are smaller than one pixel "
+                  f"in the atlas figures and get snapped to a single pixel each.")
+        save_adaptive_face_atlas(
+            os.path.join(args.out_dir, 'mask_atlas.png'), masks, F, patch_ids,
+            'White = has correspondence   |   Black = no correspondence',
+            binary=True, face_res=args.face_resolution)
+        save_adaptive_face_atlas(
+            os.path.join(args.out_dir, 'distance_atlas.png'), dist_fields, F, patch_ids,
+            'Distance from F(u,v) to nearest target point',
+            binary=False, vmax=vmax99, face_res=args.face_resolution)
+        save_depth_atlas(os.path.join(args.out_dir, 'depth_atlas.png'), F, patch_ids,
+                         face_res=args.face_resolution)
+    else:
+        save_contact_sheet(os.path.join(args.out_dir, 'mask_atlas.png'), masks, F,
+                           atlas_mode, 'White = has correspondence   |   Black = no correspondence',
+                           binary=True)
+        save_contact_sheet(os.path.join(args.out_dir, 'distance_atlas.png'), dist_fields, F,
+                           atlas_mode, 'Distance from F(u,v) to nearest target point',
+                           binary=False, vmax=vmax99)
     save_diagnostics(os.path.join(args.out_dir, 'distance_histogram.png'),
-                     all_d, tau, d_nn, args.nn_scale)
+                     all_d, tau, d_nn, args.nn_scale, weights=weights)
 
     # 3D outputs
     def to_output_frame(points):
@@ -603,22 +842,34 @@ def main():
 
     # output NPZ for the trimming step
     npz_path = os.path.join(args.out_dir, 'uv_mask.npz')
-    np.savez_compressed(
-        npz_path,
+    npz_payload = dict(
         patch_ids=np.asarray(patch_ids, dtype=np.int32),
         masks=np.stack([masks[p] for p in patch_ids], axis=0),
         distances=np.stack([dist_fields[p] for p in patch_ids], axis=0),
         threshold=np.float32(tau),
         resolution=np.int32(R),
         median_nn=np.float32(d_nn),
+        adaptive=np.bool_(is_adaptive),
     )
+    if is_adaptive:
+        # The trimming step needs each leaf's chart rectangle to stitch the
+        # per-leaf masks back into a per-face domain.
+        npz_payload.update(
+            leaf_rect=leaf_rects[np.asarray(patch_ids)].astype(np.float32),
+            leaf_face=leaf_faces[np.asarray(patch_ids)].astype(np.int32),
+            leaf_depth=leaf_depths[np.asarray(patch_ids)].astype(np.int32),
+        )
+    np.savez_compressed(npz_path, **npz_payload)
 
     summary = {
         'checkpoint': os.path.abspath(args.ckpt),
         'input_file': os.path.abspath(input_file),
         'atlas_mode': atlas_mode,
+        'adaptive': bool(is_adaptive),
         'n_patches': int(F.n_patches),
-        'grid_dims': [int(F.n_rows), int(F.n_cols)],
+        'grid_dims': None if is_adaptive else [int(F.n_rows), int(F.n_cols)],
+        'adaptive_stats': F.complex.stats() if is_adaptive else None,
+        'area_weighted': bool(is_adaptive),
         'resolution': int(R),
         'normalization': {'center': center.tolist(), 'scale': scale},
         'median_nn_spacing': d_nn,
@@ -626,6 +877,7 @@ def main():
         'threshold_mode': args.threshold,
         'threshold_description': tau_desc,
         'total_black_fraction': total_black,
+        'total_black_fraction_unweighted': total_black_raw,
         'mask_index_convention': 'mask[u_index, v_index]; True = white = has correspondence',
         'export_frame': 'original' if args.unnormalize else 'normalized',
         'mesh': mesh_stats,
@@ -637,17 +889,42 @@ def main():
 
 
     print(f"\n{'─' * 64}")
-    print(f"  Black (no correspondence) overall: {100.0 * total_black:.2f}% of UV area")
+    weight_note = ' (area-weighted across leaves)' if is_adaptive else ''
+    print(f"  Black (no correspondence) overall: {100.0 * total_black:.2f}% "
+          f"of UV area{weight_note}")
+    if is_adaptive:
+        # Subdivision is distortion-driven and a hole membrane is a high-distortion
+        # region, so the quadtree tends to pile small leaves onto exactly the area
+        # that is a hole. Averaging raw samples therefore OVERSTATES the hole.
+        print(f"  (unweighted sample mean would read {100.0 * total_black_raw:.2f}% — "
+              f"use the area-weighted number above)")
     fully_white = [p for p in patch_ids if per_patch_stats[p]['black_fraction'] < 1e-6]
     fully_black = [p for p in patch_ids if per_patch_stats[p]['black_fraction'] > 1.0 - 1e-6]
-    print(f"  Patches fully white: {len(fully_white)}/{len(patch_ids)}")
-    print(f"  Patches fully black: {len(fully_black)}/{len(patch_ids)}"
-          + (f"  -> {fully_black}" if fully_black else ""))
-    print("  Per-patch black fraction:")
-    for patch_id in patch_ids:
-        frac = per_patch_stats[patch_id]['black_fraction']
-        bar = '#' * int(round(frac * 40))
-        print(f"    p{patch_id:02d}  {100.0 * frac:6.2f}%  {bar}")
+    label = 'Leaves' if is_adaptive else 'Patches'
+    print(f"  {label} fully white: {len(fully_white)}/{len(patch_ids)}")
+    print(f"  {label} fully black: {len(fully_black)}/{len(patch_ids)}"
+          + (f"  -> {fully_black}" if fully_black and len(fully_black) <= 40 else ""))
+
+    if is_adaptive:
+        # A quadtree run can carry hundreds of leaves, so rank by how much hole
+        # AREA each contributes rather than dumping every one of them.
+        ranked = sorted(patch_ids,
+                        key=lambda p: -per_patch_stats[p]['black_fraction'] * patch_weight[p])
+        shown = [p for p in ranked if per_patch_stats[p]['black_fraction'] > 1e-6][:25]
+        print(f"  Top {len(shown)} leaves by hole area "
+              f"(of {len(patch_ids)} leaves; blank = no hole anywhere):")
+        for patch_id in shown:
+            st = per_patch_stats[patch_id]
+            bar = '#' * int(round(st['black_fraction'] * 40))
+            print(f"    leaf {patch_id:03d}  face {st['face']:>2}  d{st['depth']}  "
+                  f"{100.0 * st['black_fraction']:6.2f}% black  "
+                  f"(area {st['uv_area']:.2e})  {bar}")
+    else:
+        print("  Per-patch black fraction:")
+        for patch_id in patch_ids:
+            frac = per_patch_stats[patch_id]['black_fraction']
+            bar = '#' * int(round(frac * 40))
+            print(f"    p{patch_id:02d}  {100.0 * frac:6.2f}%  {bar}")
 
     if total_black > 0.60:
         print("\n  [warn] Over 60% of the UV area is black. That is almost never a real")
@@ -658,8 +935,14 @@ def main():
         print("         or tau is too loose — lower --nn_scale and re-run.")
 
     print(f"\n  Outputs → {args.out_dir}")
-    print(f"    mask_atlas.png            — all patch masks at a glance (START HERE)")
-    print(f"    distance_atlas.png        — the underlying distance field")
+    if is_adaptive:
+        print(f"    mask_atlas.png            — 6 cube faces, leaves in their quadtree "
+              f"rectangles (START HERE)")
+        print(f"    distance_atlas.png        — the underlying distance field, same layout")
+        print(f"    depth_atlas.png           — where the quadtree refined")
+    else:
+        print(f"    mask_atlas.png            — all patch masks at a glance (START HERE)")
+        print(f"    distance_atlas.png        — the underlying distance field")
     print(f"    distance_histogram.png    — bimodality check + threshold sweep")
     print(f"    uv_samples_classified.ply — 3D points: grey = correspondence, RED = none")
     if mesh_stats is not None:
