@@ -1550,6 +1550,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    device, log_every, vis_dir, checkpoint_every,
                    checkpoint_extra=None,
                    tangent_mode='symmetric_dirichlet', sym_dirichlet_epoch=0,
+                         save_vertex_pos_every: int = 0,
+                         vertex_pos_json_path: str = None,
                       ddf_mu_decay: float = 0.5,
                       ddf_start_epoch: int = 0,
                       chamfer_resume_epoch: int = 0,
@@ -1694,6 +1696,17 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         opt.step()
         sched.step()
 
+        if save_vertex_pos_every > 0 and vertex_pos_json_path and (
+            epoch % save_vertex_pos_every == 0 or epoch == epochs
+        ):
+            vertex_positions = utils.extract_adaptive_vertex_global_positions(model)
+            utils.append_vertex_positions_json(
+                json_path=vertex_pos_json_path,
+                epoch=epoch,
+                vertex_positions=vertex_positions,
+                meta=None,
+            )
+
         if epoch % log_every == 0 or epoch == 1:
             history['epoch'].append(epoch)
             history['cd'].append(float(cd_loss))
@@ -1786,6 +1799,8 @@ def run_adaptive(args):
             'scale': float(meta['scale']),
         },
     }
+    vertex_pos_json_path = os.path.join(result_dir, 'vertex_positions_normalized.json')
+    vertex_pos_denorm_json_path = os.path.join(result_dir, 'vertex_positions_denormalized.json')
 
     # ── phase 2: adaptive training ───────────────────────────────────────
     history, events = train_adaptive(
@@ -1807,7 +1822,10 @@ def run_adaptive(args):
         checkpoint_every=args.checkpoint_every,
         checkpoint_extra=checkpoint_extra,
         tangent_mode=args.tangent_mode,
-        sym_dirichlet_epoch=args.sym_dirichlet_epoch)
+        sym_dirichlet_epoch=args.sym_dirichlet_epoch,
+        checkpoint_extra=checkpoint_extra,
+        save_vertex_pos_every=args.save_vertex_pos_every,
+        vertex_pos_json_path=vertex_pos_json_path)
 
     # ── final outputs ────────────────────────────────────────────────────
     model.eval()
@@ -1828,6 +1846,12 @@ def run_adaptive(args):
                      os.path.join(result_dir, 'learned_sheet.ply'))
     utils.export_obj(verts_orig, faces,
                      os.path.join(result_dir, 'learned_sheet.obj'))
+    if args.save_vertex_pos_every > 0 and os.path.exists(vertex_pos_json_path):
+        utils.write_denormalized_vertex_positions_json(
+            normalized_json_path=vertex_pos_json_path,
+            denormalized_json_path=vertex_pos_denorm_json_path,
+            meta=meta,
+        )
 
     extra = dict(checkpoint_extra)
     extra.update({'history': history, 'pretrain_history': pretrain_history,
@@ -2065,6 +2089,9 @@ def main():
     adaptive_group.add_argument('--load_ckpt', type=str, default=None,
                                 help='[Adaptive] Resume topology+weights from an adaptive '
                                      'checkpoint (skips pretraining)')
+
+    adaptive_group.add_argument('--save_vertex_pos_every', type=int, default=10,
+                            help='[Adaptive] Save tracked logical vertex positions every N epochs (0 disables)')
 
     # Tangent (μ-weighted) energy schedule
     tangent_group = parser.add_argument_group('tangent energy schedule (--adaptive)')

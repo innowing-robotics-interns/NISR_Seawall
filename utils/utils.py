@@ -17,6 +17,7 @@ import matplotlib.gridspec as gridspec
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib import cm
 from sklearn.neighbors import NearestNeighbors
+import trimesh
 
 try:
     import open3d as o3d
@@ -692,6 +693,185 @@ def unnormalize_vertices(verts, meta):
     scale = meta['scale']    # scalar
     verts_original = verts * scale + center
     return verts_original
+
+
+def _to_serializable_float_list(values):
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    return [float(x) for x in arr.tolist()]
+
+
+def _vertex_tracker_empty_payload():
+    return {
+        'format_version': 1,
+        'vertex_name_map': {},
+        'vertices': {},
+    }
+
+
+def _load_vertex_tracker_payload(json_path):
+    if os.path.exists(json_path):
+        with open(json_path, 'r') as f:
+            payload = json.load(f)
+        payload.setdefault('format_version', 1)
+        payload.setdefault('vertex_name_map', {})
+        payload.setdefault('vertices', {})
+        return payload
+    return _vertex_tracker_empty_payload()
+
+
+def _save_vertex_tracker_payload(json_path, payload):
+    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+    with open(json_path, 'w') as f:
+        json.dump(payload, f, indent=2)
+
+
+@torch.no_grad()
+def extract_adaptive_vertex_global_positions(model):
+    """
+    Extract current adaptive logical vertices by sampling leaf corner UVs.
+
+    Returns:
+        Dict[int, np.ndarray]: logical vertex id -> normalized xyz position.
+    """
+    model.eval()
+    complex_obj = model.complex
+    device = next(model.parameters()).device
+
+    corner_uv = torch.tensor(
+        [[0.0, 0.0],
+         [1.0, 0.0],
+         [1.0, 1.0],
+         [0.0, 1.0]],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    vertex_positions = {}
+    for leaf_idx, patch in enumerate(complex_obj.leaf_patches):
+        xyz = model(
+            torch.full((4,), leaf_idx, dtype=torch.long, device=device),
+            corner_uv,
+        ).detach().cpu().numpy()
+        for corner_idx, vertex_id in enumerate(patch.corner_ids):
+            vertex_positions.setdefault(int(vertex_id), xyz[corner_idx].astype(np.float64))
+
+    return vertex_positions
+
+
+def append_vertex_positions_json(json_path, epoch, vertex_positions, meta=None):
+    """
+    Append normalized or denormalized vertex positions to a single JSON file.
+
+    Args:
+        json_path: Output JSON path.
+        epoch: Current epoch.
+        vertex_positions: Dict[vertex_id, xyz].
+        meta: Optional normalization metadata. If provided, stores both
+            normalized and denormalized positions in each record.
+    """
+    payload = _load_vertex_tracker_payload(json_path)
+    name_map = payload['vertex_name_map']
+    vertices = payload['vertices']
+
+    next_index = len(name_map) + 1
+    for vertex_id in sorted(vertex_positions.keys()):
+        key = str(int(vertex_id))
+        if key not in name_map:
+            name_map[key] = f'v{next_index}'
+            next_index += 1
+
+        vertex_name = name_map[key]
+        vertices.setdefault(vertex_name, [])
+
+        pos_norm = np.asarray(vertex_positions[vertex_id], dtype=np.float64).reshape(3)
+        record = {
+            'epoch': int(epoch),
+            'position_normalized': _to_serializable_float_list(pos_norm),
+        }
+        if meta is not None:
+            pos_denorm = unnormalize_vertices(pos_norm.reshape(1, 3), meta)[0]
+            record['position_denormalized'] = _to_serializable_float_list(pos_denorm)
+
+        vertex_records = vertices[vertex_name]
+        if vertex_records and int(vertex_records[-1].get('epoch', -1)) == int(epoch):
+            vertex_records[-1] = record
+        else:
+            vertex_records.append(record)
+
+    _save_vertex_tracker_payload(json_path, payload)
+
+
+def write_denormalized_vertex_positions_json(normalized_json_path, denormalized_json_path, meta):
+    """Create a denormalized-only JSON file from the normalized tracking JSON."""
+    payload = _load_vertex_tracker_payload(normalized_json_path)
+    out_payload = {
+        'format_version': payload.get('format_version', 1),
+        'vertex_name_map': dict(payload.get('vertex_name_map', {})),
+        'vertices': {},
+    }
+
+    for vertex_name, records in payload.get('vertices', {}).items():
+        out_records = []
+        for record in records:
+            pos_norm = np.asarray(record['position_normalized'], dtype=np.float64).reshape(1, 3)
+            pos_denorm = unnormalize_vertices(pos_norm, meta)[0]
+            out_records.append({
+                'epoch': int(record['epoch']),
+                'position': _to_serializable_float_list(pos_denorm),
+            })
+        out_payload['vertices'][vertex_name] = out_records
+
+    _save_vertex_tracker_payload(denormalized_json_path, out_payload)
+
+
+def export_vertex_trajectories_ply(json_path, vertex_names, output_path, position_key='position', line_radius=5.0):
+    """
+    Export requested vertex trajectories as tube meshes in a single PLY.
+
+    Args:
+        json_path: Tracking JSON path.
+        vertex_names: Iterable of names like ['v1', 'v2'].
+        output_path: Output PLY path.
+        position_key: Either 'position', 'position_normalized', or 'position_denormalized'.
+        line_radius: Tube radius used for the exported line mesh.
+    """
+    payload = _load_vertex_tracker_payload(json_path)
+    meshes = []
+    colors = [
+        [255, 0, 0, 255],
+        [0, 255, 0, 255],
+        [0, 0, 255, 255],
+        [255, 255, 0, 255],
+        [255, 0, 255, 255],
+        [0, 255, 255, 255],
+    ]
+
+    for idx, vertex_name in enumerate(vertex_names):
+        records = payload.get('vertices', {}).get(vertex_name)
+        if not records or len(records) < 2:
+            continue
+
+        points = np.asarray([rec[position_key] for rec in records if position_key in rec], dtype=np.float64)
+        if points.shape[0] < 2:
+            continue
+
+        color = np.asarray(colors[idx % len(colors)], dtype=np.uint8)
+        for start, end in zip(points[:-1], points[1:]):
+            seg = np.asarray(end) - np.asarray(start)
+            seg_len = float(np.linalg.norm(seg))
+            if seg_len <= 1e-12:
+                continue
+            cyl = trimesh.creation.cylinder(radius=float(line_radius), segment=np.vstack([start, end]), sections=16)
+            cyl.visual.vertex_colors = np.tile(color, (len(cyl.vertices), 1))
+            meshes.append(cyl)
+
+    if not meshes:
+        raise ValueError(f'No plottable trajectories found in {json_path} for vertices: {vertex_names}')
+
+    combined = trimesh.util.concatenate(meshes)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    combined.export(output_path)
+    print(f"    Vertex trajectory PLY → {output_path}")
 
 
 def export_obj(verts, faces, path):
