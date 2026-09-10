@@ -1549,10 +1549,21 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    distortion_samples, max_splits_per_round,
                    device, log_every, vis_dir, checkpoint_every,
                    checkpoint_extra=None,
-                   tangent_mode='symmetric_dirichlet', sym_dirichlet_epoch=0):
+                   tangent_mode='symmetric_dirichlet', sym_dirichlet_epoch=0,
+                      ddf_mu_decay: float = 0.5,
+                      ddf_start_epoch: int = 0,
+                      chamfer_resume_epoch: int = 0,
+                      ddf_n_reference_points: int = 20000,
+                      ddf_k_neighbors: int = 5,
+                      ddf_sigma: float = 0.05,
+                      ddf_beta: float = 0.0,
+                      ddf_resample_every: int = 500,
+                      ddf_chunk_size: int = 2048,
+                      ddf_ref_points=None,
+                      ddf_ref_gt=None,):
     pts_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
     opt, sched = _adaptive_make_optim(model, lr, epochs)
-    history = {'epoch': [], 'cd': [], 'tangent': [], 'svd': [],
+    history = {'epoch': [], 'cd': [], 'ddf': [],'tangent': [], 'svd': [],
                'total': [], 'n_leaves': [], 'tangent_mode': []}
     events = []
     zero = torch.tensor(0.0, device=device)
@@ -1617,7 +1628,36 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
 
         B = min(K * M_per_patch, pts_dev.shape[0])
         ridx = torch.randint(0, pts_dev.shape[0], (B,), device=device)
+
+        # Surface Constraint: Chamfer distance between the predicted surface and the target point cloud.
         cd_loss = chamfer_distance_chunked(Q, pts_dev[ridx], chunk_size=2048)
+
+        # Surface Constraint: Directional Distance Field (DDF) loss
+        if ddf_ref_points is None:
+            ddf_ref_points = sample_ddf_reference_points(
+                pts_dev, sigma=ddf_sigma, n_points=ddf_n_reference_points
+            )
+            with torch.no_grad():
+                ddf_ref_gt = directional_distance_field(
+                    ddf_ref_points, pts_dev,
+                    k=ddf_k_neighbors, chunk_size=ddf_chunk_size
+                )
+
+        ddf_loss = directional_distance_loss(
+            Q,
+            ddf_ref_points,
+            ddf_ref_gt,
+            k=ddf_k_neighbors,
+            beta=ddf_beta,
+            chunk_size=ddf_chunk_size,
+        )
+
+        if epochs < 5000:
+            surface_loss = cd_loss
+        else: 
+            surface_loss = ddf_loss
+
+        surface_loss = cd_loss
 
         mu_eff = mu_warmup_schedule(epoch, mu_warmup_epochs, mu,
                                     schedule=schedule,
@@ -1647,7 +1687,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                      eps=svd_eps, normalize_patch_scale=False)
                 if (svd_eff > 0 and t_u is not None) else zero)
 
-        loss = cd_loss + mu_eff * tangent + svd_eff * svd_loss
+        loss = surface_loss + mu_eff * tangent + svd_eff * svd_loss
         opt.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(list(model.parameters()), 1.0)
@@ -1657,6 +1697,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         if epoch % log_every == 0 or epoch == 1:
             history['epoch'].append(epoch)
             history['cd'].append(float(cd_loss))
+            history['ddf'].append(float(ddf_loss))
             history['tangent'].append(float(tangent))
             history['svd'].append(float(svd_loss))
             history['total'].append(float(loss))
@@ -1993,7 +2034,7 @@ def main():
                           help='[DDF] Optional epoch at which to stop using DDF and switch back to Chamfer '
                               'for the rest of training (0 disables the switch-back). Useful when DDF gets '
                               'the surface close enough but later Chamfer is less constrained by the tangent loss.')
-    ddf_group.add_argument('--ddf_mu_decay', type=float, default=0.5,
+    ddf_group.add_argument('--ddf_mu_decay', type=float, default=1,
                            help='[DDF] Multiplier applied to tangent-loss weight μ once training switches '
                                 'from Chamfer to DDF (e.g. 0.5 halves μ during the DDF phase)')
     ddf_group.add_argument('--ddf_n_reference_points', type=int, default=25000,
