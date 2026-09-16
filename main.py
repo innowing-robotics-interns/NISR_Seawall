@@ -1317,7 +1317,7 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
 
         if mu_eff > 0:
             t_u, t_v = surface_jacobian(Q_flat, uv_flat)
-            tangent_loss = tangent_loss_from_jac(None, None, t_u, t_v)
+            tangent_loss = tangent_loss_from_jac(None, None, t_u, t_v, 'dirichlet')
         else:
             tangent_loss = zero
 
@@ -1427,7 +1427,7 @@ ADAPTIVE_DEFAULTS = {
     'N': 100000,
     'mesh_res': 40,
     'log_every': 100,
-    'checkpoint_every': 500,
+    'checkpoint_every': 100,
     'epochs': 1000,
     'W': 512,
     'mu': 1.0,
@@ -1500,11 +1500,12 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    subdiv_start, subdiv_stop, distortion_mode,
                    distortion_samples, max_splits_per_round,
                    device, log_every, vis_dir, checkpoint_every,
-                   checkpoint_extra=None):
+                   checkpoint_extra=None,
+                   tangent_mode='symmetric_dirichlet', sym_dirichlet_epoch=0):
     pts_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
     opt, sched = _adaptive_make_optim(model, lr, epochs)
     history = {'epoch': [], 'cd': [], 'tangent': [], 'svd': [],
-               'total': [], 'n_leaves': []}
+               'total': [], 'n_leaves': [], 'tangent_mode': []}
     events = []
     zero = torch.tensor(0.0, device=device)
     need_jac = (mu > 0) or (lam_svd > 0)
@@ -1515,6 +1516,12 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     print(f"  subdiv: threshold={subdiv_threshold}  max_depth={subdiv_max_depth}  "
           f"every={subdiv_every}  start={subdiv_start}  mode={distortion_mode}")
     print(f"  epochs={epochs}  M_per_patch={M_per_patch}  lr={lr}  μ={mu}")
+    if mu > 0:
+        if sym_dirichlet_epoch > 0 and tangent_mode != 'symmetric_dirichlet':
+            print(f"  Tangent energy: {tangent_mode} for epochs 1-{sym_dirichlet_epoch - 1}, "
+                  f"then symmetric_dirichlet from epoch {sym_dirichlet_epoch}")
+        else:
+            print(f"  Tangent energy: {tangent_mode} for the whole run")
     if lam_svd > 0:
         print(f"  SVD loss: λ_svd={lam_svd}  mode={svd_mode}"
               + (f"  target={svd_target}" if svd_mode == 'arap' else "")
@@ -1573,12 +1580,19 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         else:
             t_u = t_v = None
 
+        # Tangent energy schedule: start with `tangent_mode`, switch to the
+        # symmetric Dirichlet energy once `sym_dirichlet_epoch` is reached.
+        use_sym = sym_dirichlet_epoch > 0 and epoch >= sym_dirichlet_epoch
+        tangent_mode_eff = 'symmetric_dirichlet' if use_sym else tangent_mode
+        if use_sym and epoch == sym_dirichlet_epoch and tangent_mode != 'symmetric_dirichlet':
+            print(f"  [tangent @ {epoch}] switching {tangent_mode} → symmetric_dirichlet")
+
         tangent = (tangent_loss_from_jac(model=model, pids=pids, t_u=t_u, t_v=t_v,
-                    mode='dirichlet')
+                    mode=tangent_mode_eff)
                if (mu_eff > 0 and t_u is not None) else zero)
         svd_loss = (tangent_loss_from_jac(model=model, pids=pids, t_u=t_u, t_v=t_v,
                      mode=svd_mode, target=svd_target,
-                     eps=svd_eps, normalize_patch_scale=True)
+                     eps=svd_eps, normalize_patch_scale=False)
                 if (svd_eff > 0 and t_u is not None) else zero)
 
         loss = cd_loss + mu_eff * tangent + svd_eff * svd_loss
@@ -1595,8 +1609,10 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             history['svd'].append(float(svd_loss))
             history['total'].append(float(loss))
             history['n_leaves'].append(model.n_patches)
+            history['tangent_mode'].append(tangent_mode_eff)
+            tangent_tag = 'SymDir' if tangent_mode_eff == 'symmetric_dirichlet' else 'Tangent'
             print(f"  Epoch {epoch:5d}/{epochs}  |  CD={float(cd_loss):.5f}  "
-                  f"Tangent={float(tangent):.5f}  SVD={float(svd_loss):.5f}  "
+                  f"{tangent_tag}={float(tangent):.5f}  SVD={float(svd_loss):.5f}  "
                   f"Total={float(loss):.5f}  μ_eff={float(mu_eff):.3f}  "
                   f"λsvd_eff={float(svd_eff):.3f}  leaves={model.n_patches}  "
                   f"[{time.time() - t0:.1f}s]")
@@ -1696,7 +1712,9 @@ def run_adaptive(args):
         max_splits_per_round=args.max_splits_per_round,
         device=args.device, log_every=args.log_every, vis_dir=result_dir,
         checkpoint_every=args.checkpoint_every,
-        checkpoint_extra=checkpoint_extra)
+        checkpoint_extra=checkpoint_extra,
+        tangent_mode=args.tangent_mode,
+        sym_dirichlet_epoch=args.sym_dirichlet_epoch)
 
     # ── final outputs ────────────────────────────────────────────────────
     model.eval()
@@ -1955,6 +1973,17 @@ def main():
                                 help='[Adaptive] Resume topology+weights from an adaptive '
                                      'checkpoint (skips pretraining)')
 
+    # Tangent (μ-weighted) energy schedule
+    tangent_group = parser.add_argument_group('tangent energy schedule (--adaptive)')
+    tangent_group.add_argument('--tangent_mode', type=str, default='dirichlet',
+                               choices=['dirichlet', 'symmetric_dirichlet'],
+                               help='[Adaptive] Energy used for the μ-weighted tangent term '
+                                    'from epoch 1 (default: dirichlet)')
+    tangent_group.add_argument('--sym_dirichlet_epoch', type=int, default=0,
+                               help='[Adaptive] Epoch from which the tangent term switches to '
+                                    'the symmetric Dirichlet energy (0 = never switch; '
+                                    'use --tangent_mode symmetric_dirichlet for the whole run)')
+
     # SVD (singular-value) Jacobian regularization
     svd_group = parser.add_argument_group('SVD tangent regularization (--adaptive)')
     svd_group.add_argument('--lam_svd', type=float, default=0.0,
@@ -1982,7 +2011,7 @@ def main():
     subdiv_group.add_argument('--subdiv_start', type=int, default=1000)
     subdiv_group.add_argument('--subdiv_stop', type=int, default=0, help='0 = never stop')
     subdiv_group.add_argument('--distortion_mode', type=str, default='area',
-                              choices=['area', 'dirichlet', 'conformal'])
+                              choices=['area', 'dirichlet', 'conformal', 'symmetric_dirichlet'],)
     subdiv_group.add_argument('--distortion_samples', type=int, default=128)
     subdiv_group.add_argument('--max_splits_per_round', type=int, default=0,
                               help='Cap leaves split per check (0 = unlimited)')

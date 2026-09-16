@@ -326,7 +326,7 @@ def directional_distance_loss(pred_points: torch.Tensor, ref_points: torch.Tenso
     return d.mean()
 
 
-def surface_jacobian(Q, uv):
+def surface_jacobian(Q, uv, create_graph=True):
     """
     Compute tangent vectors with autograd.
 
@@ -337,9 +337,9 @@ def surface_jacobian(Q, uv):
         Tuple `(t_u, t_v)`.
     """
     ones = torch.ones_like(Q[:, 0])
-    gx = torch.autograd.grad(Q[:, 0], uv, ones, create_graph=True)[0]
-    gy = torch.autograd.grad(Q[:, 1], uv, ones, create_graph=True)[0]
-    gz = torch.autograd.grad(Q[:, 2], uv, ones, create_graph=True)[0]
+    gx = torch.autograd.grad(Q[:, 0], uv, ones, create_graph=create_graph)[0]
+    gy = torch.autograd.grad(Q[:, 1], uv, ones, create_graph=create_graph)[0]
+    gz = torch.autograd.grad(Q[:, 2], uv, ones, create_graph=create_graph)[0]
     t_u = torch.stack([gx[:, 0], gy[:, 0], gz[:, 0]], dim=-1)
     t_v = torch.stack([gx[:, 1], gy[:, 1], gz[:, 1]], dim=-1)
     return t_u, t_v
@@ -350,11 +350,11 @@ def tangent_loss_from_jac(model=None,
                  t_u: torch.Tensor = None,
                  t_v: torch.Tensor = None,
                  mode: str = 'dirichlet',
-                 eps: float = 1e-4,
-                 scale_invariant: bool = True,
                  patch_sizes: torch.Tensor = None,
                  normalize_patch_scale: bool = False,
-                 target: float = 1.0) -> torch.Tensor:
+                 target: float = 1,
+                 det_eps: float = 1e-12,
+                 eps: float = 1e-8) -> torch.Tensor:
     """
     Compute Jacobian-based tangent regularization with optional scale normalization.
     """
@@ -388,11 +388,33 @@ def tangent_loss_from_jac(model=None,
         s_mean = S.mean(dim=-1, keepdim=True).detach()
         energy = ((S - s_mean) ** 2).sum(dim=-1).mean()
     elif mode == 'conformal':
-        energy = (S[:, 0] - S[:, 1]).pow(2).mean()
+        ## (s1-s2)^2 == (E+G) - 2*sqrt(EG-F^2), from the first fundamental form
+        FFF = torch.matmul(J.transpose(1, 2), J)          # (N, 2, 2)
+        E_, G_, F_ = FFF[:, 0, 0], FFF[:, 1, 1], FFF[:, 0, 1]
+        det_fff = (E_ * G_ - F_ * F_).clamp_min(det_eps)
+        energy = ((E_ + G_) - 2.0 * det_fff.sqrt()).mean()
     elif mode == 'collapse':
         energy = torch.zeros((), device=J.device, dtype=J.dtype)
     elif mode == 'dirichlet':
         energy = 1.0*torch.mean(0.5*torch.sum(J ** 2, dim=1))
+    elif mode == 'symmetric_dirichlet':
+        # -log(det(J^T J)) + tr(J^T J), per singular value
+        
+        # Sc is used to prevent the singular value from being too small, which can cause numerical instability in the log operation.
+        # Sc = S.clamp_min(log_eps)
+        # energy = (Sc.pow(2) - 2.0 * torch.log(Sc)).sum(dim=-1).mean()
+
+        # Keeps the safe, minimum-energy state perfectly at the specified target value.
+        k = target
+        
+        # Scale the singular values by our target parameter
+        S_scaled = S / k
+        
+        # Guard against numerical instability for values close to zero before taking log
+        Sc = S_scaled.clamp_min(eps)
+        
+        # Sum up the trace component (Sc^2) and the barrier component (-2 * log(Sc))
+        energy = (Sc.pow(2) - 2.0 * torch.log(Sc)).sum(dim=-1).mean()
     else:
         raise ValueError(f"unknown tangent mode: {mode}")
 

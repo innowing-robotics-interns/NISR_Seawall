@@ -34,10 +34,16 @@ def compute_patch_distortion(model, samples_per_patch: int = 128,
         E = (t_u * t_u).sum(-1)
         G = (t_v * t_v).sum(-1)
         Fd = (t_u * t_v).sum(-1)
+
+        tr_sigma  = E + G                                          # s1^2 + s2^2
+        det_sigma = torch.linalg.cross(t_u, t_v, dim=-1).pow(2).sum(-1)
         if mode == 'area':
             e = torch.sqrt(torch.clamp(E * G - Fd ** 2, min=0.0))
         elif mode == 'dirichlet':
             e = 0.5 * (E + G)
+        elif mode == 'symmetric_dirichlet':
+            # -log(det(J^T J)) + tr(J^T J), per singular value
+            e = tr_sigma - torch.log(det_sigma.clamp_min(1e-12))
         elif mode == 'conformal':
             e = ((E - G) ** 2 + 4.0 * Fd ** 2) / ((E + G) ** 2 + 1e-12)
         else:
