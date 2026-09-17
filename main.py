@@ -1436,11 +1436,59 @@ ADAPTIVE_DEFAULTS = {
 }
 
 
-def _adaptive_make_optim(model, lr, epochs_left):
+def _adaptive_make_optim(model, lr, epochs_left, prev_opt=None,
+                         prev_vertex_features=None):
+    """Build Adam + cosine schedule. When `prev_opt` is given (rebuild after a
+    subdivision round) the Adam moments are carried over, see
+    `_transfer_adam_state`."""
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=max(epochs_left, 1), eta_min=1e-6)
+    if prev_opt is not None:
+        _transfer_adam_state(prev_opt, opt, model, prev_vertex_features)
     return opt, sched
+
+
+@torch.no_grad()
+def _transfer_adam_state(old_opt, new_opt, model, old_vf):
+    """Carry Adam's per-parameter moments across a subdivision round.
+
+    A fresh Adam takes `lr * sign(grad)` as its first step for EVERY parameter
+    (empty moments → m̂/√v̂ = ±1), which kicks the whole already-converged
+    surface and costs ~100 epochs to recover. Parameters that survive the
+    round (the MLP) are the same tensor objects, so their state is reused
+    as-is. `vertex_features` is replaced by a longer Parameter: its old rows
+    get their moments back and the appended rows start with zero first
+    moment and the mean second moment of the old rows, so they take a
+    normally-sized step instead of a full `lr` one.
+    """
+    new_vf = model.complex.vertex_features
+    for group in new_opt.param_groups:
+        for p in group['params']:
+            if p is new_vf:
+                continue
+            st = old_opt.state.get(p)
+            if st:
+                new_opt.state[p] = st
+
+    st = old_opt.state.get(old_vf)
+    if not st:
+        return
+    if old_vf is new_vf:
+        new_opt.state[new_vf] = st
+        return
+
+    n_old, n_new = old_vf.shape[0], new_vf.shape[0]
+    new_st = {}
+    for key, val in st.items():
+        if torch.is_tensor(val) and val.dim() == 2 and val.shape[0] == n_old:
+            pad = val.mean(dim=0, keepdim=True).expand(n_new - n_old, -1)
+            if key == 'exp_avg':
+                pad = torch.zeros_like(pad)
+            new_st[key] = torch.cat([val, pad.to(val)], dim=0).contiguous()
+        else:
+            new_st[key] = val          # 'step' and any scalar bookkeeping
+    new_opt.state[new_vf] = new_st
 
 
 def _adaptive_save_ckpt(model, path, extra=None):
@@ -1537,6 +1585,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                     and (subdiv_stop <= 0 or epoch <= subdiv_stop)
                     and epoch % subdiv_every == 0)
         if do_check:
+            old_vf = model.complex.vertex_features
             rep = subdivide_by_distortion(
                 model, subdiv_threshold, subdiv_max_depth,
                 samples_per_patch=distortion_samples, mode=distortion_mode,
@@ -1545,9 +1594,12 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                   f"mean={rep['mean_distortion']:.4f}  split={rep['n_subdivided']} "
                   f"→ leaves={rep['n_leaves']} vertices={rep['n_vertices']}")
             if rep['n_subdivided'] > 0:
-                # vertex_features was replaced → fresh optimizer/scheduler.
+                # vertex_features was replaced → rebuild optimizer/scheduler,
+                # carrying the Adam moments over so the surface isn't kicked.
                 cur_lr = opt.param_groups[0]['lr']
-                opt, sched = _adaptive_make_optim(model, cur_lr, epochs - epoch + 1)
+                opt, sched = _adaptive_make_optim(model, cur_lr, epochs - epoch + 1,
+                                                  prev_opt=opt,
+                                                  prev_vertex_features=old_vf)
                 events.append({'epoch': epoch,
                                'n_subdivided': rep['n_subdivided'],
                                'n_leaves': rep['n_leaves']})
