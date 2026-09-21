@@ -23,7 +23,7 @@ from model.losses import (chamfer_distance, chamfer_distance_chunked, directiona
                                 directional_distance_loss,
                                 sample_ddf_reference_points,
                                 mu_warmup_schedule,
-                                normal_consistency_loss,
+                                normal_constraint_loss,
                                 outer_boundary_rectangle_loss,
                                 sample_outer_boundary_correspondence,
                                              surface_jacobian,
@@ -1433,6 +1433,7 @@ ADAPTIVE_DEFAULTS = {
     'mu': 1.0,
     'M_per_patch': 128,
     'pretrain_loss': 'mse',
+    'gamma': 0.05,
 }
 
 
@@ -1549,14 +1550,21 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    distortion_samples, max_splits_per_round,
                    device, log_every, vis_dir, checkpoint_every,
                    checkpoint_extra=None,
-                   tangent_mode='symmetric_dirichlet', sym_dirichlet_epoch=0):
+                   tangent_mode='symmetric_dirichlet', sym_dirichlet_epoch=0,
+                   normals=None, gamma=0.0,
+                   gamma_warmup_epochs=0, gamma_warmup_delay=0,
+                   normal_unsigned=False):
     pts_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
+    # Normal consistency runs only when the input actually carried normals.
+    use_normal = gamma > 0 and normals is not None
+    nrm_dev = (torch.tensor(normals, dtype=torch.float32, device=device)
+               if use_normal else None)
     opt, sched = _adaptive_make_optim(model, lr, epochs)
-    history = {'epoch': [], 'cd': [], 'tangent': [], 'svd': [],
+    history = {'epoch': [], 'cd': [], 'tangent': [], 'svd': [], 'normal': [],
                'total': [], 'n_leaves': [], 'tangent_mode': []}
     events = []
     zero = torch.tensor(0.0, device=device)
-    need_jac = (mu > 0) or (lam_svd > 0)
+    need_jac = (mu > 0) or (lam_svd > 0) or use_normal
 
     print(f"\n{'─' * 60}")
     print("  Phase 2 — adaptive training with distortion-driven subdivision")
@@ -1574,6 +1582,12 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         print(f"  SVD loss: λ_svd={lam_svd}  mode={svd_mode}"
               + (f"  target={svd_target}" if svd_mode == 'arap' else "")
               + f"  eps={svd_eps}  (depth-normalized singular values)")
+    if use_normal:
+        print(f"  Normal loss: γ={gamma}  {'unsigned (1-|cos|)' if normal_unsigned else 'signed (1-cos)'}"
+              + (f"  delay={gamma_warmup_delay} warmup={gamma_warmup_epochs}"
+                 if (gamma_warmup_delay > 0 or gamma_warmup_epochs > 0) else ""))
+    elif gamma > 0:
+        print(f"  Normal loss: OFF (γ={gamma} requested but the input has no normals)")
     print(f"{'─' * 60}")
     t0 = time.time()
     model.train()
@@ -1617,7 +1631,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
 
         B = min(K * M_per_patch, pts_dev.shape[0])
         ridx = torch.randint(0, pts_dev.shape[0], (B,), device=device)
-        cd_loss = chamfer_distance_chunked(Q, pts_dev[ridx], chunk_size=2048)
+        tgt = pts_dev[ridx]
+        cd_loss = chamfer_distance_chunked(Q, tgt, chunk_size=2048)
 
         mu_eff = mu_warmup_schedule(epoch, mu_warmup_epochs, mu,
                                     schedule=schedule,
@@ -1625,9 +1640,12 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         svd_eff = mu_warmup_schedule(epoch, svd_warmup_epochs, lam_svd,
                                      schedule=schedule,
                                      delay_epochs=svd_warmup_delay) if lam_svd > 0 else 0.0
+        gamma_eff = mu_warmup_schedule(epoch, gamma_warmup_epochs, gamma,
+                                       schedule=schedule,
+                                       delay_epochs=gamma_warmup_delay) if use_normal else 0.0
 
-        # One Jacobian, shared by both regularizers.
-        if need_jac and (mu_eff > 0 or svd_eff > 0):
+        # One Jacobian, shared by all Jacobian-based terms.
+        if need_jac and (mu_eff > 0 or svd_eff > 0 or gamma_eff > 0):
             t_u, t_v = surface_jacobian(Q, uv)
         else:
             t_u = t_v = None
@@ -1646,8 +1664,13 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                      mode=svd_mode, target=svd_target,
                      eps=svd_eps, normalize_patch_scale=False)
                 if (svd_eff > 0 and t_u is not None) else zero)
+             
+        # normal constraint against the target nearest point normal in the same batch
+        normal_loss = (normal_constraint_loss(t_u, t_v, Q, tgt, nrm_dev[ridx],
+                                                   unsigned=False)
+                       if (gamma_eff > 0 and t_u is not None) else zero)
 
-        loss = cd_loss + mu_eff * tangent + svd_eff * svd_loss
+        loss = cd_loss + mu_eff * tangent + svd_eff * svd_loss + gamma_eff * normal_loss
         opt.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(list(model.parameters()), 1.0)
@@ -1659,12 +1682,16 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             history['cd'].append(float(cd_loss))
             history['tangent'].append(float(tangent))
             history['svd'].append(float(svd_loss))
+            history['normal'].append(float(normal_loss))
             history['total'].append(float(loss))
             history['n_leaves'].append(model.n_patches)
             history['tangent_mode'].append(tangent_mode_eff)
             tangent_tag = 'SymDir' if tangent_mode_eff == 'symmetric_dirichlet' else 'Tangent'
+            normal_str = (f"Normal={float(normal_loss):.5f}  γ_eff={float(gamma_eff):.3f}  "
+                          if use_normal else "")
             print(f"  Epoch {epoch:5d}/{epochs}  |  CD={float(cd_loss):.5f}  "
                   f"{tangent_tag}={float(tangent):.5f}  SVD={float(svd_loss):.5f}  "
+                  f"{normal_str}"
                   f"Total={float(loss):.5f}  μ_eff={float(mu_eff):.3f}  "
                   f"λsvd_eff={float(svd_eff):.3f}  leaves={model.n_patches}  "
                   f"[{time.time() - t0:.1f}s]")
@@ -1736,6 +1763,22 @@ def run_adaptive(args):
         pts3n, meta = utils.make_synthetic_surface(args.shape, n=args.N, noise=0)
         input_name = f'synthetic_{args.shape}'
 
+    # check whether or not the file contains normals
+    normals = meta.get('normals') if args.file else None
+    if args.gamma > 0:
+        if normals is None:
+            print(f"  Normal consistency: DISABLED — {input_name} carries no normals "
+                  f"(γ={args.gamma} ignored)")
+        elif normals.shape != pts3n.shape:
+            raise RuntimeError(
+                f"Normals shape {normals.shape} != points shape {pts3n.shape}")
+        else:
+            print(f"  Normal consistency: ENABLED (γ={args.gamma}, "
+                  f"{normals.shape[0]} normals from file, "
+                  f"{'unsigned' if args.normal_unsigned else 'signed'})")
+    else:
+        normals = None
+
     checkpoint_extra = {
         'args': vars(args),
         'input_file': input_name,
@@ -1766,7 +1809,11 @@ def run_adaptive(args):
         checkpoint_every=args.checkpoint_every,
         checkpoint_extra=checkpoint_extra,
         tangent_mode=args.tangent_mode,
-        sym_dirichlet_epoch=args.sym_dirichlet_epoch)
+        sym_dirichlet_epoch=args.sym_dirichlet_epoch,
+        normals=normals, gamma=args.gamma,
+        gamma_warmup_epochs=args.gamma_warmup_epochs,
+        gamma_warmup_delay=args.gamma_warmup_delay,
+        normal_unsigned=args.normal_unsigned)
 
     # ── final outputs ────────────────────────────────────────────────────
     model.eval()
@@ -2035,6 +2082,18 @@ def main():
                                help='[Adaptive] Epoch from which the tangent term switches to '
                                     'the symmetric Dirichlet energy (0 = never switch; '
                                     'use --tangent_mode symmetric_dirichlet for the whole run)')
+
+    # Normal consistency (γ-weighted); --gamma itself is a shared option above.
+    normal_group = parser.add_argument_group('normal consistency (--adaptive)')
+    normal_group.add_argument('--gamma_warmup_epochs', type=int, default=0,
+                              help='[Adaptive] Ramp γ from 0 to --gamma over this many '
+                                   'epochs (0 = full weight immediately)')
+    normal_group.add_argument('--gamma_warmup_delay', type=int, default=0,
+                              help='[Adaptive] Keep γ at 0 for this many epochs before the ramp')
+    normal_group.add_argument('--normal_unsigned', action='store_true',
+                              help='[Adaptive] Use 1-|cos| so the loss ignores whether the '
+                                   'file normals point inward or outward (the atlas normal '
+                                   't_u x t_v is outward after box pretraining)')
 
     # SVD (singular-value) Jacobian regularization
     svd_group = parser.add_argument_group('SVD tangent regularization (--adaptive)')

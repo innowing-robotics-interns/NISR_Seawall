@@ -420,17 +420,27 @@ def tangent_loss_from_jac(model=None,
 
     return energy
 
-def normal_consistency_loss(Q, uv, P_data, N_data):
+def normal_constraint_loss(t_u: torch.Tensor, t_v: torch.Tensor,
+                                Q: torch.Tensor, P_data: torch.Tensor,
+                                N_data: torch.Tensor,
+                                unsigned: bool = False,
+                                chunk_size: int = 2048) -> torch.Tensor:
     """
-    Compute single-patch normal consistency loss.
+    Compute the mean cosine distance between the surface normals of the predicted surface and the normals of the nearest points in the target point cloud.
+    
+    unsigned means that the loss will be computed using the absolute value of the cosine similarity and ignoring the direction of the normals.
     """
-    t_u, t_v = surface_jacobian(Q, uv)
     n_surf = torch.cross(t_u, t_v, dim=-1)
     n_surf = n_surf / (n_surf.norm(dim=-1, keepdim=True) + 1e-8)
 
-    D = torch.cdist(Q, P_data)
-    nn_idx = D.argmin(dim=1)
+    with torch.no_grad():
+        nn_idx = torch.cat([
+            torch.cdist(Q[i:i + chunk_size], P_data).argmin(dim=1)
+            for i in range(0, Q.shape[0], chunk_size)
+        ])
     n_target = N_data[nn_idx]
 
     cos = torch.sum(n_surf * n_target, dim=-1)
+    if unsigned:
+        cos = cos.abs()
     return (1.0 - cos).mean()
