@@ -824,7 +824,49 @@ def write_denormalized_vertex_positions_json(normalized_json_path, denormalized_
     _save_vertex_tracker_payload(denormalized_json_path, out_payload)
 
 
-def export_vertex_trajectories_ply(json_path, vertex_names, output_path, position_key='position', line_radius=5.0):
+def _sample_colormap_rgba(values, cmap_name='turbo'):
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        return np.zeros((0, 4), dtype=np.uint8)
+    values = np.clip(values, 0.0, 1.0)
+    if hasattr(matplotlib, 'colormaps'):
+        cmap_obj = matplotlib.colormaps.get_cmap(cmap_name)
+    elif hasattr(plt, 'get_cmap'):
+        cmap_obj = plt.get_cmap(cmap_name)
+    else:
+        cmap_obj = cm.get_cmap(cmap_name)
+    rgba = cmap_obj(values)
+    rgba_uint8 = np.clip(np.round(rgba * 255.0), 0, 255).astype(np.uint8)
+    return rgba_uint8
+
+
+def _trajectory_color_values(records, color_mode='epoch'):
+    if len(records) <= 1:
+        return np.zeros((len(records),), dtype=np.float64)
+
+    if color_mode == 'epoch':
+        epochs = np.asarray([float(rec.get('epoch', idx)) for idx, rec in enumerate(records)], dtype=np.float64)
+        denom = epochs[-1] - epochs[0]
+        if abs(denom) < 1e-12:
+            return np.linspace(0.0, 1.0, len(records), dtype=np.float64)
+        return (epochs - epochs[0]) / denom
+
+    if color_mode == 'arc_length':
+        points = np.asarray([rec['_point'] for rec in records], dtype=np.float64)
+        if points.shape[0] <= 1:
+            return np.zeros((points.shape[0],), dtype=np.float64)
+        seg_lengths = np.linalg.norm(points[1:] - points[:-1], axis=1)
+        cumulative = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+        total = cumulative[-1]
+        if total < 1e-12:
+            return np.linspace(0.0, 1.0, len(records), dtype=np.float64)
+        return cumulative / total
+
+    raise ValueError(f'Unknown color_mode: {color_mode}')
+
+
+def export_vertex_trajectories_ply(json_path, vertex_names, output_path, position_key='position', line_radius=5.0,
+                                   color_mode='epoch', colormap='turbo'):
     """
     Export requested vertex trajectories as tube meshes in a single PLY.
 
@@ -834,35 +876,48 @@ def export_vertex_trajectories_ply(json_path, vertex_names, output_path, positio
         output_path: Output PLY path.
         position_key: Either 'position', 'position_normalized', or 'position_denormalized'.
         line_radius: Tube radius used for the exported line mesh.
+        color_mode: 'epoch' or 'arc_length'.
+        colormap: Matplotlib colormap name.
     """
     payload = _load_vertex_tracker_payload(json_path)
     meshes = []
-    colors = [
-        [255, 0, 0, 255],
-        [0, 255, 0, 255],
-        [0, 0, 255, 255],
-        [255, 255, 0, 255],
-        [255, 0, 255, 255],
-        [0, 255, 255, 255],
-    ]
 
-    for idx, vertex_name in enumerate(vertex_names):
+    for vertex_name in vertex_names:
         records = payload.get('vertices', {}).get(vertex_name)
         if not records or len(records) < 2:
             continue
 
-        points = np.asarray([rec[position_key] for rec in records if position_key in rec], dtype=np.float64)
+        filtered_records = []
+        for rec in records:
+            if position_key not in rec:
+                continue
+            rec_copy = dict(rec)
+            rec_copy['_point'] = np.asarray(rec[position_key], dtype=np.float64)
+            filtered_records.append(rec_copy)
+
+        points = np.asarray([rec['_point'] for rec in filtered_records], dtype=np.float64)
         if points.shape[0] < 2:
             continue
 
-        color = np.asarray(colors[idx % len(colors)], dtype=np.uint8)
-        for start, end in zip(points[:-1], points[1:]):
+        color_values = _trajectory_color_values(filtered_records, color_mode=color_mode)
+        colors_rgba = _sample_colormap_rgba(color_values, cmap_name=colormap)
+
+        for seg_idx, (start, end) in enumerate(zip(points[:-1], points[1:])):
             seg = np.asarray(end) - np.asarray(start)
             seg_len = float(np.linalg.norm(seg))
             if seg_len <= 1e-12:
                 continue
             cyl = trimesh.creation.cylinder(radius=float(line_radius), segment=np.vstack([start, end]), sections=16)
-            cyl.visual.vertex_colors = np.tile(color, (len(cyl.vertices), 1))
+            color_start = colors_rgba[seg_idx]
+            color_end = colors_rgba[seg_idx + 1]
+            axis = end - start
+            axis_norm_sq = float(np.dot(axis, axis))
+            if axis_norm_sq < 1e-12:
+                t = np.zeros((len(cyl.vertices), 1), dtype=np.float64)
+            else:
+                t = np.clip((((cyl.vertices - start) @ axis) / axis_norm_sq).reshape(-1, 1), 0.0, 1.0)
+            blended = np.round((1.0 - t) * color_start.reshape(1, 4) + t * color_end.reshape(1, 4)).astype(np.uint8)
+            cyl.visual.vertex_colors = blended
             meshes.append(cyl)
 
     if not meshes:

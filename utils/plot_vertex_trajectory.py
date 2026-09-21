@@ -27,6 +27,11 @@ def main():
     parser.add_argument('--position_key', type=str, default='position',
                         choices=['position', 'position_normalized', 'position_denormalized'],
                         help='Which position field to read from the JSON file')
+    parser.add_argument('--color_mode', type=str, default='epoch',
+                        choices=['epoch', 'arc_length'],
+                        help='Color progression mode: by epoch or by cumulative traveled distance')
+    parser.add_argument('--colormap', type=str, default='turbo',
+                        help='Matplotlib colormap name used for the spectrum coloring')
     args = parser.parse_args()
 
     json_path = os.path.abspath(args.json)
@@ -47,6 +52,8 @@ def main():
         output_path=output_path,
         position_key=args.position_key,
         line_radius=args.line_radius,
+        color_mode=args.color_mode,
+        colormap=args.colormap,
     )
 
 
