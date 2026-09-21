@@ -1551,16 +1551,29 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    device, log_every, vis_dir, checkpoint_every,
                    checkpoint_extra=None,
                    tangent_mode='symmetric_dirichlet', sym_dirichlet_epoch=0,
+                    save_vertex_pos_every: int = 0,
+                   vertex_pos_json_path: str = None,
+                   ddf_mu_decay: float = 0.5,
+                   ddf_start_epoch: int = 0,
+                   chamfer_resume_epoch: int = 0,
+                   ddf_n_reference_points: int = 20000,
+                   ddf_k_neighbors: int = 5,
+                   ddf_sigma: float = 0.05,
+                   ddf_beta: float = 0.0,
+                   ddf_resample_every: int = 500,
+                   ddf_chunk_size: int = 2048,
+                   ddf_ref_points=None,
+                   ddf_ref_gt=None,
                    normals=None, gamma=0.0,
                    gamma_warmup_epochs=0, gamma_warmup_delay=0,
-                   normal_unsigned=False):
+                   normal_unsigned=False,):
     pts_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
     # Normal consistency runs only when the input actually carried normals.
     use_normal = gamma > 0 and normals is not None
     nrm_dev = (torch.tensor(normals, dtype=torch.float32, device=device)
                if use_normal else None)
     opt, sched = _adaptive_make_optim(model, lr, epochs)
-    history = {'epoch': [], 'cd': [], 'tangent': [], 'svd': [], 'normal': [],
+    history = {'epoch': [], 'cd': [], 'ddf': [],'tangent': [], 'svd': [], 'normal': [],
                'total': [], 'n_leaves': [], 'tangent_mode': []}
     events = []
     zero = torch.tensor(0.0, device=device)
@@ -1632,7 +1645,36 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         B = min(K * M_per_patch, pts_dev.shape[0])
         ridx = torch.randint(0, pts_dev.shape[0], (B,), device=device)
         tgt = pts_dev[ridx]
-        cd_loss = chamfer_distance_chunked(Q, tgt, chunk_size=2048)
+
+        # Surface Constraint: Chamfer distance between the predicted surface and the target point cloud.
+        cd_loss = chamfer_distance_chunked(Q, pts_dev[ridx], chunk_size=2048)
+
+        # Surface Constraint: Directional Distance Field (DDF) loss
+        if ddf_ref_points is None:
+            ddf_ref_points = sample_ddf_reference_points(
+                pts_dev, sigma=ddf_sigma, n_points=ddf_n_reference_points
+            )
+            with torch.no_grad():
+                ddf_ref_gt = directional_distance_field(
+                    ddf_ref_points, pts_dev,
+                    k=ddf_k_neighbors, chunk_size=ddf_chunk_size
+                )
+
+        ddf_loss = directional_distance_loss(
+            Q,
+            ddf_ref_points,
+            ddf_ref_gt,
+            k=ddf_k_neighbors,
+            beta=ddf_beta,
+            chunk_size=ddf_chunk_size,
+        )
+
+        if epochs < 5000:
+            surface_loss = cd_loss
+        else: 
+            surface_loss = ddf_loss
+
+        surface_loss = cd_loss
 
         mu_eff = mu_warmup_schedule(epoch, mu_warmup_epochs, mu,
                                     schedule=schedule,
@@ -1670,16 +1712,28 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                                                    unsigned=False)
                        if (gamma_eff > 0 and t_u is not None) else zero)
 
-        loss = cd_loss + mu_eff * tangent + svd_eff * svd_loss + gamma_eff * normal_loss
+        loss = surface_loss + mu_eff * tangent + svd_eff * svd_loss + gamma_eff * normal_loss
         opt.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(list(model.parameters()), 1.0)
         opt.step()
         sched.step()
 
+        if save_vertex_pos_every > 0 and vertex_pos_json_path and (
+            epoch % save_vertex_pos_every == 0 or epoch == epochs
+        ):
+            vertex_positions = utils.extract_adaptive_vertex_global_positions(model)
+            utils.append_vertex_positions_json(
+                json_path=vertex_pos_json_path,
+                epoch=epoch,
+                vertex_positions=vertex_positions,
+                meta=None,
+            )
+
         if epoch % log_every == 0 or epoch == 1:
             history['epoch'].append(epoch)
             history['cd'].append(float(cd_loss))
+            history['ddf'].append(float(ddf_loss))
             history['tangent'].append(float(tangent))
             history['svd'].append(float(svd_loss))
             history['normal'].append(float(normal_loss))
@@ -1788,6 +1842,8 @@ def run_adaptive(args):
             'scale': float(meta['scale']),
         },
     }
+    vertex_pos_json_path = os.path.join(result_dir, 'vertex_positions_normalized.json')
+    vertex_pos_denorm_json_path = os.path.join(result_dir, 'vertex_positions_denormalized.json')
 
     # ── phase 2: adaptive training ───────────────────────────────────────
     history, events = train_adaptive(
@@ -1810,6 +1866,9 @@ def run_adaptive(args):
         checkpoint_extra=checkpoint_extra,
         tangent_mode=args.tangent_mode,
         sym_dirichlet_epoch=args.sym_dirichlet_epoch,
+        checkpoint_extra=checkpoint_extra,
+        save_vertex_pos_every=args.save_vertex_pos_every,
+        vertex_pos_json_path=vertex_pos_json_path,
         normals=normals, gamma=args.gamma,
         gamma_warmup_epochs=args.gamma_warmup_epochs,
         gamma_warmup_delay=args.gamma_warmup_delay,
@@ -1834,6 +1893,12 @@ def run_adaptive(args):
                      os.path.join(result_dir, 'learned_sheet.ply'))
     utils.export_obj(verts_orig, faces,
                      os.path.join(result_dir, 'learned_sheet.obj'))
+    if args.save_vertex_pos_every > 0 and os.path.exists(vertex_pos_json_path):
+        utils.write_denormalized_vertex_positions_json(
+            normalized_json_path=vertex_pos_json_path,
+            denormalized_json_path=vertex_pos_denorm_json_path,
+            meta=meta,
+        )
 
     extra = dict(checkpoint_extra)
     extra.update({'history': history, 'pretrain_history': pretrain_history,
@@ -2040,7 +2105,7 @@ def main():
                           help='[DDF] Optional epoch at which to stop using DDF and switch back to Chamfer '
                               'for the rest of training (0 disables the switch-back). Useful when DDF gets '
                               'the surface close enough but later Chamfer is less constrained by the tangent loss.')
-    ddf_group.add_argument('--ddf_mu_decay', type=float, default=0.5,
+    ddf_group.add_argument('--ddf_mu_decay', type=float, default=1,
                            help='[DDF] Multiplier applied to tangent-loss weight μ once training switches '
                                 'from Chamfer to DDF (e.g. 0.5 halves μ during the DDF phase)')
     ddf_group.add_argument('--ddf_n_reference_points', type=int, default=25000,
@@ -2071,6 +2136,9 @@ def main():
     adaptive_group.add_argument('--load_ckpt', type=str, default=None,
                                 help='[Adaptive] Resume topology+weights from an adaptive '
                                      'checkpoint (skips pretraining)')
+
+    adaptive_group.add_argument('--save_vertex_pos_every', type=int, default=10,
+                            help='[Adaptive] Save tracked logical vertex positions every N epochs (0 disables)')
 
     # Tangent (μ-weighted) energy schedule
     tangent_group = parser.add_argument_group('tangent energy schedule (--adaptive)')
