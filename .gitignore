@@ -6,6 +6,8 @@ utils/3dModel_to_PC.py
 utils/mask.sh
 run_oneSeq.sh
 run_sequence.sh
+utils/intersect.sh
+3d_input_models/*
 **/__pycache__/
 inputmodels/*
 demo/*

@@ -128,7 +128,7 @@ def plot_history(history, out_path):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
     ep = history['epoch']
     for key, color in (('cd', '#58a6ff'), ('tangent', '#d2a8ff'),
-                       ('svd', '#e3b341'),
+                       ('svd', '#e3b341'), ('normal', '#f778ba'),
                        ('total', '#f78166'), ('loss', '#3fb950')):
         if key in history and len(history[key]) == len(ep):
             ax1.plot(ep, history[key], lw=1.6, color=color, label=key)

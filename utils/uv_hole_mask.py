@@ -104,35 +104,6 @@ def median_nn_spacing(points: np.ndarray, tree: cKDTree,
     dists, _ = tree.query(probe, k=2, workers=-1)
     return float(np.median(dists[:, 1]))
 
-# Not used. Use auto instead
-def otsu_threshold(values: np.ndarray, n_bins: int = 512) -> float:
-    """
-    Otsu's between-class-variance threshold, for splitting a bimodal histogram.
-
-    Applied to log10(distance) by the caller: the raw distance distribution is
-    far too skewed (a huge spike near zero) for Otsu to split sensibly, while in
-    log space the "on surface" and "in empty space" modes are comparable in width.
-    """
-    hist, edges = np.histogram(values, bins=n_bins)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-
-    total = hist.sum()
-    if total == 0:
-        return float(centers[-1])
-
-    p = hist.astype(np.float64) / total
-    omega = np.cumsum(p)                      # class-0 weight
-    mu = np.cumsum(p * centers)               # class-0 cumulative mean
-    mu_total = mu[-1]
-
-    denom = omega * (1.0 - omega)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        sigma_b = (mu_total * omega - mu) ** 2 / denom
-    sigma_b[~np.isfinite(sigma_b)] = -1.0
-
-    return float(centers[int(np.argmax(sigma_b))])
-
-
 def black_fraction(distances: np.ndarray, tau: float,
                    weights: np.ndarray = None) -> float:
     """
@@ -149,10 +120,14 @@ def black_fraction(distances: np.ndarray, tau: float,
     return float(np.sum(weights * over) / np.sum(weights))
 
 
-def resolve_threshold(mode: str, distances: np.ndarray, d_nn: float,
-                      nn_scale: float) -> tuple:
+def resolve_threshold(mode: str, d_nn: float, nn_scale: float) -> tuple:
     """
     Turn the --threshold argument into a concrete value.
+
+    Both modes are calibrated against the TARGET cloud, never against the
+    model's own distances: a threshold derived from the predictions would move
+    with the fitting error, so it could neither be compared across checkpoints
+    nor report honestly that a closed shape has no hole at all.
 
     Returns:
         Tuple `(tau, description)`.
@@ -161,16 +136,11 @@ def resolve_threshold(mode: str, distances: np.ndarray, d_nn: float,
         tau = nn_scale * d_nn
         return tau, f"auto = {nn_scale} x median_nn({d_nn:.6f})"
 
-    if mode == 'otsu':
-        safe = np.maximum(distances, 1e-9)
-        tau = float(10.0 ** otsu_threshold(np.log10(safe)))
-        return tau, f"otsu on log10(d) = {tau / d_nn:.2f} x median_nn"
-
     try:
         tau = float(mode)
     except ValueError:
         raise ValueError(
-            f"--threshold must be 'auto', 'otsu', or a float in normalized units, got {mode!r}")
+            f"--threshold must be 'auto' or a float in normalized units, got {mode!r}")
     if tau <= 0:
         raise ValueError(f"--threshold must be positive, got {tau}")
     return tau, f"explicit = {tau / d_nn:.2f} x median_nn"
@@ -581,8 +551,8 @@ def main():
     parser.add_argument('--resolution', type=int, default=256,
                         help='UV grid resolution per patch (per side)')
     parser.add_argument('--threshold', type=str, default='auto',
-                        help="'auto' (nn_scale x median NN spacing), 'otsu', or "
-                             'an explicit float in NORMALIZED units')
+                        help="'auto' (nn_scale x the target cloud's median NN spacing) "
+                             'or an explicit float in NORMALIZED units')
     parser.add_argument('--nn_scale', type=float, default=5.0,
                         help="Multiplier on the cloud's median NN spacing for --threshold auto")
     parser.add_argument('--target_max_points', type=int, default=-1,
@@ -710,7 +680,7 @@ def main():
     weights = all_w if is_adaptive else None
 
     # threshold
-    tau, tau_desc = resolve_threshold(args.threshold, all_d, d_nn, args.nn_scale)
+    tau, tau_desc = resolve_threshold(args.threshold, d_nn, args.nn_scale)
 
     print(f"\n{'─' * 64}")
     print(f"  Threshold tau = {tau:.6f}   [{tau_desc}]")
