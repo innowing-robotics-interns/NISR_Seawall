@@ -24,6 +24,7 @@ from model.losses import (chamfer_distance, chamfer_distance_chunked, directiona
                                 sample_ddf_reference_points,
                                 mu_warmup_schedule,
                                 normal_constraint_loss,
+                                chunked_argmin_nn,
                                 outer_boundary_rectangle_loss,
                                 sample_outer_boundary_correspondence,
                                              surface_jacobian,
@@ -33,6 +34,7 @@ from model.model import (MultiPatchForwardMap, MultiPatchInverseMap, TwoSheetFor
 from model.correspondence import build_hard_correspondence
 from model.subdivision import subdivide_by_distortion, check_seam_continuity
 from utils.adaptive_vis import visualize_patch_configuration, plot_history
+from scipy.spatial import cKDTree
 try:
     import open3d as o3d
 except ImportError:
@@ -1566,14 +1568,23 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    ddf_ref_gt=None,
                    normals=None, gamma=0.0,
                    gamma_warmup_epochs=0, gamma_warmup_delay=0,
-                   normal_unsigned=False,):
+                   normal_unsigned=False, normal_nn='kdtree',
+                   normal_w_fwd=0.1, normal_w_bwd=1.0):
     pts_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
     # Normal consistency runs only when the input actually carried normals.
     use_normal = gamma > 0 and normals is not None
     nrm_dev = (torch.tensor(normals, dtype=torch.float32, device=device)
                if use_normal else None)
+               
+    # kdtree: exact nearest neighbour in the full cloud via a CPU KD-tree
+    # built once. batch is the nearest neighbour within the
+    # step's random target batch, same pool as the Chamfer term uses.
+    if normal_nn not in ('kdtree', 'batch'):
+        raise ValueError(f"normal_nn must be 'kdtree' or 'batch', got {normal_nn!r}")
+    nrm_tree = cKDTree(pts3n) if (use_normal and normal_nn == 'kdtree') else None
     opt, sched = _adaptive_make_optim(model, lr, epochs)
     history = {'epoch': [], 'cd': [], 'ddf': [],'tangent': [], 'svd': [], 'normal': [],
+               'normal_fwd': [], 'normal_bwd': [],
                'total': [], 'n_leaves': [], 'tangent_mode': []}
     events = []
     zero = torch.tensor(0.0, device=device)
@@ -1598,9 +1609,32 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     if use_normal:
         print(f"  Normal loss: γ={gamma}  {'unsigned (1-|cos|)' if normal_unsigned else 'signed (1-cos)'}"
               + (f"  delay={gamma_warmup_delay} warmup={gamma_warmup_epochs}"
-                 if (gamma_warmup_delay > 0 or gamma_warmup_epochs > 0) else ""))
+                 if (gamma_warmup_delay > 0 or gamma_warmup_epochs > 0) else "")
+              + (f"  NN=KD-tree over full cloud ({pts3n.shape[0]} pts)"
+                 if nrm_tree is not None else "  NN=within target batch")
+              + f"  weights: fwd(pred→tgt)={normal_w_fwd} bwd(tgt→pred)={normal_w_bwd}")
     elif gamma > 0:
         print(f"  Normal loss: OFF (γ={gamma} requested but the input has no normals)")
+
+    ### Stop subdivision after normal loss activates (Currently not used)
+    # if use_normal and subdiv_threshold > 0 and subdiv_every > 0:
+    #     # The normal loss freezes the quadtree from its first active epoch
+    #     # (gamma_warmup_delay + 1). Subdivision only gets a chance if at least
+    #     # one check epoch falls before that.
+    #     first_active = gamma_warmup_delay + 1
+    #     last_check = subdiv_stop if subdiv_stop > 0 else epochs
+    #     checks_before = [e for e in range(subdiv_start, min(last_check, first_active - 1) + 1)
+    #                      if e % subdiv_every == 0]
+    #     if checks_before:
+    #         print(f"  Subdivision: {len(checks_before)} check(s) at epochs "
+    #               f"{checks_before[0]}..{checks_before[-1]}, then frozen when the "
+    #               f"normal loss activates at epoch {first_active}")
+    #     else:
+    #         print(f"  [warn] Normal loss activates at epoch {first_active} but the first "
+    #               f"subdivision check is at epoch {subdiv_start} → subdivision will "
+    #               f"NEVER run. Set --gamma_warmup_delay >= the last subdivision epoch "
+    #               f"you want (e.g. --gamma_warmup_delay {subdiv_start}).")
+
     print(f"{'─' * 60}")
     t0 = time.time()
     model.train()
@@ -1707,10 +1741,29 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                      eps=svd_eps, normalize_patch_scale=False)
                 if (svd_eff > 0 and t_u is not None) else zero)
              
-        # normal constraint against the target nearest point normal in the same batch
-        normal_loss = (normal_constraint_loss(t_u, t_v, Q, tgt, nrm_dev[ridx],
-                                                   unsigned=False)
-                       if (gamma_eff > 0 and t_u is not None) else zero)
+        if gamma_eff > 0 and t_u is not None:
+            if nrm_tree is not None:
+                Q_np = Q.detach().cpu().numpy()
+                _, fwd_np = nrm_tree.query(Q_np, k=1, workers=-1)
+                nn_fwd = torch.as_tensor(fwd_np, dtype=torch.long, device=device)
+                if normal_w_bwd > 0:
+                    _, bwd_np = cKDTree(Q_np).query(pts3n, k=1, workers=-1)
+                    nn_bwd = torch.as_tensor(bwd_np, dtype=torch.long, device=device)
+                else:
+                    nn_bwd = None
+                normal_loss, normal_fwd, normal_bwd = normal_constraint_loss(
+                    t_u, t_v, nrm_dev, nn_fwd, nrm_dev, nn_bwd,
+                    w_fwd=normal_w_fwd, w_bwd=normal_w_bwd, unsigned=normal_unsigned)
+            else:
+                # same target subset the Chamfer term used.
+                nrm_batch = nrm_dev[ridx]
+                nn_fwd = chunked_argmin_nn(Q, tgt)
+                nn_bwd = chunked_argmin_nn(tgt, Q) if normal_w_bwd > 0 else None
+                normal_loss, normal_fwd, normal_bwd = normal_constraint_loss(
+                    t_u, t_v, nrm_batch, nn_fwd, nrm_batch, nn_bwd,
+                    w_fwd=normal_w_fwd, w_bwd=normal_w_bwd, unsigned=normal_unsigned)
+        else:
+            normal_loss = normal_fwd = normal_bwd = zero
 
         loss = surface_loss + mu_eff * tangent + svd_eff * svd_loss + gamma_eff * normal_loss
         opt.zero_grad()
@@ -1737,11 +1790,15 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             history['tangent'].append(float(tangent))
             history['svd'].append(float(svd_loss))
             history['normal'].append(float(normal_loss))
+            history['normal_fwd'].append(float(normal_fwd))
+            history['normal_bwd'].append(float(normal_bwd))
             history['total'].append(float(loss))
             history['n_leaves'].append(model.n_patches)
             history['tangent_mode'].append(tangent_mode_eff)
             tangent_tag = 'SymDir' if tangent_mode_eff == 'symmetric_dirichlet' else 'Tangent'
-            normal_str = (f"Normal={float(normal_loss):.5f}  γ_eff={float(gamma_eff):.3f}  "
+            normal_str = (f"Normal={float(normal_loss):.5f} "
+                          f"(f{float(normal_fwd):.3f}/b{float(normal_bwd):.3f})  "
+                          f"γ_eff={float(gamma_eff):.3f}  "
                           if use_normal else "")
             print(f"  Epoch {epoch:5d}/{epochs}  |  CD={float(cd_loss):.5f}  "
                   f"{tangent_tag}={float(tangent):.5f}  SVD={float(svd_loss):.5f}  "
@@ -1866,13 +1923,15 @@ def run_adaptive(args):
         checkpoint_extra=checkpoint_extra,
         tangent_mode=args.tangent_mode,
         sym_dirichlet_epoch=args.sym_dirichlet_epoch,
-        checkpoint_extra=checkpoint_extra,
         save_vertex_pos_every=args.save_vertex_pos_every,
         vertex_pos_json_path=vertex_pos_json_path,
         normals=normals, gamma=args.gamma,
         gamma_warmup_epochs=args.gamma_warmup_epochs,
         gamma_warmup_delay=args.gamma_warmup_delay,
-        normal_unsigned=args.normal_unsigned)
+        normal_unsigned=args.normal_unsigned,
+        normal_nn=args.normal_nn,
+        normal_w_fwd=args.normal_w_fwd,
+        normal_w_bwd=args.normal_w_bwd)
 
     # ── final outputs ────────────────────────────────────────────────────
     model.eval()
@@ -2162,6 +2221,20 @@ def main():
                               help='[Adaptive] Use 1-|cos| so the loss ignores whether the '
                                    'file normals point inward or outward (the atlas normal '
                                    't_u x t_v is outward after box pretraining)')
+    normal_group.add_argument('--normal_nn', type=str, default='kdtree',
+                              choices=['kdtree', 'batch'],
+                              help="[Adaptive] Where each predicted point's matching normal "
+                                   "comes from: 'kdtree' (default) = exact nearest neighbour "
+                                   "in the FULL cloud via a CPU KD-tree built once; 'batch' = "
+                                   "nearest neighbour within the step's random target batch "
+                                   "(same pool as the Chamfer term)")
+    normal_group.add_argument('--normal_w_fwd', type=float, default=0.1,
+                              help='[Adaptive] Weight of the pred→target direction (each '
+                                   'predicted point vs. the normal of its nearest target point)')
+    normal_group.add_argument('--normal_w_bwd', type=float, default=1.0,
+                              help='[Adaptive] Weight of the target→pred direction (each target '
+                                   'point vs. the normal of its nearest predicted point). This is '
+                                   'the coverage term; 0 disables it.')
 
     # SVD (singular-value) Jacobian regularization
     svd_group = parser.add_argument_group('SVD tangent regularization (--adaptive)')

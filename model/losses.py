@@ -420,27 +420,42 @@ def tangent_loss_from_jac(model=None,
 
     return energy
 
+def chunked_argmin_nn(query: torch.Tensor, candidates: torch.Tensor,
+                      chunk_size: int = 2048) -> torch.Tensor:
+    """Index of each query's nearest candidate for birdirectional normal loss"""
+    with torch.no_grad():
+        return torch.cat([
+            torch.cdist(query[i:i + chunk_size], candidates).argmin(dim=1)
+            for i in range(0, query.shape[0], chunk_size)
+        ])
+
+
 def normal_constraint_loss(t_u: torch.Tensor, t_v: torch.Tensor,
-                                Q: torch.Tensor, P_data: torch.Tensor,
-                                N_data: torch.Tensor,
-                                unsigned: bool = False,
-                                chunk_size: int = 2048) -> torch.Tensor:
+                           N_fwd: torch.Tensor, nn_fwd: torch.Tensor,
+                           N_bwd: torch.Tensor = None, nn_bwd: torch.Tensor = None,
+                           w_fwd: float = 0.1, w_bwd: float = 1.0,
+                           unsigned: bool = False):
     """
-    Compute the mean cosine distance between the surface normals of the predicted surface and the normals of the nearest points in the target point cloud.
+    Normal constraint between the predicted surface and the target
+    normals, given precomputed nearest-neighbour correspondences
+
+    unsigned: use 1 - |cos| (does not conside normals' orientation)
+    """
     
-    unsigned means that the loss will be computed using the absolute value of the cosine similarity and ignoring the direction of the normals.
-    """
     n_surf = torch.cross(t_u, t_v, dim=-1)
     n_surf = n_surf / (n_surf.norm(dim=-1, keepdim=True) + 1e-8)
 
-    with torch.no_grad():
-        nn_idx = torch.cat([
-            torch.cdist(Q[i:i + chunk_size], P_data).argmin(dim=1)
-            for i in range(0, Q.shape[0], chunk_size)
-        ])
-    n_target = N_data[nn_idx]
-
-    cos = torch.sum(n_surf * n_target, dim=-1)
+    cos_fwd = torch.sum(n_surf * N_fwd[nn_fwd], dim=-1)
     if unsigned:
-        cos = cos.abs()
-    return (1.0 - cos).mean()
+        cos_fwd = cos_fwd.abs()
+    fwd = (1.0 - cos_fwd).mean()
+
+    if N_bwd is not None and nn_bwd is not None and w_bwd > 0:
+        cos_bwd = torch.sum(n_surf[nn_bwd] * N_bwd, dim=-1)
+        if unsigned:
+            cos_bwd = cos_bwd.abs()
+        bwd = (1.0 - cos_bwd).mean()
+    else:
+        bwd = torch.zeros((), device=fwd.device, dtype=fwd.dtype)
+
+    return w_fwd * fwd + w_bwd * bwd, fwd, bwd
