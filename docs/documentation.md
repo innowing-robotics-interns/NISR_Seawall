@@ -124,10 +124,15 @@ renumbers leaf indices; face coordinates never change.
    untouched cube complex, including across hanging vertices and cube edges,
    and the later steps rely on it.
 2. **Refine** (surface-preserving subdivision). `max_depth` caps the quadtree
-   depth, and `min_leaf_cells` keeps leaves at least that many cells of the
-   detection grid wide.
+   depth, and a floor keeps leaves at least a few cells of the detection grid
+   wide: `opening_min_leaf_cells` in `opening` mode, `min_leaf_cells` in
+   `crossing` mode.
    - `opening` mode (`refine_openings`): split the leaves an opening touches
      until at least `min_disk_leaves` leaves lie mostly (≥ 50 %) inside it.
+     How much of a leaf an opening covers (`opening_fraction`) is measured from
+     the opening's own detection-grid vertices, each placed in the leaf that
+     contains it. Sampling each leaf instead can miss an opening that is small
+     compared with its leaf (bug #5).
    - `crossing` mode (`refine_along_curves`): split the leaves `C` passes
      through until `C` touches `min_loop_leaves` leaves. Here `min_leaf_cells`
      also keeps leaves larger than the gaps the seam guard leaves in `C`
@@ -135,8 +140,7 @@ renumbers leaf indices; face coordinates never change.
 3. **Select what to remove**, once per opening.
 
    `opening` mode (`select_opening_disk`):
-   - take the leaves at least 50 % inside the opening (from 4×4 samples per
-     leaf);
+   - take the leaves at least 50 % covered by the opening;
    - keep the largest connected piece;
    - fill in any islands of other leaves it encloses, so there is one boundary
      loop.
@@ -285,8 +289,9 @@ script):
 | `min_disk_leaves` | 16 | [opening] refine until each opening covers this many leaves |
 | `min_loop_leaves` | 24 | [crossing] refine until `C` spans this many leaves |
 | `min_closedness` | 0.75 | [crossing] warn when `C` is less loop-like |
-| `max_refine_rounds`, `max_depth` | 4, 12 | refinement limits |
-| `min_leaf_cells` | 8 | leaf-size floor in mask-grid cells |
+| `max_refine_rounds`, `max_depth` | 8, 12 | refinement limits |
+| `opening_min_leaf_cells` | 2 | [opening] leaf-size floor, in mask-grid cells |
+| `min_leaf_cells` | 8 | [crossing] leaf-size floor, in mask-grid cells (above the seam-guard gaps) |
 | `cut_dilate` | 0 | [crossing] grow the ring to close gaps |
 | `allow_non_disk` | off | keep going when a removed region is not a disk |
 | `tube_columns` | 0 (auto) | N |
@@ -426,6 +431,7 @@ Bugs found or reported, with their status. New reports are added here.
 | 2 | 2026-09-26 | found in review | `utils.load_point_cloud` sets `center = None; scale = None` right before using them, so the `center`/`scale` arguments are ignored. `uv_hole_mask.py` passes the checkpoint's normalization and silently gets a per-file one; with a different downsample the frame shifts slightly. `utils/cutting_hole.py` works around it by normalizing with the checkpoint's values itself. | open, not changed (the comment above it suggests it may be intended) |
 | 3 | 2026-09-26 | found in torus test | Cutting along the crossing curve failed ("ring does not enclose any leaf"). On a trained model the membranes cross only partway, so `C` is an open arc, and an arc can't bound a region. | fixed: added `opening` mode (remove whole openings, stitch rim to rim) and made it the default; `crossing` mode kept |
 | 4 | 2026-09-26 | found in torus test | The pair with the most crossings was a fold inside the torus body, not the hole. A closed-loop score (`loop_closedness`) couldn't tell them apart either (arc curves score 0.6–0.8). | fixed: pick the pair whose smaller opening has the largest 3D area; `--hole_openings` override |
+| 5 | 2026-09-26 | user (`run.sh`, rocker-arm.ply) | `opening` mode stopped with "opening 1: no leaf lies mostly inside it". After 5000 epochs the model had only 48 coarse leaves, and opening 1 was small. Coverage was measured with 4×4 samples per leaf, which fell between the opening's cells, so every leaf read 0 % and refinement never split the leaves around it. | fixed: coverage now comes from the opening's own grid vertices (`OpeningLookup.opening_points`); the leaf-size floor is 2 grid cells in `opening` mode (`opening_min_leaf_cells`, was the 8 meant for `crossing` mode); `max_refine_rounds` 4 → 8. Reproduced with a tiny opening in a coarse leaf (old measure: 0 leaves); now cut and stitched, genus 1. |
 
 ## 12. Future plan (to be implemented)
 

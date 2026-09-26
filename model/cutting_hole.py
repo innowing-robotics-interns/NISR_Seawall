@@ -53,9 +53,10 @@ class HoleConfig:
                                    # curve C (needs C to be a closed loop)
     min_disk_leaves: int = 16      # [opening] refine until each opening covers this many leaves
     min_loop_leaves: int = 24      # [crossing] refine until C spans this many leaves
-    max_refine_rounds: int = 4
+    max_refine_rounds: int = 8
     max_depth: int = 12
-    min_leaf_cells: float = 8.0    # leaf size floor, in mask-grid cells (> seam-guard gaps)
+    min_leaf_cells: float = 8.0    # [crossing] leaf size floor, in mask-grid cells (> seam-guard gaps)
+    opening_min_leaf_cells: float = 2.0  # [opening] leaf size floor, in mask-grid cells
     cut_dilate: int = 0
     allow_non_disk: bool = False
     # stitching
@@ -159,8 +160,18 @@ class OpeningLookup:
         self.opening_id = np.asarray(opening_id)
         self.R = int(self.opening_id.shape[-1])
         # Patches absent from the npz get no labels (-1 everywhere).
+        self.patch_ids = np.asarray(patch_ids, dtype=np.int64)
         self.row_of = np.full(rects.shape[0], -1, np.int64)
-        self.row_of[np.asarray(patch_ids, dtype=np.int64)] = np.arange(len(patch_ids))
+        self.row_of[self.patch_ids] = np.arange(len(patch_ids))
+
+    def opening_points(self, opening):
+        """Every detection-grid vertex labelled `opening`, as face coordinates,
+        plus the size of the (detection-time) leaf it belongs to."""
+        rows, i, j = np.nonzero(self.opening_id == opening)
+        leaf = self.patch_ids[rows]
+        r = self.rects[leaf]
+        ij = np.stack([i, j], axis=1).astype(np.float64) / (self.R - 1)
+        return self.faces[leaf], r[:, :2] + ij * r[:, 2:3], r[:, 2]
 
     def __call__(self, face, fuv):
         leaf = locate(self.rects, self.faces, face, fuv)
@@ -350,13 +361,22 @@ def select_inner_disk(cx, crossing_face, crossing_fuv, opening, lookup,
     return remove, info
 
 
-def opening_fraction(cx, opening, lookup, n=4):
-    """Per current leaf: fraction of its n x n interior samples labelled
-    `opening` in the detection-time openings grid."""
+def opening_fraction(cx, opening, lookup):
+    """
+    Per current leaf: fraction of its area covered by `opening`.
+
+    Built from the opening's own detection-grid vertices: each one is located
+    in the current leaf that contains it and stands for one grid cell of area.
+    Unlike sampling each leaf, this cannot miss an opening that is small
+    compared with the leaf it sits in.
+    """
     rects, faces = leaf_geometry(cx)
-    s_leaf, s_face, s_fuv = leaf_sample_points(rects, faces, n)
-    hit = (lookup(s_face, s_fuv) == opening).astype(np.float64)
-    return np.bincount(s_leaf, weights=hit, minlength=rects.shape[0]) / (n * n)
+    face, fuv, osize = lookup.opening_points(opening)
+    leaf = locate(rects, faces, face, fuv)
+    ok = leaf >= 0
+    cell = (osize[ok] / (lookup.R - 1)) ** 2
+    covered = np.bincount(leaf[ok], weights=cell, minlength=rects.shape[0])
+    return np.minimum(covered / rects[:, 2] ** 2, 1.0)
 
 
 def refine_openings(cx, openings, lookup, min_disk_leaves, max_rounds, max_depth,
@@ -424,8 +444,10 @@ def select_opening_disk(cx, opening, lookup):
     frac = opening_fraction(cx, opening, lookup)
     core = np.flatnonzero(frac >= 0.5)
     if core.size == 0:
-        raise RuntimeError(f"opening {opening}: no leaf lies mostly inside it; "
-                           f"refine more (hole_min_disk_leaves, hole_max_depth)")
+        raise RuntimeError(
+            f"opening {opening}: no leaf lies mostly inside it (the opening is "
+            f"only a few mask cells wide). Try a higher hole_resolution, a lower "
+            f"hole_opening_min_leaf_cells, or more hole_max_refine_rounds.")
     comps = _components(core.tolist(), nbr)
     disk = set(comps[0])
     rest = _components([i for i in range(L) if i not in disk], nbr)
@@ -705,7 +727,8 @@ def cut_hole(model, crossing, cfg: HoleConfig, verbose=True):
             print("    refining the openings")
         counts = refine_openings(cx, [s['opening'] for s in sides], lookup,
                                  cfg.min_disk_leaves, cfg.max_refine_rounds,
-                                 cfg.max_depth, cfg.min_leaf_cells, verbose=verbose)
+                                 cfg.max_depth, cfg.opening_min_leaf_cells,
+                                 verbose=verbose)
     elif cfg.cut_mode == 'crossing':
         if verbose:
             print("    refining along the crossing curve")
