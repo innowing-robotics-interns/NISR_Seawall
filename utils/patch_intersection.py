@@ -15,8 +15,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-import patch_vis
-from uv_hole_mask import sample_patch_uv_grid, write_colored_ply
+try:
+    from . import patch_vis
+    from .uv_hole_mask import sample_patch_uv_grid, write_colored_ply
+except ImportError:
+    import patch_vis
+    from uv_hole_mask import sample_patch_uv_grid, write_colored_ply
 
 from model.model import FACE_NAMES  # noqa: E402
 

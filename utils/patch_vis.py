@@ -30,8 +30,13 @@ import torch
 import trimesh
 from PIL import Image
 
-import pc_presegmentation as pc_presegmentation
-import utils as utils
+# Bare imports when run as a script from utils/; package-relative when imported
+# as utils.patch_vis (e.g. by main.py's hole cutting).
+try:
+    from . import pc_presegmentation, utils
+except ImportError:
+    import pc_presegmentation as pc_presegmentation
+    import utils as utils
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 for _root in (os.path.dirname(_HERE), _HERE, os.getcwd()):

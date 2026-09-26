@@ -18,10 +18,16 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Rectangle
 
-import patch_vis
-from uv_hole_mask import (adaptive_leaf_rects, composite_face_canvases,
-                          grid_faces, sample_patch_uv_grid, sheet_layout,
-                          write_colored_mesh_ply)
+try:
+    from . import patch_vis
+    from .uv_hole_mask import (adaptive_leaf_rects, composite_face_canvases,
+                               grid_faces, sample_patch_uv_grid, sheet_layout,
+                               write_colored_mesh_ply)
+except ImportError:
+    import patch_vis
+    from uv_hole_mask import (adaptive_leaf_rects, composite_face_canvases,
+                              grid_faces, sample_patch_uv_grid, sheet_layout,
+                              write_colored_mesh_ply)
 
 from model.model import FACE_NAMES  # noqa: E402
 

@@ -8,162 +8,47 @@
 # INPUT_FILE="data/${FILE}"
 # OUTPUT_DIR="logs/log_bestConfig/${FILE%.*}_D3_W512_M4096_d128_16Patches_bound1"
 
-FILE="max-planck.ply"
+FILE="rocker-arm.ply"
 INPUT_FILE="3d_test_models/${FILE}"
-OUTPUT_DIR="logs/adaptive/${FILE%.*}_CD_24Patches_M1100_6Atlas_5k_mu0.08_dirichlet_refP25k_ddfBeta0_ddfSigma0.05_lamDDF1_muDecay1_noCollapse"
+OUTPUT_DIR="logs/stitching/${FILE%.*}"
 
 
-# python main.py \
-#     --multi_patch \
-#     --pretrain_then_train \
-#     --result_dir ${OUTPUT_DIR} \
-#     --pretrain_epochs 2000 \
-#     --epochs 5000 \
-#     --n_patches 16 \
-#     --d_features 128 \
-#     --M_per_patch 4096 \
-#     --W 512 \
-#     --N 5000000 \
-#     --mesh_res 200 \
-#     --file ${INPUT_FILE} \
-#     --D 3 \
-#     --L 0 \
-#     --beta 100 \
-#     --mu 0.08 \
-#     --gamma 0 \
-#     --lambda_outer_boundary 1 \
-#     --lam 0 \
-#     --lam2 0 \
-#     --log_every 200 \
-#     --pretrain_loss l1 \
-#     --mu_warmup_epochs 1000 \
-#     --mu_warmup_delay 300 \
-#     --schedule cosine \
-#     --checkpoint_every  5000
-
-# python main.py \
-#     --multi_patch \
-#     --pretrain_then_train \
-#     --result_dir ${OUTPUT_DIR} \
-#     --shape sphere \
-#     --pretrain_epochs 2000 \
-#     --epochs 5000 \
-#     --n_patches 4 \
-#     --d_features 88 \
-#     --M_per_patch 4096 \
-#     --W 512 \
-#     --D 6 \
-#     --L 0 \
-#     --beta 100 \
-#     --mu 0.08 \
-#     --lambda_outer_boundary 0 \
-#     --gamma 0 \
-#     --lam 0 \
-#     --lam2 0 \
-#     --log_every 100 \
-#     --pretrain_loss l1 \
-#     --mu_warmup_epochs 1000 \
-#     --mu_warmup_delay 300 \
-#     --schedule cosine \
-#     --checkpoint_every  5000\
-
-# Initialize the model as a sphere 
-# If using 4x4 atlas then 2 sheets (32 Patches), set M_per_patch to 1100
-# If using 3x3 atlas then 2 sheets (18 Patches), set M_per_patch to 2000
-# if using 2x2 atlas then 2 sheets (8 Patches), set M_per_patch to 4096
-# python main.py \
-#     --multi_patch \
-#     --atlas_mode two_sheet \
-#     --file ${INPUT_FILE} \
-#     --result_dir ${OUTPUT_DIR} \
-#     --shape sphere \
-#     --epochs 5000 \
-#     --d_features 88 \
-#     --M_per_patch 2000 \
-#     --W 512 \
-#     --D 6 \
-#     --L 0 \
-#     --beta 100 \
-#     --mu 0.08 \
-#     --gamma 0 \
-#     --lam 0 \
-#     --lam2 0 \
-#     --lambda_outer_boundary 0 \
-#     --log_every 100 \
-#     --mu_warmup_epochs 1000 \
-#     --mu_warmup_delay 300 \
-#     --schedule cosine \
-#     --N 5000 \
-#     --checkpoint_every 5000 \
-#     --two_sheet_side_rows 3 \
-#     --two_sheet_side_cols 3 \
-#     --two_sheet_split_axis 2 \
-#     --two_sheet_side_axes 0 1 \
-#     --pretrain_then_train \
-#     --pretrain_epochs 2000 \
-#     --pretrain_shape sphere \
-#     --pretrain_mode closed_shape \
-#     --no_presplit \
-#     --correspondence_line_segment q_to_t \
-
-
-# initialize the model as a box
-# 2x2 patches per sheet, 6 sheets (24 patches), M = 1500
-# 3x3 patches per sheet, 6 sheets (54 patches), M = 700
+# Adaptive cube atlas + hole cutting/stitching (docs/documentation.md).
+# Phase 1: box pretraining. Phase 2: --epochs of training. Then detect the
+# crossing membranes, cut both openings, stitch a tube (genus +1), and train
+# again for --hole_epochs with a fresh optimizer / LR / mu warmup.
 python main.py \
-    --multi_patch \
-    --atlas_mode six_sheet \
+    --adaptive \
     --file ${INPUT_FILE} \
     --result_dir ${OUTPUT_DIR} \
+    --N 100000 \
+    --pretrain_epochs 1000 \
     --epochs 5000 \
+    --base_subdivisions 1 \
     --d_features 88 \
-    --M_per_patch 500 \
+    --M_per_patch 128 \
     --W 512 \
     --D 6 \
     --L 0 \
     --beta 100 \
     --mu 0.08 \
-    --gamma 0 \
-    --lam 0 \
-    --lam2 0 \
-    --lambda_outer_boundary 0 \
-    --log_every 100 \
     --mu_warmup_epochs 1000 \
     --mu_warmup_delay 300 \
     --schedule cosine \
-    --N 100000 \
+    --gamma 0 \
+    --log_every 100 \
     --checkpoint_every 1000 \
-    --six_sheet_face_rows 2 \
-    --six_sheet_face_cols 2 \
-    --face_aware_box_supervision \
-    --pretrain_then_train \
-    --pretrain_epochs 1000 \
-    --pretrain_shape box \
-    --pretrain_mode closed_shape \
-    --no_presplit \
-    --correspondence_line_segment q_to_t \
-    --corr_switch_epoch 0 \
-    --save_boundary_debug 0 \
-    --save_correspondence_every 5000 \
-    --surface_loss_type chamfer \
-    --ddf_start_epoch 0 \
-    --ddf_sigma 0.05 \
-    --ddf_mu_decay 1 \
-    --chamfer_resume_epoch 0 \
-    --lambda_chamfer 1 \
-    --lambda_ddf 1 \
+    --cut_hole \
+    --hole_epochs 5000 \
+    --hole_resolution 128 \
+    --hole_tube_rows 4
+    # --hole_openings 0,3      # force the opening pair if the auto choice is wrong
+    # --hole_cut_mode crossing # cut along the crossing curve instead (needs a closed loop)
 
-
-
-# python utils/patch_vis.py \
-#     --ckpt ${OUTPUT_DIR}/checkpoint_100_before_subdivision.pt \
-#     --out_dir ${OUTPUT_DIR} \
-#     --n_images 1 \
-#     --subdivision_depth "-1" \
-#     # --input_file ${INPUT_FILE} \
-
+# checkpoint.pt = final model after the hole phase
+# (checkpoint_before_hole.pt = genus-0 model, checkpoint_hole_<epoch>.pt = hole phase)
 python utils/patch_vis.py \
-    --ckpt ${OUTPUT_DIR}/checkpoint_5000.pt \
+    --ckpt ${OUTPUT_DIR}/checkpoint.pt \
     --out_dir ${OUTPUT_DIR} \
     --n_images 4 \
     --subdivision_depth "-1" \

@@ -41,8 +41,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
-import patch_vis
-import utils as utils
+try:
+    from . import patch_vis, utils
+except ImportError:
+    import patch_vis
+    import utils as utils
 
 # patch_vis puts the repo root on sys.path so `model` is importable.
 from model.model import FACE_NAMES  # noqa: E402

@@ -32,6 +32,7 @@ from model.model import (MultiPatchForwardMap, MultiPatchInverseMap, TwoSheetFor
                          AdaptiveCubeForwardMap)
 from model.correspondence import build_hard_correspondence
 from model.subdivision import subdivide_by_distortion, check_seam_continuity
+from model.cutting_hole import add_hole_args
 from utils.adaptive_vis import visualize_patch_configuration, plot_history
 try:
     import open3d as o3d
@@ -1566,7 +1567,12 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    ddf_ref_gt=None,
                    normals=None, gamma=0.0,
                    gamma_warmup_epochs=0, gamma_warmup_delay=0,
-                   normal_unsigned=False,):
+                   normal_unsigned=False,
+                   tag: str = ''):
+    """Phase-2 training loop. Every call builds a FRESH optimizer, cosine LR
+    schedule and μ/γ/SVD warmup (all driven by the local epoch counter), so
+    calling it again after hole cutting restarts all of them. `tag` prefixes
+    the checkpoint and patch-config file names of this call."""
     pts_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
     # Normal consistency runs only when the input actually carried normals.
     use_normal = gamma > 0 and normals is not None
@@ -1580,7 +1586,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     need_jac = (mu > 0) or (lam_svd > 0) or use_normal
 
     print(f"\n{'─' * 60}")
-    print("  Phase 2 — adaptive training with distortion-driven subdivision")
+    print("  Phase 2 — adaptive training with distortion-driven subdivision"
+          + (f"  [{tag.rstrip('_')}]" if tag else ""))
     print(f"  leaves={model.n_patches}  target points={pts3n.shape[0]}")
     print(f"  subdiv: threshold={subdiv_threshold}  max_depth={subdiv_max_depth}  "
           f"every={subdiv_every}  start={subdiv_start}  mode={distortion_mode}")
@@ -1632,7 +1639,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                                'n_leaves': rep['n_leaves']})
 
             visualize_patch_configuration(
-                model, os.path.join(vis_dir, f'patch_config_{epoch:05d}.png'),
+                model, os.path.join(vis_dir, f'patch_config_{tag}{epoch:05d}.png'),
                 pts=pts3n)
 
         # ── training step ────────────────────────────────────────────────
@@ -1754,7 +1761,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             extra = dict(checkpoint_extra or {})
             extra.update({'epoch': epoch, 'history': history,
                           'subdivision_events': events})
-            _adaptive_save_ckpt(model, os.path.join(vis_dir, f'checkpoint_{epoch}.pt'), extra)
+            _adaptive_save_ckpt(model, os.path.join(vis_dir, f'checkpoint_{tag}{epoch}.pt'), extra)
 
     print(f"{'─' * 60}\n")
     return history, events
@@ -1866,13 +1873,66 @@ def run_adaptive(args):
         checkpoint_extra=checkpoint_extra,
         tangent_mode=args.tangent_mode,
         sym_dirichlet_epoch=args.sym_dirichlet_epoch,
-        checkpoint_extra=checkpoint_extra,
         save_vertex_pos_every=args.save_vertex_pos_every,
         vertex_pos_json_path=vertex_pos_json_path,
         normals=normals, gamma=args.gamma,
         gamma_warmup_epochs=args.gamma_warmup_epochs,
         gamma_warmup_delay=args.gamma_warmup_delay,
         normal_unsigned=args.normal_unsigned)
+
+    # ── phase 3: cut + stitch the hole, then train again from scratch ────
+    hole_record, hole_history, hole_events = None, None, None
+    if args.cut_hole:
+        _adaptive_save_ckpt(model, os.path.join(result_dir, 'checkpoint_before_hole.pt'),
+                            dict(checkpoint_extra, history=history,
+                                 subdivision_events=events))
+        from utils.cutting_hole import cut_and_stitch_hole
+        from model.cutting_hole import NoCrossingFound, hole_config_from_args
+        hole_cfg = hole_config_from_args(args, prefix='hole_')
+        try:
+            hole_record = cut_and_stitch_hole(
+                model, pts3n, hole_cfg, args.device,
+                out_dir=os.path.join(result_dir, 'cutting_hole'),
+                stitch=not args.hole_cut_only)
+        except NoCrossingFound as exc:
+            print(f"  [hole] no crossing to cut ({exc}); skipping the hole phase")
+        if hole_record is not None:
+            checkpoint_extra = dict(checkpoint_extra, hole=hole_record)
+            _adaptive_save_ckpt(model, os.path.join(result_dir, 'checkpoint_hole_stitched.pt'),
+                                checkpoint_extra)
+            # Fresh train_adaptive call = new Adam, LR back to --lr, cosine
+            # schedule and μ/γ/SVD warmups restarted from epoch 1: the cut and
+            # the new tube change the model too much to continue the old ones.
+            hole_epochs = args.hole_epochs if args.hole_epochs >= 0 else args.epochs
+            model.train()
+            hole_history, hole_events = train_adaptive(
+                model, pts3n,
+                epochs=hole_epochs, M_per_patch=args.M_per_patch, lr=args.lr,
+                mu=args.mu, mu_warmup_epochs=args.mu_warmup_epochs,
+                mu_warmup_delay=args.mu_warmup_delay, schedule=args.schedule,
+                lam_svd=args.lam_svd, svd_mode=args.svd_mode,
+                svd_target=args.svd_target, svd_eps=args.svd_eps,
+                svd_warmup_epochs=args.svd_warmup_epochs,
+                svd_warmup_delay=args.svd_warmup_delay,
+                subdiv_threshold=args.subdiv_threshold,
+                subdiv_max_depth=args.subdiv_max_depth,
+                subdiv_every=args.subdiv_every, subdiv_start=args.subdiv_start,
+                subdiv_stop=args.subdiv_stop, distortion_mode=args.distortion_mode,
+                distortion_samples=args.distortion_samples,
+                max_splits_per_round=args.max_splits_per_round,
+                device=args.device, log_every=args.log_every, vis_dir=result_dir,
+                checkpoint_every=args.checkpoint_every,
+                checkpoint_extra=checkpoint_extra,
+                tangent_mode=args.tangent_mode,
+                sym_dirichlet_epoch=args.sym_dirichlet_epoch,
+                save_vertex_pos_every=args.save_vertex_pos_every,
+                vertex_pos_json_path=os.path.join(
+                    result_dir, 'vertex_positions_normalized_hole.json'),
+                normals=normals, gamma=args.gamma,
+                gamma_warmup_epochs=args.gamma_warmup_epochs,
+                gamma_warmup_delay=args.gamma_warmup_delay,
+                normal_unsigned=args.normal_unsigned,
+                tag='hole_')
 
     # ── final outputs ────────────────────────────────────────────────────
     model.eval()
@@ -1882,7 +1942,15 @@ def run_adaptive(args):
 
     visualize_patch_configuration(
         model, os.path.join(result_dir, 'patch_config_final.png'), pts=pts3n)
-    plot_history(history, os.path.join(result_dir, 'history.png'))
+    if history['epoch']:
+        plot_history(history, os.path.join(result_dir, 'history.png'))
+    if hole_history and hole_history['epoch']:
+        plot_history(hole_history, os.path.join(result_dir, 'history_hole.png'))
+    if model.complex.tube_patches:
+        from model.stitching_hole import seam_gaps
+        tube_seam = seam_gaps(model)
+        print(f"  Final tube seam check: max gap={tube_seam['max_gap']:.3e}  "
+              f"open edges={tube_seam['n_boundary_edges']}")
 
     verts, faces = utils.sample_multi_patch_grid(
         model, resolution=args.mesh_res, device=args.device)
@@ -1902,11 +1970,14 @@ def run_adaptive(args):
 
     extra = dict(checkpoint_extra)
     extra.update({'history': history, 'pretrain_history': pretrain_history,
-                  'subdivision_events': events, 'seam_check': seam})
+                  'subdivision_events': events, 'seam_check': seam,
+                  'hole_history': hole_history, 'hole_subdivision_events': hole_events})
     _adaptive_save_ckpt(model, os.path.join(result_dir, 'checkpoint.pt'), extra)
 
     with open(os.path.join(result_dir, 'metadata.json'), 'w') as f:
         json.dump({'args': vars(args), 'subdivision_events': events,
+                   'hole_subdivision_events': hole_events,
+                   'hole': hole_record,
                    'final_stats': model.complex.stats(),
                    'seam_check': seam}, f, indent=2)
     print(f"  Run complete → {result_dir}")
@@ -2139,6 +2210,19 @@ def main():
 
     adaptive_group.add_argument('--save_vertex_pos_every', type=int, default=10,
                             help='[Adaptive] Save tracked logical vertex positions every N epochs (0 disables)')
+
+    # Hole cutting + stitching (one handle; see docs/documentation.md)
+    hole_group = parser.add_argument_group('hole cutting and stitching (--adaptive)')
+    hole_group.add_argument('--cut_hole', action='store_true',
+                            help='[Adaptive] After training, detect the crossing membranes '
+                                 '(uv_hole_mask -> opening_labels -> patch_intersection), '
+                                 'cut them, stitch a tube, and train again with a fresh '
+                                 'optimizer, LR schedule and μ warmup')
+    hole_group.add_argument('--hole_epochs', type=int, default=-1,
+                            help='[Adaptive] Epochs after stitching (-1 = --epochs)')
+    hole_group.add_argument('--hole_cut_only', action='store_true',
+                            help='[Adaptive] Cut but do not stitch (debugging)')
+    add_hole_args(hole_group, prefix='hole_')
 
     # Tangent (μ-weighted) energy schedule
     tangent_group = parser.add_argument_group('tangent energy schedule (--adaptive)')

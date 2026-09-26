@@ -1014,8 +1014,17 @@ _FACE_AFFINE = [
 
 
 class _Patch:
-    """Quadtree cell. Leaf iff children is None."""
-    __slots__ = ('face', 'u0', 'v0', 'size', 'depth', 'corner_ids', 'children')
+    """Quadtree cell. Leaf iff children is None.
+
+    removed  the leaf was cut out of the surface by hole cutting
+             (model/cutting_hole.py); it is kept in `patches` for replay but is
+             not part of `leaf_patches`, so it is never sampled or trained.
+    frozen   the leaf borders a cut loop and must not be subdivided: a new
+             edge midpoint would change the loop's vertex list, which the
+             stitched tube shares.
+    """
+    __slots__ = ('face', 'u0', 'v0', 'size', 'depth', 'corner_ids', 'children',
+                 'removed', 'frozen')
 
     def __init__(self, face, u0, v0, size, depth, corner_ids):
         self.face = face
@@ -1025,6 +1034,8 @@ class _Patch:
         self.depth = depth
         self.corner_ids = list(corner_ids)   # CCW: (0,0),(1,0),(1,1),(0,1)
         self.children = None
+        self.removed = False
+        self.frozen = False
 
     @property
     def is_leaf(self):
@@ -1032,6 +1043,38 @@ class _Patch:
 
     def rect_key(self):
         return (self.face, self.u0, self.v0, self.size)
+
+
+class _TubePatch:
+    """
+    One cell of a stitched tube (model/stitching_hole.py). Not a quadtree
+    cell: its polygon (vertex ids + local uv on the unit square's boundary) is
+    stored explicitly, and some of those ids belong to the cut loops of the
+    surface. It decodes through the same MVC path as a quadtree leaf, so the
+    seam with the surface is C0 for the same reason quadtree seams are.
+
+    face = -1 marks it as off the cube: no face chart, no cube position.
+    Always frozen (never subdivided).
+    """
+    __slots__ = ('ids', 'uvs', 'tube', 'col', 'row')
+
+    face, u0, v0, size, depth = -1, 0, 0, S_INT, 0
+    children, removed, frozen, is_leaf = None, False, True, True
+
+    def __init__(self, ids, uvs, tube, col, row):
+        self.ids = list(ids)
+        self.uvs = [tuple(uv) for uv in uvs]
+        self.tube, self.col, self.row = tube, col, row
+
+    @property
+    def corner_ids(self):
+        """Vertices at the unit square's corners, CCW from (0,0) — the same
+        order a quadtree leaf's corner_ids uses."""
+        at = {uv: v for v, uv in zip(self.ids, self.uvs)}
+        return [at[c] for c in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))]
+
+    def rect_key(self):
+        return ('tube', self.tube, self.col, self.row)
 
 
 class AdaptiveCubeComplex(nn.Module):
@@ -1046,6 +1089,8 @@ class AdaptiveCubeComplex(nn.Module):
         self.patches = []              # creation order (deterministic)
         self._rect_to_patch = {}
         self.subdiv_log = []           # replayable list of (face,u0,v0,size)
+        self.tube_patches = []         # stitched tube cells, after the quad leaves
+        self.tube_log = []             # replayable tube records (see add_tube)
 
         self.vertex_features = nn.Parameter(torch.zeros(0, d_features))
         self.register_buffer('face_affine',
@@ -1123,6 +1168,8 @@ class AdaptiveCubeComplex(nn.Module):
 
     def _polygon(self, p):
         """Ordered CCW polygon of a leaf: corners + hanging vertices."""
+        if isinstance(p, _TubePatch):
+            return list(p.ids), list(p.uvs)
         s = p.size
         c = [(p.u0, p.v0), (p.u0 + s, p.v0),
              (p.u0 + s, p.v0 + s), (p.u0, p.v0 + s)]
@@ -1154,6 +1201,9 @@ class AdaptiveCubeComplex(nn.Module):
         Callers must rebuild_flat() (and their optimizer) afterwards."""
         if not p.is_leaf:
             raise ValueError("subdivide() called on a non-leaf patch")
+        if p.removed or p.frozen:
+            raise ValueError("subdivide() called on a removed/frozen patch "
+                             f"{p.rect_key()} (hole cutting)")
         if p.size < 2:
             raise ValueError(f"patch at max dyadic resolution (level {MAX_LEVEL})")
 
@@ -1197,10 +1247,64 @@ class AdaptiveCubeComplex(nn.Module):
             self.subdivide(p)
         self.rebuild_flat()
 
+    # hole cutting / stitching (see model/cutting_hole.py, model/stitching_hole.py)
+    def remove_patches(self, patch_list):
+        """Cut leaves out of the surface. Their vertices stay in
+        `vertex_features` (ids are never renumbered); they just stop being
+        referenced. Callers must rebuild their optimizer's view of the leaves
+        (the Parameter itself is unchanged)."""
+        for p in patch_list:
+            if not p.is_leaf:
+                raise ValueError("remove_patches() called on a non-leaf patch")
+            p.removed = True
+        self.rebuild_flat()
+
+    def freeze_patches(self, patch_list):
+        for p in patch_list:
+            p.frozen = True
+
+    def add_tube(self, polys, new_keys, new_features):
+        """
+        Append a stitched tube.
+
+        polys         list of (ids, uvs, col, row) cells; ids may reference
+                      existing (loop) vertices and the new ones below.
+        new_keys      keys of the new vertices, in id order. They start at the
+                      current n_vertices.
+        new_features  (len(new_keys), d) initial features.
+
+        Replaces vertex_features with a longer Parameter, so the caller must
+        rebuild its optimizer.
+        """
+        first = self.n_vertices
+        with torch.no_grad():
+            feats = torch.as_tensor(new_features, dtype=self.vertex_features.dtype,
+                                    device=self.vertex_features.device)
+            for key, row in zip(new_keys, feats):
+                self._create_vertex(tuple(key), row)
+        t = len(self.tube_log)
+        self.tube_log.append({
+            'first_vid': first,
+            'keys': [list(k) for k in new_keys],
+            'polys': [[list(ids), [list(uv) for uv in uvs], col, row]
+                      for ids, uvs, col, row in polys],
+            # Replay inserts the tube after this many subdivisions, so vertex
+            # ids come out in the same order as in the original run.
+            'subdiv_log_len': len(self.subdiv_log),
+        })
+        self._build_tube(t)
+        self.rebuild_flat()
+        return t
+
+    def _build_tube(self, t):
+        for ids, uvs, col, row in self.tube_log[t]['polys']:
+            self.tube_patches.append(_TubePatch(ids, uvs, t, col, row))
+
     # flat query tensors (rebuild_flat() must be called after any subdivision round)
     def rebuild_flat(self):
         device = self.vertex_features.device
-        self.leaf_patches = [p for p in self.patches if p.is_leaf]
+        self.leaf_patches = ([p for p in self.patches if p.is_leaf and not p.removed]
+                             + self.tube_patches)
         polys = [self._polygon(p) for p in self.leaf_patches]
         k_max = max(len(ids) for ids, _ in polys)
         vid_rows, uv_rows = [], []
@@ -1226,6 +1330,11 @@ class AdaptiveCubeComplex(nn.Module):
     @property
     def n_leaves(self):
         return len(self.leaf_patches)
+
+    @property
+    def n_quad_leaves(self):
+        """Quadtree leaves; they come first in leaf_patches, tube cells after."""
+        return len(self.leaf_patches) - len(self.tube_patches)
 
     @property
     def n_vertices(self):
@@ -1265,8 +1374,11 @@ class AdaptiveCubeComplex(nn.Module):
         fuv = self.face_uv(leaf_idx, uv)
         ones = torch.ones_like(fuv[:, :1])
         homog = torch.cat([fuv, ones], dim=1).unsqueeze(-1)     # (B,3,1)
-        A = self.face_affine[self.leaf_face[leaf_idx]]          # (B,3,3)
-        return torch.bmm(A, homog).squeeze(-1)                  # (B,3)
+        face = self.leaf_face[leaf_idx]
+        A = self.face_affine[face.clamp_min(0)]                 # (B,3,3)
+        xyz = torch.bmm(A, homog).squeeze(-1)                   # (B,3)
+        # Tube cells (face -1) have no cube position.
+        return torch.where((face >= 0).unsqueeze(-1), xyz, torch.zeros_like(xyz))
 
     # serialization
     def serialize(self):
@@ -1275,14 +1387,38 @@ class AdaptiveCubeComplex(nn.Module):
             'subdiv_log': list(self.subdiv_log),
             'n_vertices': self.n_vertices,
             'vertex_keys': list(self.vertex_keys),
+            'removed': [p.rect_key() for p in self.patches if p.removed],
+            'frozen': [p.rect_key() for p in self.patches if p.frozen],
+            'tubes': [dict(t) for t in self.tube_log],
         }
 
     def replay(self, topo):
         """Rebuild topology on a FRESH complex (base_subdivisions=0)."""
         if self.subdiv_log:
             raise RuntimeError("replay() requires a fresh complex")
-        for rect in topo['subdiv_log']:
+        tubes = list(topo.get('tubes', []))
+
+        def insert_tubes(n_done):
+            while tubes and tubes[0]['subdiv_log_len'] == n_done:
+                t = tubes.pop(0)
+                if self.n_vertices != t['first_vid']:
+                    raise RuntimeError("replay tube vertex-id mismatch")
+                zero = torch.zeros(len(t['keys']), self.d_features)
+                for key, row in zip(t['keys'], zero):
+                    self._create_vertex(tuple(key), row)
+                self.tube_log.append(dict(t))
+                self._build_tube(len(self.tube_log) - 1)
+
+        for n_done, rect in enumerate(topo['subdiv_log']):
+            insert_tubes(n_done)
             self.subdivide(self._rect_to_patch[tuple(rect)])
+        insert_tubes(len(topo['subdiv_log']))
+        # Cut state is applied after all subdivisions: removed/frozen leaves
+        # are never subdivided afterwards, so the order is equivalent.
+        for rect in topo.get('removed', []):
+            self._rect_to_patch[tuple(rect)].removed = True
+        for rect in topo.get('frozen', []):
+            self._rect_to_patch[tuple(rect)].frozen = True
         self.rebuild_flat()
         if self.n_vertices != topo['n_vertices']:
             raise RuntimeError("replay vertex-count mismatch")

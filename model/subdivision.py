@@ -65,7 +65,8 @@ def subdivide_by_distortion(model, threshold: float, max_depth: int,
         distortion = compute_patch_distortion(model, samples_per_patch, mode)
     leaves = list(model.complex.leaf_patches)
     cand = [(float(distortion[i]), i, p) for i, p in enumerate(leaves)
-            if float(distortion[i]) > threshold and p.depth < max_depth and p.size >= 2]
+            if float(distortion[i]) > threshold and p.depth < max_depth and p.size >= 2
+            and not p.frozen]
     cand.sort(key=lambda t: -t[0])
     if max_splits_per_round and max_splits_per_round > 0:
         cand = cand[:max_splits_per_round]
@@ -83,8 +84,10 @@ def subdivide_by_distortion(model, threshold: float, max_depth: int,
 
 
 def _leaf_edge_queries(model, samples_per_edge, device):
-    """(pids, uv) covering all 4 boundary edges of every leaf."""
-    n = model.n_patches
+    """(pids, uv) covering all 4 boundary edges of every quadtree leaf.
+    Stitched tube cells have no cube position to bucket by; their seams are
+    checked by stitching_hole.seam_gaps."""
+    n = model.complex.n_quad_leaves
     t = torch.linspace(0.0, 1.0, samples_per_edge, device=device).unsqueeze(1)
     z, o = torch.zeros_like(t), torch.ones_like(t)
     edges = torch.cat([torch.cat([t, z], 1), torch.cat([o, t], 1),
