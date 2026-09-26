@@ -202,6 +202,21 @@ reason quadtree seams are.
      `v = 0` by arc length.
    - **Row R−1:** the top edge carries the loop-B chain along `v = 1`.
    - **Middle rows:** plain quads.
+5. **Tube fit** (`prefit_tube`, before any training on the point cloud).
+   - **Why:** the feature blend in §5.1 does not blend *positions*. The decoder
+     is nonlinear, so a freshly stitched tube can bulge or fold anywhere (bug
+     #6).
+   - **Target:** each tube sample (column k, row r, local u, v) is pulled
+     towards `(1 − w)·A_k(u) + w·B_k(u)`, with `w = (r + v)/R`. `A_k(u)` and
+     `B_k(u)` are the decoded rim points under column k, so the target is the
+     straight ruled surface from rim A to rim B.
+   - **What moves:** only the new vertex rows. The decoder and all other rows
+     are held, so the rest of the surface and the seams don't move.
+   - **Settings:** `tube_prefit_steps` (500; 0 turns it off) and
+     `tube_prefit_lr` (5e-3).
+   - **Result on the torus:** mean distance to the target 0.034 → 0.004, and
+     chamfer distance at the first retraining epoch 0.067 → 0.056. For a
+     cylinder-like hole the ruled surface is already close to the real wall.
 
 ### 5.1 The vertex matrix after stitching
 
@@ -232,6 +247,8 @@ reason quadtree seams are.
     doesn't support.
 - **Orphaned rows.** The rows of removed leaves stay in the matrix. They get
   no gradient.
+- **After the tube fit** (step 5), the new rows are no longer the blend: they
+  are whatever makes the tube decode to the rim-to-rim surface.
 
 After stitching:
 - the surface is closed (no edge without a partner);
@@ -252,7 +269,14 @@ After stitching:
    - It is a new call, so it builds a **fresh Adam**, the LR restarts at
      `--lr` with a new cosine schedule, and the μ/γ/SVD warmups and delays
      restart from epoch 1.
-   - Subdivision restarts too; tube cells and loop leaves are frozen.
+   - Subdivision after the hole is set by `--hole_subdiv`:
+     - `off` (default): no subdivision in this phase;
+     - `local`: only quadtree leaves within `--hole_subdiv_rings` (2) edge
+       rings of the loop leaves may split, and their descendants too
+       (`local_subdiv_predicate`);
+     - `all`: the normal schedule everywhere.
+
+     Tube cells and loop leaves never split in any mode.
    - Its files carry a `hole_` prefix: `checkpoint_hole_<epoch>.pt`,
      `patch_config_hole_<epoch>.png`, `history_hole.png`,
      `vertex_positions_normalized_hole.json`.
@@ -296,6 +320,7 @@ script):
 | `allow_non_disk` | off | keep going when a removed region is not a disk |
 | `tube_columns` | 0 (auto) | N |
 | `tube_rows` | 4 | R |
+| `tube_prefit_steps`, `tube_prefit_lr` | 500, 5e-3 | tube fit (§5 step 5); 0 steps turns it off |
 
 `main.py` also takes `--hole_cut_only` and the script takes `--no_stitch`. Both
 cut without stitching, for debugging.
@@ -307,7 +332,9 @@ Outputs in `cutting_hole/`:
 | `crossing.ply` | the crossing curve C |
 | `loops.ply` | loop A red, loop B blue |
 | `cut_surface.ply` | after the cut; loop leaves yellow |
-| `stitched_surface.ply` | tube cells orange |
+| `openings.ply` | every opening found, one colour per ID (IDs, areas, centroids and crossing partners are printed and stored in `hole_summary.json` → `detection.openings`) |
+| `openings_chosen.ply` | the two openings that were cut (A red, B blue) |
+| `stitched_surface.ply` | after the tube fit; tube cells orange |
 | `hole_summary.json` | detection stats, cut diagnostics, stitch info, seam gaps, χ and genus |
 
 ## 8. Code map
@@ -375,6 +402,16 @@ config: `W 128`, `D 4`, `d_features 32`, `base_subdivisions 2` = 96 leaves,
 
   In a top view, the membranes inside the hole are gone and the tube has
   become the hole's inner wall.
+- **Rerun with the tube fit and `--hole_subdiv local`**, from the same
+  checkpoint and with the same 300 epochs:
+  - tube fit error 0.034 → 0.004; chamfer distance at epoch 1 0.056 (was 0.067);
+  - local subdivision split only near the cut (214 → 658 leaves);
+  - final chamfer distance 0.028 (was 0.036), mean distance 0.0099 (was
+    0.0104), p99 0.025 (was 0.032), 0 % of the surface inside the hole,
+    genus 1.
+
+  Both changes were active, so this does not separate the fit's effect from
+  the local subdivision's.
 - **Not yet run** on a real scanned input, or with larger settings on GPU.
 
 ## 10. Limitations
@@ -410,8 +447,11 @@ config: `W 128`, `D 4`, `d_features 32`, `base_subdivisions 2` = 96 leaves,
 - **Fixed tube resolution.** Tube cells are never subdivided, so the tube's
   resolution is set by N × R at stitch time.
 - **Frozen loop leaves** cannot gain resolution after the cut.
-- **Initial tube shape.** It is a straight feature blend between the two
-  loops, not a geometric fit. Retraining has to open it up.
+- **Initial tube shape.** It is a straight ruled surface between the rims.
+  That fits a cylinder-like hole well; a curved or flaring hole still has to be
+  fitted by retraining.
+- **No subdivision on the tube.** `local` subdivision refines the quadtree
+  leaves around the cut, but not the tube cells or the loop leaves.
 - **Twists.** A phase error twists the tube. `phase_concentration` reports the
   fit but doesn't correct it.
 - **Positional encoding.** Tube cells have no cube position, so with `L > 0`
@@ -432,6 +472,7 @@ Bugs found or reported, with their status. New reports are added here.
 | 3 | 2026-09-26 | found in torus test | Cutting along the crossing curve failed ("ring does not enclose any leaf"). On a trained model the membranes cross only partway, so `C` is an open arc, and an arc can't bound a region. | fixed: added `opening` mode (remove whole openings, stitch rim to rim) and made it the default; `crossing` mode kept |
 | 4 | 2026-09-26 | found in torus test | The pair with the most crossings was a fold inside the torus body, not the hole. A closed-loop score (`loop_closedness`) couldn't tell them apart either (arc curves score 0.6–0.8). | fixed: pick the pair whose smaller opening has the largest 3D area; `--hole_openings` override |
 | 5 | 2026-09-26 | user (`run.sh`, rocker-arm.ply) | `opening` mode stopped with "opening 1: no leaf lies mostly inside it". After 5000 epochs the model had only 48 coarse leaves, and opening 1 was small. Coverage was measured with 4×4 samples per leaf, which fell between the opening's cells, so every leaf read 0 % and refinement never split the leaves around it. | fixed: coverage now comes from the opening's own grid vertices (`OpeningLookup.opening_points`); the leaf-size floor is 2 grid cells in `opening` mode (`opening_min_leaf_cells`, was the 8 meant for `crossing` mode); `max_refine_rounds` 4 → 8. Reproduced with a tiny opening in a coarse leaf (old measure: 0 leaves); now cut and stitched, genus 1. |
+| 6 | 2026-09-26 | user (`run.sh`, rocker-arm.ply) | "It's a mess": the genus is created, but the stitched surface right after cutting looks bad, and after retraining the handle is not where the input's hole is. The user also asked to suspend subdivision after the cut, or limit it to the cells around the cut. | partly fixed. (a) The tube was initialised by blending features, which gives an arbitrary shape; it is now fitted to the rim-to-rim surface first (`prefit_tube`). (b) Subdivision after the hole is now `--hole_subdiv off` by default (`local` / `all` optional). (c) Wrong placement not confirmed: on the rocker arm only one crossing pair (0,1, area 0.149) was found among 13 openings, so it may not be the hole's membranes. `openings.ply` / `openings_chosen.ply` and the printed openings table were added to check this; `--hole_openings a,b` forces the pair. Waiting for the rerun. |
 
 ## 12. Future plan (to be implemented)
 

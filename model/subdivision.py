@@ -54,19 +54,22 @@ def compute_patch_distortion(model, samples_per_patch: int = 128,
 
 def subdivide_by_distortion(model, threshold: float, max_depth: int,
                             samples_per_patch: int = 128, mode: str = 'area',
-                            max_splits_per_round: int = 0, distortion=None):
+                            max_splits_per_round: int = 0, distortion=None,
+                            allow=None):
     """
     Subdivide every leaf whose distortion exceeds `threshold`, unless it is
     already at `max_depth` (absolute quadtree depth; base_subdivisions count
     toward it). Returns a summary dict. The caller MUST rebuild its optimizer
     if n_subdivided > 0 (vertex_features is a new Parameter afterwards).
     """
+    """`allow(patch) -> bool`, when given, restricts which leaves may split
+    (hole phase: see cutting_hole.local_subdiv_predicate)."""
     if distortion is None:
         distortion = compute_patch_distortion(model, samples_per_patch, mode)
     leaves = list(model.complex.leaf_patches)
     cand = [(float(distortion[i]), i, p) for i, p in enumerate(leaves)
             if float(distortion[i]) > threshold and p.depth < max_depth and p.size >= 2
-            and not p.frozen]
+            and not p.frozen and (allow is None or allow(p))]
     cand.sort(key=lambda t: -t[0])
     if max_splits_per_round and max_splits_per_round > 0:
         cand = cand[:max_splits_per_round]

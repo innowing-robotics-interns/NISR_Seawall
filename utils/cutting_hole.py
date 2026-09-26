@@ -16,7 +16,10 @@ Outputs (out_dir):
     crossing.ply          the crossing curve C found by patch_intersection
     loops.ply             the two cut loops (red = A, blue = B)
     cut_surface.ply       surface after the cut, before stitching
-    stitched_surface.ply  surface with the tube (tube cells in orange)
+    stitched_surface.ply  surface with the tube after the tube prefit (tube in orange)
+    openings.ply          every opening found (one colour per ID; IDs and
+                          areas are printed and in hole_summary.json)
+    openings_chosen.ply   the two openings that were cut (red = A, blue = B)
     hole_summary.json     detection, cut and stitch diagnostics
     checkpoint_hole.pt    (standalone only) the stitched model
 """
@@ -31,9 +34,11 @@ import torch
 
 try:
     from . import patch_vis
+    from .opening_labels import opening_colors
     from .uv_hole_mask import grid_faces, write_colored_mesh_ply, write_colored_ply
 except ImportError:
     import patch_vis
+    from opening_labels import opening_colors
     from uv_hole_mask import grid_faces, write_colored_mesh_ply, write_colored_ply
 
 from model import cutting_hole, stitching_hole  # noqa: E402  (patch_vis sets sys.path)
@@ -99,6 +104,14 @@ def cut_and_stitch_hole(model, pts, cfg, device, out_dir=None, stitch=True,
 
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+        ids = crossing['opening_ids']
+        write_colored_ply(os.path.join(out_dir, 'openings.ply'), crossing['opening_xyz'],
+                          opening_colors(int(ids.max()) + 1)[ids])
+        chosen = np.isin(ids, record['openings'])
+        write_colored_ply(os.path.join(out_dir, 'openings_chosen.ply'),
+                          crossing['opening_xyz'][chosen],
+                          np.where((ids[chosen] == record['openings'][0])[:, None],
+                                   COLOR_A, COLOR_B))
         xyz = np.asarray(record['crossing_xyz'])
         write_colored_ply(os.path.join(out_dir, 'crossing.ply'), xyz,
                           np.tile(COLOR_TUBE, (len(xyz), 1)))

@@ -1568,7 +1568,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    normals=None, gamma=0.0,
                    gamma_warmup_epochs=0, gamma_warmup_delay=0,
                    normal_unsigned=False,
-                   tag: str = ''):
+                   tag: str = '',
+                   subdiv_allow=None):
     """Phase-2 training loop. Every call builds a FRESH optimizer, cosine LR
     schedule and μ/γ/SVD warmup (all driven by the local epoch counter), so
     calling it again after hole cutting restarts all of them. `tag` prefixes
@@ -1623,7 +1624,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             rep = subdivide_by_distortion(
                 model, subdiv_threshold, subdiv_max_depth,
                 samples_per_patch=distortion_samples, mode=distortion_mode,
-                max_splits_per_round=max_splits_per_round)
+                max_splits_per_round=max_splits_per_round,
+                allow=subdiv_allow)
             print(f"  [subdiv @ {epoch}] distortion max={rep['max_distortion']:.4f} "
                   f"mean={rep['mean_distortion']:.4f}  split={rep['n_subdivided']} "
                   f"→ leaves={rep['n_leaves']} vertices={rep['n_vertices']}")
@@ -1904,6 +1906,17 @@ def run_adaptive(args):
             # schedule and μ/γ/SVD warmups restarted from epoch 1: the cut and
             # the new tube change the model too much to continue the old ones.
             hole_epochs = args.hole_epochs if args.hole_epochs >= 0 else args.epochs
+            # Subdivision after the hole: off (default), only near the cut, or
+            # everywhere. Tube cells and loop leaves never split either way.
+            hole_subdiv_threshold, subdiv_allow = args.subdiv_threshold, None
+            if args.hole_subdiv == 'off':
+                hole_subdiv_threshold = 0.0
+            elif args.hole_subdiv == 'local':
+                from model.cutting_hole import local_subdiv_predicate
+                subdiv_allow, n_allowed = local_subdiv_predicate(
+                    model.complex, rings=args.hole_subdiv_rings)
+                print(f"  [hole] subdivision limited to {n_allowed} leaves within "
+                      f"{args.hole_subdiv_rings} rings of the cut")
             model.train()
             hole_history, hole_events = train_adaptive(
                 model, pts3n,
@@ -1914,12 +1927,13 @@ def run_adaptive(args):
                 svd_target=args.svd_target, svd_eps=args.svd_eps,
                 svd_warmup_epochs=args.svd_warmup_epochs,
                 svd_warmup_delay=args.svd_warmup_delay,
-                subdiv_threshold=args.subdiv_threshold,
+                subdiv_threshold=hole_subdiv_threshold,
                 subdiv_max_depth=args.subdiv_max_depth,
                 subdiv_every=args.subdiv_every, subdiv_start=args.subdiv_start,
                 subdiv_stop=args.subdiv_stop, distortion_mode=args.distortion_mode,
                 distortion_samples=args.distortion_samples,
                 max_splits_per_round=args.max_splits_per_round,
+                subdiv_allow=subdiv_allow,
                 device=args.device, log_every=args.log_every, vis_dir=result_dir,
                 checkpoint_every=args.checkpoint_every,
                 checkpoint_extra=checkpoint_extra,
@@ -2222,6 +2236,12 @@ def main():
                             help='[Adaptive] Epochs after stitching (-1 = --epochs)')
     hole_group.add_argument('--hole_cut_only', action='store_true',
                             help='[Adaptive] Cut but do not stitch (debugging)')
+    hole_group.add_argument('--hole_subdiv', type=str, default='off',
+                            choices=['off', 'local', 'all'],
+                            help='[Adaptive] Subdivision after the hole: off (default), '
+                                 'local = only leaves within --hole_subdiv_rings of the '
+                                 'cut, all = everywhere (tube/loop cells never split)')
+    hole_group.add_argument('--hole_subdiv_rings', type=int, default=2)
     add_hole_args(hole_group, prefix='hole_')
 
     # Tangent (μ-weighted) energy schedule

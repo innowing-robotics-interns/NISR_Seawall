@@ -197,8 +197,92 @@ def stitch_hole(model, record, cfg, verbose=True):
         print(f"    stitch: tube {info['n_columns']} x {info['n_rows']} cells, "
               f"{info['n_new_vertices']} new vertices (loops {info['loop_a_len']} / "
               f"{info['loop_b_len']}), phase fit {info['phase_concentration']:.2f}")
+    before, after = prefit_tube(model, record['tube_index'],
+                                steps=getattr(cfg, 'tube_prefit_steps', 0),
+                                lr=getattr(cfg, 'tube_prefit_lr', 5e-3),
+                                verbose=verbose)
+    info['prefit_error'] = {'before': before, 'after': after}
     record['stitch'] = info
     return info
+
+
+def prefit_tube(model, tube_index, steps=500, lr=5e-3, grid=12, verbose=True):
+    """
+    Fit the tube's NEW vertex rows so the tube decodes to the ruled surface
+    between its two rims, before any training on the point cloud.
+
+    Blending features (build_tube) does not blend positions: the decoder is
+    nonlinear, so the freshly stitched tube can bulge or fold anywhere. Here
+    every tube sample (column k, row r, local u, v) gets the target
+
+        (1 - w) * A_k(u) + w * B_k(u),   w = (r + v) / R
+
+    where A_k(u) / B_k(u) are the decoded rim points under column k (the
+    bottom edge of row 0 and the top edge of row R-1). Those edges only read
+    loop vertices, so the targets are fixed. Only the new rows are updated;
+    the decoder and every other vertex row are held, so the rest of the
+    surface and the seams do not move.
+
+    Returns (mean distance to target before, after).
+    """
+    cx = model.complex
+    first = cx.tube_log[tube_index]['first_vid']
+    n_new = len(cx.tube_log[tube_index]['keys'])
+    base = cx.n_quad_leaves
+    cells = {(p.col, p.row): base + i for i, p in enumerate(cx.tube_patches)
+             if p.tube == tube_index}
+    N = 1 + max(k for k, _ in cells)
+    R = 1 + max(r for _, r in cells)
+    if n_new == 0 or steps <= 0:
+        return None, None
+    device = cx.vertex_features.device
+
+    t = torch.linspace(0.0, 1.0, grid, device=device)
+    gu, gv = torch.meshgrid(t, t, indexing='ij')
+    uv = torch.stack([gu.flatten(), gv.flatten()], -1)            # (G, 2)
+    pids, targets = [], []
+    with torch.no_grad():
+        for k in range(N):
+            rimA = model(torch.full((grid,), cells[(k, 0)], device=device),
+                         torch.stack([t, torch.zeros_like(t)], -1))
+            rimB = model(torch.full((grid,), cells[(k, R - 1)], device=device),
+                         torch.stack([t, torch.ones_like(t)], -1))
+            for r in range(R):
+                w = ((r + uv[:, 1]) / R).unsqueeze(-1)
+                iu = torch.round(uv[:, 0] * (grid - 1)).long()
+                targets.append((1 - w) * rimA[iu] + w * rimB[iu])
+                pids.append(torch.full((uv.shape[0],), cells[(k, r)], device=device))
+    pids = torch.cat(pids)
+    targets = torch.cat(targets)
+    uv_all = uv.repeat(N * R, 1)
+
+    vf = cx.vertex_features
+    mask = torch.zeros(vf.shape[0], 1, device=device)
+    mask[first:first + n_new] = 1.0
+    frozen = [(p, p.requires_grad) for p in model.parameters()]
+    for p, _ in frozen:
+        p.requires_grad_(p is vf)
+    hook = vf.register_hook(lambda g: g * mask)
+    opt = torch.optim.Adam([vf], lr=lr)
+
+    def err():
+        with torch.no_grad():
+            return float((model(pids, uv_all) - targets).norm(dim=1).mean())
+
+    before = err()
+    for _ in range(steps):
+        loss = ((model(pids, uv_all) - targets) ** 2).sum(dim=1).mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    hook.remove()
+    for p, flag in frozen:
+        p.requires_grad_(flag)
+    after = err()
+    if verbose:
+        print(f"    tube prefit: mean distance to the rim-to-rim surface "
+              f"{before:.4f} -> {after:.4f} ({steps} steps)")
+    return before, after
 
 
 @torch.no_grad()

@@ -41,8 +41,11 @@ python main.py \
     --cut_hole \
     --hole_epochs 5000 \
     --hole_resolution 128 \
-    --hole_tube_rows 4
+    --hole_tube_rows 4 \
+    --hole_subdiv off
+    # --hole_subdiv local      # after the hole, only refine leaves near the cut
     # --hole_openings 0,3      # force the opening pair if the auto choice is wrong
+                               # (check cutting_hole/openings.ply and the openings table in the log)
     # --hole_cut_mode crossing # cut along the crossing curve instead (needs a closed loop)
 
 # checkpoint.pt = final model after the hole phase

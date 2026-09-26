@@ -62,6 +62,8 @@ class HoleConfig:
     # stitching
     tube_columns: int = 0          # 0 = min(len(loop A), len(loop B), 64)
     tube_rows: int = 4
+    tube_prefit_steps: int = 500   # fit the new tube rows to the ruled surface rim A -> rim B
+    tube_prefit_lr: float = 5e-3
 
 
 def add_hole_args(parser, prefix='hole_'):
@@ -646,6 +648,27 @@ def detect_crossing(model, pts, cfg: HoleConfig, device, verbose=True):
     for g in groups:
         g['closedness'] = loop_closedness(g['xyz'])
         g['area'] = float(min(area[g['opening_a']], area[g['opening_b']]))
+
+    # Every opening, for checking the pair choice by eye (openings.ply).
+    o_xyz, o_id = [], []
+    for i, p in enumerate(patch_ids):
+        lab = opening_id[i].ravel()
+        keep = lab >= 0
+        o_xyz.append(xyz_fields[p][keep])
+        o_id.append(lab[keep])
+    o_xyz, o_id = np.concatenate(o_xyz), np.concatenate(o_id)
+    partners = {o: [] for o in range(n_openings)}
+    for g in groups:
+        partners[g['opening_a']].append(g['opening_b'])
+        partners[g['opening_b']].append(g['opening_a'])
+    openings = [{'id': o, 'area': float(area[o]), 'n_vertices': int((o_id == o).sum()),
+                 'centroid': o_xyz[o_id == o].mean(axis=0).round(4).tolist(),
+                 'crosses': partners[o]} for o in range(n_openings)]
+    if verbose:
+        print("    openings (id: 3D area, centroid, crosses):")
+        for o in openings:
+            print(f"      {o['id']:3d}: area {o['area']:.4f}  centroid {o['centroid']}  "
+                  f"crosses {o['crosses'] or '-'}")
     if verbose:
         print(f"    crossings: {len(hits):,} hits, {len(groups)} opening pair(s)"
               + (": " + ", ".join(f"({g['opening_a']},{g['opening_b']}) x{g['n_crossings']} "
@@ -678,6 +701,7 @@ def detect_crossing(model, pts, cfg: HoleConfig, device, verbose=True):
         'min_size_a': rects[g['patch_a'], 2] * cfg.min_leaf_cells / (R - 1),
         'min_size_b': rects[g['patch_b'], 2] * cfg.min_leaf_cells / (R - 1),
         'lookup': OpeningLookup(rects, lfaces, patch_ids, opening_id),
+        'opening_xyz': o_xyz, 'opening_ids': o_id,
         'stats': {'tau': float(tau), 'median_nn': float(d_nn),
                   'n_black_vertices': n_black, 'n_openings': int(n_openings),
                   'n_hits': len(hits), 'n_pairs': len(groups),
@@ -685,6 +709,7 @@ def detect_crossing(model, pts, cfg: HoleConfig, device, verbose=True):
                              int(x['n_crossings']), float(x['area']),
                              float(x['closedness'])] for x in groups],
                   'opening_area': area.tolist(),
+                  'openings': openings,
                   'chosen': [int(g['opening_a']), int(g['opening_b'])],
                   'closedness': float(g['closedness'])},
     }
@@ -808,3 +833,38 @@ def cut_hole(model, crossing, cfg: HoleConfig, verbose=True):
         'euler_characteristic': {'before': chi0, 'after_cut': chi1},
     }
 
+
+
+# ── subdivision after the hole ──────────────────────────────────────────────
+def local_subdiv_predicate(cx, rings=2):
+    """
+    `allow(patch)` for subdivide_by_distortion that only lets quadtree leaves
+    near the cut split: the leaves within `rings` edge-rings of the frozen
+    loop leaves (the loop leaves themselves and tube cells never split). The
+    region is fixed now, as rects in face coordinates, so it stays valid while
+    leaves are renumbered; a later leaf is allowed when it lies inside one of
+    these rects (i.e. descends from a leaf of the region).
+    """
+    nbr = leaf_adjacency(cx)
+    n_quad = cx.n_quad_leaves
+    leaves = cx.leaf_patches
+    region = {i for i in range(n_quad) if leaves[i].frozen}
+    frontier = set(region)
+    for _ in range(max(0, rings)):
+        frontier = {j for i in frontier for j in nbr[i] if j < n_quad} - region
+        region |= frontier
+    rects = {}
+    for i in region:
+        p = leaves[i]
+        if not p.frozen:
+            rects.setdefault(p.face, []).append((p.u0, p.v0, p.size))
+    rects = {f: np.asarray(r, np.int64) for f, r in rects.items()}
+    n_allowed = sum(len(r) for r in rects.values())
+
+    def allow(p):
+        r = rects.get(p.face)
+        if r is None:
+            return False
+        return bool(np.any((p.u0 >= r[:, 0]) & (p.u0 + p.size <= r[:, 0] + r[:, 2])
+                           & (p.v0 >= r[:, 1]) & (p.v0 + p.size <= r[:, 1] + r[:, 2])))
+    return allow, n_allowed
