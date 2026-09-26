@@ -23,7 +23,7 @@ python main.py \
     --result_dir ${OUTPUT_DIR} \
     --N 100000 \
     --pretrain_epochs 1000 \
-    --epochs 5000 \
+    --epochs 1000 \
     --base_subdivisions 1 \
     --d_features 88 \
     --M_per_patch 128 \
