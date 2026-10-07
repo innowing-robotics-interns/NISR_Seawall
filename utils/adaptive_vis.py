@@ -127,11 +127,23 @@ def visualize_patch_configuration(model, out_path, pts=None, resolution=10,
 def plot_history(history, out_path):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
     ep = history['epoch']
-    for key, color in (('cd', '#58a6ff'), ('tangent', '#d2a8ff'),
+    for key, color in (('cd', '#58a6ff'), ('ddf', '#39c5cf'),
+                       ('tangent', '#d2a8ff'),
                        ('svd', '#e3b341'), ('normal', '#f778ba'),
                        ('total', '#f78166'), ('loss', '#3fb950')):
         if key in history and len(history[key]) == len(ep):
-            ax1.plot(ep, history[key], lw=1.6, color=color, label=key)
+            # A term that is inactive for part of the run logs exact zeros (e.g.
+            # DDF outside its window). On a log axis those would plunge to the
+            # floor and draw a spike at every phase boundary, so blank them out
+            # and let the curve break instead.
+            y = np.asarray(history[key], dtype=float)
+            y[~(y > 0)] = np.nan
+            if np.all(np.isnan(y)):
+                continue
+            ax1.plot(ep, y, lw=1.6, color=color, label=key)
+    # GHPR stage / full-cloud boundaries; the target set jumps at each one.
+    for start in history.get('phase_starts', [])[1:]:
+        ax1.axvline(start, color='0.5', lw=0.8, ls='--')
     ax1.set_yscale('log')
     ax1.set_xlabel('epoch')
     ax1.legend()

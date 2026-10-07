@@ -34,6 +34,8 @@ from model.model import (MultiPatchForwardMap, MultiPatchInverseMap, TwoSheetFor
 from model.correspondence import build_hard_correspondence
 from model.subdivision import subdivide_by_distortion, check_seam_continuity
 from utils.adaptive_vis import visualize_patch_configuration, plot_history
+from utils.ghpr import (ghpr_from_points, ghpr_visible, keep_connected,
+                        median_nn_spacing, write_classified_ply)
 from scipy.spatial import cKDTree
 try:
     import open3d as o3d
@@ -1500,17 +1502,28 @@ def _adaptive_save_ckpt(model, path, extra=None):
 
 
 def pretrain_adaptive_box(model, epochs, M_per_patch, lr, device, log_every,
-                          loss_type='mse'):
-    """Fit every leaf patch to its own piece of the reference cube."""
+                          loss_type='mse', box_center=None, box_radius=1.0):
+    """Fit every leaf patch to its own piece of the reference cube.
+
+    `box_center`/`box_radius` place and size that cube. The default is the
+    canonical [-1,1]^3; a small box at the GHPR viewpoint makes the surface grow
+    outward instead of shrinking inward. `cube_xyz` itself is left alone — it
+    stays the reference address space used by the seam check and PE.
+    """
     loss_fn = nn.MSELoss() if loss_type == 'mse' else nn.L1Loss()
     opt, sched = _adaptive_make_optim(model, lr, epochs)
     history = {'epoch': [], 'loss': []}
+
+    center = torch.zeros(3, device=device) if box_center is None else \
+        torch.as_tensor(box_center, dtype=torch.float32, device=device).reshape(1, 3)
 
     print(f"\n{'─' * 60}")
     print("  Phase 1 — box pretraining (structure validation, no subdivision)")
     print(f"  leaves={model.n_patches}  vertices={model.complex.n_vertices}  "
           f"K_max={model.complex.stats()['k_max']}")
     print(f"  epochs={epochs}  M_per_patch={M_per_patch}  lr={lr}  loss={loss_type}")
+    print(f"  box: center={np.round(np.asarray(center.detach().cpu()).reshape(3), 5)}  "
+          f"radius={box_radius:.5f}")
     print(f"{'─' * 60}")
     t0 = time.time()
 
@@ -1520,7 +1533,7 @@ def pretrain_adaptive_box(model, epochs, M_per_patch, lr, device, log_every,
         pids = torch.arange(K, device=device).repeat_interleave(M_per_patch)
         uv = torch.rand(K * M_per_patch, 2, device=device)
         with torch.no_grad():
-            target = model.cube_xyz(pids, uv)      # exact box [-1,1]^3
+            target = center + box_radius * model.cube_xyz(pids, uv)
         pred = model(pids, uv)
         loss = loss_fn(pred, target)
 
@@ -1555,21 +1568,27 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    tangent_mode='symmetric_dirichlet', sym_dirichlet_epoch=0,
                     save_vertex_pos_every: int = 0,
                    vertex_pos_json_path: str = None,
-                   ddf_mu_decay: float = 0.5,
+                   surface_loss_type: str = 'chamfer',
+                   lambda_chamfer: float = 1.0,
+                   lambda_ddf: float = 1.0,
+                   ddf_mu_decay: float = 1.0,
                    ddf_start_epoch: int = 0,
                    chamfer_resume_epoch: int = 0,
-                   ddf_n_reference_points: int = 20000,
+                   ddf_n_reference_points: int = 25000,
                    ddf_k_neighbors: int = 5,
-                   ddf_sigma: float = 0.05,
+                   ddf_sigma: float = 0.005,
                    ddf_beta: float = 0.0,
-                   ddf_resample_every: int = 500,
+                   ddf_resample_every: int = 0,
                    ddf_chunk_size: int = 2048,
                    ddf_ref_points=None,
                    ddf_ref_gt=None,
+                   save_ddf_reference_every: int = 0,
                    normals=None, gamma=0.0,
                    gamma_warmup_epochs=0, gamma_warmup_delay=0,
                    normal_unsigned=False, normal_nn='kdtree',
-                   normal_w_fwd=0.1, normal_w_bwd=1.0):
+                   normal_w_fwd=0.1, normal_w_bwd=1.0,
+                   ghpr_stages=None, visible_epochs=0, normal_off_frac=0.5,
+                   ghpr_subdiv_max_depth=None):
     pts_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
     # Normal consistency runs only when the input actually carried normals.
     use_normal = gamma > 0 and normals is not None
@@ -1582,10 +1601,97 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     if normal_nn not in ('kdtree', 'batch'):
         raise ValueError(f"normal_nn must be 'kdtree' or 'batch', got {normal_nn!r}")
     nrm_tree = cKDTree(pts3n) if (use_normal and normal_nn == 'kdtree') else None
+
+    # Phase 2a fits GHPR-visible subsets (star-shaped about the viewpoint, so
+    # the box can grow onto them without folding); phase 2b fits the full cloud.
+    # `ghpr_stages` is a list of (gamma, visible_mask), fitted in order for
+    # `visible_epochs` each. Gammas approach 0, so each subset contains the
+    # previous one and the target grows stage by stage. All share one
+    # normalization because the split happens after loading.
+    stages = []
+    if ghpr_stages and visible_epochs > 0:
+        for g, mask in ghpr_stages:
+            vis = np.asarray(mask, dtype=bool)
+            vis_np = pts3n[vis]
+            stages.append({
+                'gamma': g,
+                'np': vis_np,
+                'dev': torch.tensor(vis_np, dtype=torch.float32, device=device),
+                'nrm': nrm_dev[torch.as_tensor(vis, device=device)] if use_normal else None,
+                'tree': cKDTree(vis_np) if nrm_tree is not None else None,
+            })
+    n_stage_epochs = len(stages) * visible_epochs
+
+    # With more than one stage, the normal loss follows a per-phase hard switch
+    # instead of the global delay/warmup: off for the first `normal_off_epochs`
+    # of every phase (each GHPR stage and the full-cloud phase), then full γ.
+    # A single stage keeps the original global schedule.
+    staged_normal = len(stages) > 1
+    normal_off_epochs = int(round(normal_off_frac * visible_epochs)) if staged_normal else 0
+    if staged_normal and n_stage_epochs >= epochs:
+        raise ValueError(
+            f"{len(stages)} GHPR stages x {visible_epochs} epochs = {n_stage_epochs} "
+            f"leaves no full-cloud phase within --epochs {epochs}")
+
+    if surface_loss_type not in ('chamfer', 'ddf', 'cd_ddf'):
+        raise ValueError(f"Unknown surface_loss_type: {surface_loss_type}. "
+                         f"Use 'chamfer', 'ddf', or 'cd_ddf'.")
+    if lambda_chamfer < 0 or lambda_ddf < 0:
+        raise ValueError("--lambda_chamfer/--lambda_ddf must be >= 0, got "
+                         f"{lambda_chamfer}/{lambda_ddf}")
+    if surface_loss_type == 'cd_ddf' and lambda_chamfer == 0 and lambda_ddf == 0:
+        raise ValueError("surface_loss_type='cd_ddf' needs lambda_chamfer > 0 or lambda_ddf > 0")
+    if ddf_start_epoch < 0 or chamfer_resume_epoch < 0 or ddf_mu_decay < 0:
+        raise ValueError("--ddf_start_epoch/--chamfer_resume_epoch/--ddf_mu_decay must be >= 0")
+    if chamfer_resume_epoch > 0 and chamfer_resume_epoch <= ddf_start_epoch:
+        raise ValueError(
+            f"--chamfer_resume_epoch ({chamfer_resume_epoch}) must be > --ddf_start_epoch "
+            f"({ddf_start_epoch}) so the DDF phase has time to run.")
+    if surface_loss_type != 'chamfer' and ddf_start_epoch > epochs:
+        raise ValueError(
+            f"--ddf_start_epoch ({ddf_start_epoch}) is past the last epoch ({epochs}), "
+            f"so the DDF phase never runs.")
+    if ddf_ref_points is not None and ddf_ref_gt is None:
+        raise ValueError("ddf_ref_points was supplied without its ddf_ref_gt")
+    use_ddf_at_all = surface_loss_type in ('ddf', 'cd_ddf')
+
+
+    def _refresh_ddf_reference(pool_points):
+        ref = sample_ddf_reference_points(pool_points, sigma=ddf_sigma,
+                                          n_points=ddf_n_reference_points)
+        with torch.no_grad():
+            gt = directional_distance_field(ref, pool_points, k=ddf_k_neighbors,
+                                            chunk_size=ddf_chunk_size)
+        return ref, gt
+
+    def _save_ddf_reference_snapshot(epoch, ref, gt, pool_points, force=False):
+        """`force` covers a freshly (re)built shell, whose epoch is rarely a
+        multiple of save_ddf_reference_every."""
+        if save_ddf_reference_every <= 0 or ref is None:
+            return
+        if not force and epoch % save_ddf_reference_every != 0:
+            return
+        correspondence_vis.export_ddf_reference_debug(
+            ref_points=ref.detach().cpu().numpy(),
+            target_points=pool_points.detach().cpu().numpy(),
+            ref_gt=None if gt is None else gt.detach().cpu().numpy(),
+            output_dir=os.path.join(vis_dir, 'ddf_debug', f'epoch_{epoch:05d}'),
+            max_vectors=min(2000, ref.shape[0]))
+
+    # A supplied shell is assumed to belong to the full cloud; anything built
+    # here is tagged with the pool it came from so a pool switch rebuilds it.
+    ddf_ref_pool = pts_dev if ddf_ref_points is not None else None
+    ddf_ref_epoch = 0
+
     opt, sched = _adaptive_make_optim(model, lr, epochs)
-    history = {'epoch': [], 'cd': [], 'ddf': [],'tangent': [], 'svd': [], 'normal': [],
+    history = {'epoch': [], 'cd': [], 'ddf': [], 'surface': [],
+               'tangent': [], 'svd': [], 'normal': [],
                'normal_fwd': [], 'normal_bwd': [],
-               'total': [], 'n_leaves': [], 'tangent_mode': []}
+               'total': [], 'n_leaves': [], 'tangent_mode': [],
+               'surface_phase': [], 'ghpr_stage': [],
+               # first epoch of every GHPR stage / the full-cloud phase
+               'phase_starts': ([i * visible_epochs + 1 for i in range(len(stages))]
+                                + [n_stage_epochs + 1]) if stages else []}
     events = []
     zero = torch.tensor(0.0, device=device)
     need_jac = (mu > 0) or (lam_svd > 0) or use_normal
@@ -1595,7 +1701,29 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     print(f"  leaves={model.n_patches}  target points={pts3n.shape[0]}")
     print(f"  subdiv: threshold={subdiv_threshold}  max_depth={subdiv_max_depth}  "
           f"every={subdiv_every}  start={subdiv_start}  mode={distortion_mode}")
+    if stages and ghpr_subdiv_max_depth is not None:
+        print(f"  subdiv max_depth during GHPR stages (epochs 1-{n_stage_epochs}): "
+              f"{ghpr_subdiv_max_depth}")
     print(f"  epochs={epochs}  M_per_patch={M_per_patch}  lr={lr}  μ={mu}")
+    if use_ddf_at_all:
+        window = (f"epochs {max(ddf_start_epoch, 1)}-{chamfer_resume_epoch - 1}"
+                  if chamfer_resume_epoch > 0
+                  else f"epochs {max(ddf_start_epoch, 1)}-{epochs}")
+        if surface_loss_type == 'cd_ddf':
+            print(f"  Surface loss: CD for epochs 1-{max(ddf_start_epoch - 1, 0)}, then "
+                  f"λ_cd={lambda_chamfer}·CD + λ_ddf={lambda_ddf}·DDF for {window}"
+                  + (f", then CD again from epoch {chamfer_resume_epoch}"
+                     if chamfer_resume_epoch > 0 else ""))
+        else:
+            print(f"  Surface loss: CD for epochs 1-{max(ddf_start_epoch - 1, 0)}, then "
+                  f"λ_ddf={lambda_ddf}·DDF for {window}"
+                  + (f", then CD again from epoch {chamfer_resume_epoch}"
+                     if chamfer_resume_epoch > 0 else ""))
+        print(f"  DDF: n_ref={ddf_n_reference_points}  k={ddf_k_neighbors}  "
+              f"σ={ddf_sigma}  β={ddf_beta}  resample_every={ddf_resample_every}  "
+              f"μ scaling during DDF=×{ddf_mu_decay}")
+    else:
+        print("  Surface loss: Chamfer distance for the whole run")
     if mu > 0:
         if sym_dirichlet_epoch > 0 and tangent_mode != 'symmetric_dirichlet':
             print(f"  Tangent energy: {tangent_mode} for epochs 1-{sym_dirichlet_epoch - 1}, "
@@ -1606,10 +1734,24 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         print(f"  SVD loss: λ_svd={lam_svd}  mode={svd_mode}"
               + (f"  target={svd_target}" if svd_mode == 'arap' else "")
               + f"  eps={svd_eps}  (depth-normalized singular values)")
+    if stages:
+        print(f"  GHPR stages: {len(stages)} x {visible_epochs} epochs, then full cloud "
+              f"for epochs {n_stage_epochs + 1}-{epochs}")
+        for i, s in enumerate(stages):
+            print(f"    stage {i + 1}: γ={s['gamma']:g}  {s['np'].shape[0]} pts  "
+                  f"epochs {i * visible_epochs + 1}-{(i + 1) * visible_epochs}")
     if use_normal:
+        if staged_normal:
+            schedule_str = (f"  per phase: off for the first {normal_off_epochs} epochs, "
+                            f"then on (hard switch)"
+                            + ("; --gamma_warmup_delay/--gamma_warmup_epochs ignored"
+                               if (gamma_warmup_delay > 0 or gamma_warmup_epochs > 0) else ""))
+        elif gamma_warmup_delay > 0 or gamma_warmup_epochs > 0:
+            schedule_str = f"  delay={gamma_warmup_delay} warmup={gamma_warmup_epochs}"
+        else:
+            schedule_str = ""
         print(f"  Normal loss: γ={gamma}  {'unsigned (1-|cos|)' if normal_unsigned else 'signed (1-cos)'}"
-              + (f"  delay={gamma_warmup_delay} warmup={gamma_warmup_epochs}"
-                 if (gamma_warmup_delay > 0 or gamma_warmup_epochs > 0) else "")
+              + schedule_str
               + (f"  NN=KD-tree over full cloud ({pts3n.shape[0]} pts)"
                  if nrm_tree is not None else "  NN=within target batch")
               + f"  weights: fwd(pred→tgt)={normal_w_fwd} bwd(tgt→pred)={normal_w_bwd}")
@@ -1646,14 +1788,20 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                     and (subdiv_stop <= 0 or epoch <= subdiv_stop)
                     and epoch % subdiv_every == 0)
         if do_check:
+            # The GHPR stages fit partial targets, so they may use a shallower
+            # depth cap; the full-cloud phase lifts it to subdiv_max_depth.
+            max_depth = (ghpr_subdiv_max_depth
+                         if ghpr_subdiv_max_depth is not None and epoch <= n_stage_epochs
+                         else subdiv_max_depth)
             old_vf = model.complex.vertex_features
             rep = subdivide_by_distortion(
-                model, subdiv_threshold, subdiv_max_depth,
+                model, subdiv_threshold, max_depth,
                 samples_per_patch=distortion_samples, mode=distortion_mode,
                 max_splits_per_round=max_splits_per_round)
             print(f"  [subdiv @ {epoch}] distortion max={rep['max_distortion']:.4f} "
                   f"mean={rep['mean_distortion']:.4f}  split={rep['n_subdivided']} "
-                  f"→ leaves={rep['n_leaves']} vertices={rep['n_vertices']}")
+                  f"→ leaves={rep['n_leaves']} vertices={rep['n_vertices']}  "
+                  f"max_depth={max_depth}")
             if rep['n_subdivided'] > 0:
                 # vertex_features was replaced → rebuild optimizer/scheduler,
                 # carrying the Adam moments over so the surface isn't kicked.
@@ -1669,6 +1817,27 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 model, os.path.join(vis_dir, f'patch_config_{epoch:05d}.png'),
                 pts=pts3n)
 
+        # ── target pool for this phase ───────────────────────────────────
+        in_warmup = epoch <= n_stage_epochs
+        if in_warmup:
+            stage_idx = (epoch - 1) // visible_epochs
+            s = stages[stage_idx]
+            pool, pool_np, pool_tree, pool_nrm = s['dev'], s['np'], s['tree'], s['nrm']
+            phase_start = stage_idx * visible_epochs + 1
+        else:
+            stage_idx = None
+            pool, pool_np, pool_tree, pool_nrm = pts_dev, pts3n, nrm_tree, nrm_dev
+            phase_start = n_stage_epochs + 1
+        if stages and epoch == phase_start:
+            what = (f"GHPR stage {stage_idx + 1}/{len(stages)} γ={stages[stage_idx]['gamma']:g}"
+                    if in_warmup else "full cloud")
+            print(f"  [phase @ {epoch}] {what} ({pool.shape[0]} pts)"
+                  + (f", normal loss off until epoch {phase_start + normal_off_epochs}"
+                     if use_normal and staged_normal and normal_off_epochs > 0 else ""))
+        if (use_normal and staged_normal and normal_off_epochs > 0
+                and epoch == phase_start + normal_off_epochs):
+            print(f"  [normal @ {epoch}] normal loss ON (γ={gamma})")
+
         # ── training step ────────────────────────────────────────────────
         K = model.n_patches
         pids = torch.arange(K, device=device).repeat_interleave(M_per_patch)
@@ -1676,39 +1845,61 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                         requires_grad=need_jac)
         Q = model(pids, uv)
 
-        B = min(K * M_per_patch, pts_dev.shape[0])
-        ridx = torch.randint(0, pts_dev.shape[0], (B,), device=device)
-        tgt = pts_dev[ridx]
+        B = min(K * M_per_patch, pool.shape[0])
+        ridx = torch.randint(0, pool.shape[0], (B,), device=device)
+        tgt = pool[ridx]
 
-        # Surface Constraint: Chamfer distance between the predicted surface and the target point cloud.
-        cd_loss = chamfer_distance_chunked(Q, pts_dev[ridx], chunk_size=2048)
+        use_ddf = (use_ddf_at_all
+                   and epoch >= ddf_start_epoch
+                   and (chamfer_resume_epoch <= 0 or epoch < chamfer_resume_epoch))
 
-        # Surface Constraint: Directional Distance Field (DDF) loss
-        if ddf_ref_points is None:
-            ddf_ref_points = sample_ddf_reference_points(
-                pts_dev, sigma=ddf_sigma, n_points=ddf_n_reference_points
+        if use_ddf:
+            pool_changed = ddf_ref_pool is not pool
+            if (ddf_ref_points is None or pool_changed
+                    or (ddf_resample_every > 0
+                        and epoch - ddf_ref_epoch >= ddf_resample_every)):
+                ddf_ref_points, ddf_ref_gt = _refresh_ddf_reference(pool)
+                ddf_ref_epoch = epoch
+                if pool_changed:
+                    print(f"  [ddf @ {epoch}] reference shell: "
+                          f"{ddf_ref_points.shape[0]} points, σ={ddf_sigma}, "
+                          f"built from the {'visible subset' if in_warmup else 'full cloud'} "
+                          f"({pool.shape[0]} pts)")
+                ddf_ref_pool = pool
+                _save_ddf_reference_snapshot(epoch, ddf_ref_points, ddf_ref_gt,
+                                             pool, force=True)
+            else:
+                _save_ddf_reference_snapshot(epoch, ddf_ref_points, ddf_ref_gt, pool)
+
+            ddf_loss = directional_distance_loss(
+                Q,
+                ddf_ref_points,
+                ddf_ref_gt,
+                k=ddf_k_neighbors,
+                beta=ddf_beta,
+                chunk_size=ddf_chunk_size,
             )
+        else:
+            ddf_loss = zero
+
+        # Surface Constraint: Chamfer distance between the predicted surface and
+        # the target point cloud. Outside the DDF window it IS the surface loss;
+        # inside it, it is only part of the loss for 'cd_ddf' — otherwise it is
+        # evaluated without a graph, purely so the logged CD stays comparable
+        # across phases.
+        cd_in_loss = (not use_ddf) or surface_loss_type == 'cd_ddf'
+        if cd_in_loss:
+            cd_loss = chamfer_distance_chunked(Q, tgt, chunk_size=2048)
+        else:
             with torch.no_grad():
-                ddf_ref_gt = directional_distance_field(
-                    ddf_ref_points, pts_dev,
-                    k=ddf_k_neighbors, chunk_size=ddf_chunk_size
-                )
+                cd_loss = chamfer_distance_chunked(Q, tgt, chunk_size=2048)
 
-        ddf_loss = directional_distance_loss(
-            Q,
-            ddf_ref_points,
-            ddf_ref_gt,
-            k=ddf_k_neighbors,
-            beta=ddf_beta,
-            chunk_size=ddf_chunk_size,
-        )
-
-        if epochs < 5000:
+        if not use_ddf:
             surface_loss = cd_loss
-        else: 
-            surface_loss = ddf_loss
-
-        surface_loss = cd_loss
+        elif surface_loss_type == 'cd_ddf':
+            surface_loss = lambda_chamfer * cd_loss + lambda_ddf * ddf_loss
+        else:
+            surface_loss = lambda_ddf * ddf_loss
 
         mu_eff = mu_warmup_schedule(epoch, mu_warmup_epochs, mu,
                                     schedule=schedule,
@@ -1716,9 +1907,16 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         svd_eff = mu_warmup_schedule(epoch, svd_warmup_epochs, lam_svd,
                                      schedule=schedule,
                                      delay_epochs=svd_warmup_delay) if lam_svd > 0 else 0.0
-        gamma_eff = mu_warmup_schedule(epoch, gamma_warmup_epochs, gamma,
-                                       schedule=schedule,
-                                       delay_epochs=gamma_warmup_delay) if use_normal else 0.0
+        if not use_normal:
+            gamma_eff = 0.0
+        elif staged_normal:
+            gamma_eff = gamma if epoch - phase_start >= normal_off_epochs else 0.0
+        else:
+            gamma_eff = mu_warmup_schedule(epoch, gamma_warmup_epochs, gamma,
+                                           schedule=schedule,
+                                           delay_epochs=gamma_warmup_delay)
+        if use_ddf:
+            mu_eff *= ddf_mu_decay
 
         # One Jacobian, shared by all Jacobian-based terms.
         if need_jac and (mu_eff > 0 or svd_eff > 0 or gamma_eff > 0):
@@ -1742,21 +1940,21 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 if (svd_eff > 0 and t_u is not None) else zero)
              
         if gamma_eff > 0 and t_u is not None:
-            if nrm_tree is not None:
+            if pool_tree is not None:
                 Q_np = Q.detach().cpu().numpy()
-                _, fwd_np = nrm_tree.query(Q_np, k=1, workers=-1)
+                _, fwd_np = pool_tree.query(Q_np, k=1, workers=-1)
                 nn_fwd = torch.as_tensor(fwd_np, dtype=torch.long, device=device)
                 if normal_w_bwd > 0:
-                    _, bwd_np = cKDTree(Q_np).query(pts3n, k=1, workers=-1)
+                    _, bwd_np = cKDTree(Q_np).query(pool_np, k=1, workers=-1)
                     nn_bwd = torch.as_tensor(bwd_np, dtype=torch.long, device=device)
                 else:
                     nn_bwd = None
                 normal_loss, normal_fwd, normal_bwd = normal_constraint_loss(
-                    t_u, t_v, nrm_dev, nn_fwd, nrm_dev, nn_bwd,
+                    t_u, t_v, pool_nrm, nn_fwd, pool_nrm, nn_bwd,
                     w_fwd=normal_w_fwd, w_bwd=normal_w_bwd, unsigned=normal_unsigned)
             else:
                 # same target subset the Chamfer term used.
-                nrm_batch = nrm_dev[ridx]
+                nrm_batch = pool_nrm[ridx]
                 nn_fwd = chunked_argmin_nn(Q, tgt)
                 nn_bwd = chunked_argmin_nn(tgt, Q) if normal_w_bwd > 0 else None
                 normal_loss, normal_fwd, normal_bwd = normal_constraint_loss(
@@ -1792,22 +1990,37 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             history['normal'].append(float(normal_loss))
             history['normal_fwd'].append(float(normal_fwd))
             history['normal_bwd'].append(float(normal_bwd))
+            history['surface'].append(float(surface_loss))
             history['total'].append(float(loss))
             history['n_leaves'].append(model.n_patches)
             history['tangent_mode'].append(tangent_mode_eff)
+            history['surface_phase'].append(
+                ('cd_ddf' if surface_loss_type == 'cd_ddf' else 'ddf') if use_ddf else 'chamfer')
+            history['ghpr_stage'].append(stage_idx + 1 if in_warmup else 0)   # 0 = full cloud
             tangent_tag = 'SymDir' if tangent_mode_eff == 'symmetric_dirichlet' else 'Tangent'
             normal_str = (f"Normal={float(normal_loss):.5f} "
                           f"(f{float(normal_fwd):.3f}/b{float(normal_bwd):.3f})  "
                           f"γ_eff={float(gamma_eff):.3f}  "
                           if use_normal else "")
-            print(f"  Epoch {epoch:5d}/{epochs}  |  CD={float(cd_loss):.5f}  "
+            # Mark which term is actually being optimized: '*' = in the loss,
+            # '(·)' = evaluated for monitoring only.
+            cd_str = (f"CD={float(cd_loss):.5f}" if cd_in_loss
+                      else f"CD=({float(cd_loss):.5f})")
+            ddf_str = (f"DDF={float(ddf_loss):.5f}  " if use_ddf
+                       else ("DDF=--  " if use_ddf_at_all else ""))
+            print(f"  Epoch {epoch:5d}/{epochs}  |  {cd_str}  {ddf_str}"
                   f"{tangent_tag}={float(tangent):.5f}  SVD={float(svd_loss):.5f}  "
                   f"{normal_str}"
                   f"Total={float(loss):.5f}  μ_eff={float(mu_eff):.3f}  "
                   f"λsvd_eff={float(svd_eff):.3f}  leaves={model.n_patches}  "
-                  f"[{time.time() - t0:.1f}s]")
+                  + (f"stage={stage_idx + 1 if in_warmup else 'full'}  " if stages else "")
+                  + f"[{time.time() - t0:.1f}s]")
 
-        if checkpoint_every > 0 and epoch % checkpoint_every == 0:
+        # Also checkpoint the last epoch of every GHPR stage, so each stage's
+        # end state is kept even when it doesn't fall on checkpoint_every.
+        stage_end = (len(stages) > 1 and in_warmup
+                     and epoch == phase_start + visible_epochs - 1)
+        if (checkpoint_every > 0 and epoch % checkpoint_every == 0) or stage_end:
             extra = dict(checkpoint_extra or {})
             extra.update({'epoch': epoch, 'history': history,
                           'subdivision_events': events})
@@ -1817,55 +2030,62 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     return history, events
 
 
+def _resolve_ghpr_gammas(args):
+    """GHPR gamma per stage, validated before any training time is spent.
+
+    `--ghpr_gammas` gives the list explicitly. Otherwise `--ghpr_stages N`
+    derives it from `--ghpr_gamma`, moving 10x closer to 0 each stage
+    (e.g. -0.01, -0.001, -0.0001).
+    """
+    if args.ghpr_gammas:
+        gammas = [float(g) for g in args.ghpr_gammas]
+        if args.ghpr_stages not in (1, len(gammas)):
+            raise ValueError(
+                f"--ghpr_stages {args.ghpr_stages} does not match the "
+                f"{len(gammas)} values given to --ghpr_gammas")
+    else:
+        if args.ghpr_stages < 1:
+            raise ValueError(f"--ghpr_stages must be >= 1, got {args.ghpr_stages}")
+        # Round away float noise (-0.01 * 0.1**2 = -0.00010000000000000002).
+        gammas = [float(f'{args.ghpr_gamma * 0.1 ** i:.10g}')
+                  for i in range(args.ghpr_stages)]
+
+    if args.ghpr_keep_largest and args.ghpr_connect_radius <= 0:
+        raise ValueError(f"--ghpr_connect_radius must be > 0, got {args.ghpr_connect_radius}")
+    if any(g >= 0 for g in gammas):
+        raise ValueError(f"GHPR gammas must be negative (0 marks every point "
+                         f"visible), got {gammas}")
+    # Each stage should see a superset of the previous one, i.e. gamma moves
+    # toward 0.
+    if any(a >= b for a, b in zip(gammas, gammas[1:])):
+        raise ValueError(f"GHPR gammas must move strictly toward 0, stage by "
+                         f"stage (e.g. -0.01 -0.001 -0.0001), got {gammas}")
+    if len(gammas) > 1:
+        if args.visible_epochs <= 0:
+            raise ValueError(f"{len(gammas)} GHPR stages need --visible_epochs > 0")
+        if len(gammas) * args.visible_epochs >= args.epochs:
+            raise ValueError(
+                f"{len(gammas)} GHPR stages x --visible_epochs {args.visible_epochs} = "
+                f"{len(gammas) * args.visible_epochs} leaves no full-cloud phase within "
+                f"--epochs {args.epochs}")
+        if not 0.0 <= args.normal_off_frac <= 1.0:
+            raise ValueError(f"--normal_off_frac must be in [0, 1], got {args.normal_off_frac}")
+    return gammas
+
+
 def run_adaptive(args):
     """Entry point for `main.py --adaptive`: the quadtree cube-atlas pipeline."""
     if args.pretrain_loss not in ('mse', 'l1'):
         raise ValueError(
             f"--adaptive supports --pretrain_loss mse or l1, got '{args.pretrain_loss}'. "
             f"('cd' is only available in the fixed-grid pipeline.)")
+    ghpr_gammas = _resolve_ghpr_gammas(args) if args.ghpr_init else None
 
     result_dir = utils._get_unique_folder(args.result_dir)
     os.makedirs(result_dir, exist_ok=True)
     print(f"  Output directory: {result_dir}")
 
-    # ── model ────────────────────────────────────────────────────────────
-    if args.load_ckpt:
-        ckpt = torch.load(args.load_ckpt, map_location='cpu')
-        model = AdaptiveCubeForwardMap.from_checkpoint(ckpt, device=args.device)
-        model.train()
-        print(f"  Resumed adaptive model from {args.load_ckpt}: "
-              f"{model.n_patches} leaves, {model.complex.n_vertices} vertices")
-    else:
-        model = AdaptiveCubeForwardMap(
-            d_features=args.d_features, base_subdivisions=args.base_subdivisions,
-            L=args.L, W=args.W, D=args.D, beta=args.beta).to(args.device)
-        model.complex.rebuild_flat()
-
-    # ── phase 1: box pretraining ─────────────────────────────────────────
-    pretrain_history = None
-    if not args.skip_pretrain and not args.load_ckpt:
-        pretrain_history = pretrain_adaptive_box(
-            model, epochs=args.pretrain_epochs, M_per_patch=args.M_per_patch,
-            lr=args.lr, device=args.device, log_every=args.log_every,
-            loss_type=args.pretrain_loss)
-
-        visualize_patch_configuration(
-            model, os.path.join(result_dir, 'patch_config_pretrain.png'))
-        verts, faces = utils.sample_multi_patch_grid(
-            model, resolution=args.mesh_res, device=args.device)
-        utils.export_ply(verts, faces,
-                         os.path.join(result_dir, 'pretrain_box.ply'))
-        _adaptive_save_ckpt(model, os.path.join(result_dir, 'pretrain_checkpoint.pt'),
-                            {'phase': 'pretrain', 'history': pretrain_history,
-                             'args': vars(args)})
-        if args.pretrain_only:
-            plot_history(pretrain_history,
-                         os.path.join(result_dir, 'pretrain_history.png'))
-            print("  Pretraining complete (pretrain_only). Inspect the seam "
-                  "check, pretrain_box.ply and patch_config_pretrain.png.")
-            return
-
-    # ── data ─────────────────────────────────────────────────────────────
+    # point cloud loader 
     downsample_n = None if args.N is not None and args.N < 0 else args.N
     if args.file:
         pts3n, meta = utils.load_point_cloud(args.file, downsample_n=downsample_n)
@@ -1890,6 +2110,163 @@ def run_adaptive(args):
     else:
         normals = None
 
+    # GHPR warm start
+    ghpr_stages, ghpr_info = [], None       # [(gamma, visible_mask), ...]
+    box_center = np.zeros(3)
+    box_radius = 1.0
+    if args.ghpr_init:
+        # One viewpoint (and box radius) for every stage: the first gamma picks
+        # it, the others only re-run the visibility test from the same point.
+        res = ghpr_from_points(pts3n, meta.get('normals'), gamma=ghpr_gammas[0],
+                               k=args.ghpr_k, viewpoint=args.box_center)
+        visible_mask = res['visible']
+        box_center, box_radius = res['viewpoint'], res['radius']
+        ghpr_stages = [(ghpr_gammas[0], visible_mask)] + [
+            (g, ghpr_visible(pts3n, box_center, g)) for g in ghpr_gammas[1:]]
+
+        # Optionally keep one connected group per stage (see keep_connected).
+        # The box radius stays measured to the nearest point of the whole
+        # visible set, so the start box never pokes through a dropped island.
+        raw_masks = [m for _, m in ghpr_stages]
+        connect_stats, connect_radius = None, None
+        if args.ghpr_keep_largest:
+            d_nn = median_nn_spacing(pts3n)
+            connect_radius = args.ghpr_connect_radius * d_nn
+            kept, connect_stats = keep_connected(pts3n, raw_masks, connect_radius)
+            ghpr_stages = [(g, k) for (g, _), k in zip(ghpr_stages, kept)]
+
+        ghpr_info = {
+            'gamma': ghpr_gammas[0],
+            'viewpoint': box_center.tolist(),
+            'viewpoint_source': res['source'],
+            'interior_score': res['inside_score'],
+            'box_radius': box_radius,
+            'n_visible': int(visible_mask.sum()),
+            'visible_fraction': res['visible_fraction'],
+            'visible_epochs': args.visible_epochs,
+            # n_visible / visible_fraction: the points actually fitted in that
+            # stage (after the connectivity filter when it is on).
+            'stages': [{'stage': i + 1, 'gamma': g,
+                        'n_visible': int(m.sum()),
+                        'visible_fraction': float(m.mean()),
+                        'epochs': [i * args.visible_epochs + 1,
+                                   (i + 1) * args.visible_epochs],
+                        **({'connectivity': connect_stats[i]} if connect_stats else {})}
+                       for i, (g, m) in enumerate(ghpr_stages)],
+            'keep_largest': ({'connect_radius': connect_radius,
+                              'connect_radius_x_median_nn': args.ghpr_connect_radius}
+                             if connect_stats else None),
+        }
+        print(f"\n  GHPR warm start: {int(visible_mask.sum()):,} of {len(pts3n):,} "
+              f"points visible ({100 * res['visible_fraction']:.1f}%)")
+        if connect_stats:
+            print(f"    keeping one connected group per stage "
+                  f"(link radius {connect_radius:.5f} = {args.ghpr_connect_radius:g} x median NN)")
+        if len(ghpr_stages) > 1 or connect_stats:
+            for st in ghpr_info['stages']:
+                c = st.get('connectivity')
+                print(f"    stage {st['stage']}: γ={st['gamma']:g}  "
+                      f"{st['n_visible']:,} pts ({100 * st['visible_fraction']:.1f}%)  "
+                      f"epochs {st['epochs'][0]}-{st['epochs'][1]}"
+                      + (f"  [visible {c['n_visible_raw']:,} in {c['n_groups']} groups, "
+                         f"dropped {c['n_dropped']:,}]" if c else ""))
+                if c and c['kept_fraction_of_visible'] < 0.5:
+                    print(f"      [warn] kept only {100 * c['kept_fraction_of_visible']:.1f}% of "
+                          f"this stage's visible points — --ghpr_connect_radius may be too "
+                          f"small to link GHPR's sparse samples")
+                if c and c['contains_previous'] is not None and c['contains_previous'] < 1.0:
+                    print(f"      [warn] holds only {100 * c['contains_previous']:.1f}% of the "
+                          f"previous stage's points, so this stage's target is not a superset")
+        print(f"    viewpoint={np.round(box_center, 5)}  [{res['source']}]"
+              + (f"  interior score={res['inside_score']:.2f}"
+                 if res['inside_score'] is not None else ""))
+        print(f"    box radius={box_radius:.5f}  "
+              f"visible-only epochs={args.visible_epochs}")
+        if res['visible_fraction'] < 0.5:
+            print(f"    [warn] under half the cloud is visible — a closed box fitted "
+                  f"to it may end up more distorted than a plain box start")
+        if args.visible_epochs <= 0:
+            print(f"    [warn] --visible_epochs is 0, so phase 2a is skipped; only "
+                  f"the box placement is affected")
+    if args.box_radius > 0:
+        box_radius = args.box_radius
+    if args.box_center is not None:
+        box_center = np.asarray(args.box_center, dtype=np.float64)
+
+    # GHPR debug 
+    if args.ghpr_init:
+        ghpr_dir = os.path.join(result_dir, 'ghpr')
+        os.makedirs(ghpr_dir, exist_ok=True)
+        nrm_c = np.asarray(meta['center'], np.float64)
+        nrm_s = float(meta['scale'])
+        
+        for i, ((_, mask), raw) in enumerate(zip(ghpr_stages, raw_masks)):
+            prefix = f'stage{i + 1}_' if len(ghpr_stages) > 1 else ''
+            dropped = (raw & ~mask) if connect_stats else None
+            vis_nrm = res['normals'][mask] if res['normals'] is not None else None
+            utils.export_point_cloud_ply(
+                pts3n[mask],
+                os.path.join(ghpr_dir, f'{prefix}ghpr_visible_normalized.ply'), normals=vis_nrm)
+            utils.export_point_cloud_ply(
+                pts3n[mask] * nrm_s + nrm_c,
+                os.path.join(ghpr_dir, f'{prefix}ghpr_visible.ply'), normals=vis_nrm)
+            write_classified_ply(
+                os.path.join(ghpr_dir, f'{prefix}ghpr_classified_normalized.ply'),
+                pts3n, mask, box_center, dropped=dropped)
+            write_classified_ply(
+                os.path.join(ghpr_dir, f'{prefix}ghpr_classified.ply'),
+                pts3n * nrm_s + nrm_c, mask, box_center * nrm_s + nrm_c, dropped=dropped)
+
+        ghpr_info.update({
+            'viewpoint_original': (box_center * nrm_s + nrm_c).tolist(),
+            'box_center_effective': np.asarray(box_center).tolist(),
+            'box_radius_effective': float(box_radius),
+            'normalization': {'center': nrm_c.tolist(), 'scale': nrm_s},
+        })
+        with open(os.path.join(ghpr_dir, 'ghpr.json'), 'w') as f:
+            json.dump(ghpr_info, f, indent=2)
+        print(f"    GHPR debug → {ghpr_dir}")
+
+    # model
+    if args.load_ckpt:
+        ckpt = torch.load(args.load_ckpt, map_location='cpu')
+        model = AdaptiveCubeForwardMap.from_checkpoint(ckpt, device=args.device)
+        model.train()
+        print(f"  Resumed adaptive model from {args.load_ckpt}: "
+              f"{model.n_patches} leaves, {model.complex.n_vertices} vertices")
+    else:
+        model = AdaptiveCubeForwardMap(
+            d_features=args.d_features, base_subdivisions=args.base_subdivisions,
+            L=args.L, W=args.W, D=args.D, beta=args.beta).to(args.device)
+        model.complex.rebuild_flat()
+
+    # first phase: box pretraining
+    pretrain_history = None
+    if not args.skip_pretrain and not args.load_ckpt:
+        pretrain_history = pretrain_adaptive_box(
+            model, epochs=args.pretrain_epochs, M_per_patch=args.M_per_patch,
+            lr=args.lr, device=args.device, log_every=args.log_every,
+            loss_type=args.pretrain_loss,
+            box_center=box_center, box_radius=box_radius)
+
+        visualize_patch_configuration(
+            model, os.path.join(result_dir, 'patch_config_pretrain.png'))
+        verts, faces = utils.sample_multi_patch_grid(
+            model, resolution=args.mesh_res, device=args.device)
+        utils.export_ply(verts, faces,
+                         os.path.join(result_dir, 'pretrain_box.ply'))
+        utils.export_ply(utils.unnormalize_vertices(verts, meta), faces,
+                         os.path.join(result_dir, 'pretrain_box_original.ply'))
+        _adaptive_save_ckpt(model, os.path.join(result_dir, 'pretrain_checkpoint.pt'),
+                            {'phase': 'pretrain', 'history': pretrain_history,
+                             'args': vars(args)})
+        if args.pretrain_only:
+            plot_history(pretrain_history,
+                         os.path.join(result_dir, 'pretrain_history.png'))
+            print("  Pretraining complete (pretrain_only). Inspect the seam "
+                  "check, pretrain_box.ply and patch_config_pretrain.png.")
+            return
+
     checkpoint_extra = {
         'args': vars(args),
         'input_file': input_name,
@@ -1898,6 +2275,9 @@ def run_adaptive(args):
                       else list(meta['center']),
             'scale': float(meta['scale']),
         },
+        'ghpr': ghpr_info,
+        'box_init': {'center': np.asarray(box_center).tolist(),
+                     'radius': float(box_radius)},
     }
     vertex_pos_json_path = os.path.join(result_dir, 'vertex_positions_normalized.json')
     vertex_pos_denorm_json_path = os.path.join(result_dir, 'vertex_positions_denormalized.json')
@@ -1914,6 +2294,7 @@ def run_adaptive(args):
         svd_warmup_delay=args.svd_warmup_delay,
         subdiv_threshold=args.subdiv_threshold,
         subdiv_max_depth=args.subdiv_max_depth,
+        ghpr_subdiv_max_depth=args.ghpr_subdiv_max_depth if args.ghpr_init else None,
         subdiv_every=args.subdiv_every, subdiv_start=args.subdiv_start,
         subdiv_stop=args.subdiv_stop, distortion_mode=args.distortion_mode,
         distortion_samples=args.distortion_samples,
@@ -1925,13 +2306,28 @@ def run_adaptive(args):
         sym_dirichlet_epoch=args.sym_dirichlet_epoch,
         save_vertex_pos_every=args.save_vertex_pos_every,
         vertex_pos_json_path=vertex_pos_json_path,
+        surface_loss_type=args.surface_loss_type,
+        lambda_chamfer=args.lambda_chamfer,
+        lambda_ddf=args.lambda_ddf,
+        ddf_mu_decay=args.ddf_mu_decay,
+        ddf_start_epoch=args.ddf_start_epoch,
+        chamfer_resume_epoch=args.chamfer_resume_epoch,
+        ddf_n_reference_points=args.ddf_n_reference_points,
+        ddf_k_neighbors=args.ddf_k_neighbors,
+        ddf_sigma=args.ddf_sigma,
+        ddf_beta=args.ddf_beta,
+        ddf_resample_every=args.ddf_resample_every,
+        ddf_chunk_size=args.ddf_chunk_size,
+        save_ddf_reference_every=args.save_ddf_reference_every,
         normals=normals, gamma=args.gamma,
         gamma_warmup_epochs=args.gamma_warmup_epochs,
         gamma_warmup_delay=args.gamma_warmup_delay,
         normal_unsigned=args.normal_unsigned,
         normal_nn=args.normal_nn,
         normal_w_fwd=args.normal_w_fwd,
-        normal_w_bwd=args.normal_w_bwd)
+        normal_w_bwd=args.normal_w_bwd,
+        ghpr_stages=ghpr_stages, visible_epochs=args.visible_epochs,
+        normal_off_frac=args.normal_off_frac)
 
     # ── final outputs ────────────────────────────────────────────────────
     model.eval()
@@ -2145,11 +2541,12 @@ def main():
     # Chamfer vs. Directional Distance Field (DDF) surface-fitting loss
     ddf_group = parser.add_argument_group('directional distance field (DDF) loss')
     ddf_group.add_argument('--surface_loss_type', type=str, default='chamfer', choices=['chamfer', 'ddf', 'cd_ddf'],
-                           help='[Multi-patch, no_presplit] Loss driving the pre-correspondence-switch '
-                                'surface-fitting phase: plain Chamfer distance, Directional Distance '
-                                'Field (DDM, Ren et al. 2024, arXiv:2401.09736), or a weighted '
-                                'combination of both. Does not affect the '
-                                'post-corr_switch_epoch MSE phase.')
+                           help='Loss driving the surface-fitting phase: plain Chamfer distance, '
+                                'Directional Distance Field (DDM, Ren et al. 2024, '
+                                'arXiv:2401.09736), or a weighted combination of both. Applies to '
+                                'both --adaptive and the multi-patch pipeline; in the latter it '
+                                'covers only the pre-correspondence-switch phase (no effect on the '
+                                'post-corr_switch_epoch MSE phase) and requires --no_presplit.')
     ddf_group.add_argument('--lambda_chamfer', type=float, default=1.0,
                            help='[CD+DDF] Weight for the Chamfer term when --surface_loss_type=cd_ddf')
     ddf_group.add_argument('--lambda_ddf', type=float, default=1.0,
@@ -2167,7 +2564,7 @@ def main():
     ddf_group.add_argument('--ddf_mu_decay', type=float, default=1,
                            help='[DDF] Multiplier applied to tangent-loss weight μ once training switches '
                                 'from Chamfer to DDF (e.g. 0.5 halves μ during the DDF phase)')
-    ddf_group.add_argument('--ddf_n_reference_points', type=int, default=25000,
+    ddf_group.add_argument('--ddf_n_reference_points', type=int, default=100000,
                            help='[DDF] Number of reference points sampled near the target surface')
     ddf_group.add_argument('--ddf_k_neighbors', type=int, default=5,
                            help='[DDF] Number of nearest neighbors used to approximate the closest surface point')
@@ -2199,6 +2596,51 @@ def main():
     adaptive_group.add_argument('--save_vertex_pos_every', type=int, default=10,
                             help='[Adaptive] Save tracked logical vertex positions every N epochs (0 disables)')
 
+    # GHPR warm start: small box at an interior viewpoint, fitted to the
+    # visible (star-shaped) subset first, then to the full cloud.
+    ghpr_group = parser.add_argument_group('GHPR warm start (--adaptive)')
+    ghpr_group.add_argument('--ghpr_init', action='store_true',
+                            help='[Adaptive] Pick an interior viewpoint with GHPR, start '
+                                 'the pretrain box there sized to the nearest visible '
+                                 'point, and fit the visible subset before the full cloud')
+    ghpr_group.add_argument('--ghpr_gamma', type=float, default=-0.01,
+                            help='[Adaptive] GHPR kernel exponent. Nearer 0 keeps more '
+                                 'points; for a warm start prefer a loose value so the '
+                                 'target stays as complete as possible')
+    ghpr_group.add_argument('--ghpr_k', type=int, default=15,
+                            help='[Adaptive] Neighbours used by the interior test')
+    ghpr_group.add_argument('--visible_epochs', type=int, default=2000,
+                            help='[Adaptive] Epochs to fit each GHPR stage\'s visible subset '
+                                 'before moving on (0 = skip the visible-only phase)')
+    ghpr_group.add_argument('--ghpr_stages', type=int, default=1,
+                            help='[Adaptive] Number of visible-only stages before the full '
+                                 'cloud. Stage i uses gamma = --ghpr_gamma x 0.1^i (e.g. 3 → '
+                                 '-0.01, -0.001, -0.0001), each for --visible_epochs; the '
+                                 'full cloud gets the rest of --epochs. With more than one '
+                                 'stage the normal loss is switched per phase, see '
+                                 '--normal_off_frac. 1 = original single-stage behaviour')
+    ghpr_group.add_argument('--ghpr_gammas', type=float, nargs='+', default=None,
+                            help='[Adaptive] Explicit per-stage gammas, moving toward 0 '
+                                 '(e.g. -0.01 -0.001 -0.0001). Overrides the values derived '
+                                 'from --ghpr_gamma; the stage count follows the list')
+    ghpr_group.add_argument('--ghpr_keep_largest', action='store_true',
+                            help='[Adaptive] Keep one connected group of visible points per '
+                                 'GHPR stage: the largest in stage 1, then the group holding '
+                                 'the previous stage\'s points. Drops islands seen through '
+                                 'gaps, which Chamfer would otherwise stretch the surface '
+                                 'across; they return in a later stage or the full cloud')
+    ghpr_group.add_argument('--ghpr_connect_radius', type=float, default=5.0,
+                            help='[Adaptive] Link distance for --ghpr_keep_largest, in '
+                                 'multiples of the cloud\'s median nearest-neighbour spacing. '
+                                 'Too small splits GHPR\'s sparse samples into specks; too '
+                                 'large bridges separate surfaces that nearly touch')
+    ghpr_group.add_argument('--box_center', type=float, nargs=3, default=None,
+                            help='[Adaptive] Pretrain box centre in the NORMALIZED frame, '
+                                 'overriding the GHPR viewpoint (default: origin)')
+    ghpr_group.add_argument('--box_radius', type=float, default=0.0,
+                            help='[Adaptive] Pretrain box half-width, overriding the GHPR '
+                                 'inscribed radius (0 = auto; 1.0 is the old [-1,1]^3 box)')
+
     # Tangent (μ-weighted) energy schedule
     tangent_group = parser.add_argument_group('tangent energy schedule (--adaptive)')
     tangent_group.add_argument('--tangent_mode', type=str, default='dirichlet',
@@ -2217,6 +2659,12 @@ def main():
                                    'epochs (0 = full weight immediately)')
     normal_group.add_argument('--gamma_warmup_delay', type=int, default=0,
                               help='[Adaptive] Keep γ at 0 for this many epochs before the ramp')
+    normal_group.add_argument('--normal_off_frac', type=float, default=1,
+                              help='[Adaptive, >1 GHPR stage] Fraction of --visible_epochs at '
+                                   'the start of every phase (each GHPR stage and the '
+                                   'full-cloud phase) with the normal loss off; it then turns '
+                                   'on at full γ (hard switch). Replaces --gamma_warmup_delay/'
+                                   '--gamma_warmup_epochs in that mode')
     normal_group.add_argument('--normal_unsigned', action='store_true',
                               help='[Adaptive] Use 1-|cos| so the loss ignores whether the '
                                    'file normals point inward or outward (the atlas normal '
@@ -2259,10 +2707,15 @@ def main():
                               help='Distortion above which a leaf is subdivided (0 disables)')
     subdiv_group.add_argument('--subdiv_max_depth', type=int, default=5,
                               help='Absolute quadtree depth cap (base_subdivisions count)')
+    subdiv_group.add_argument('--ghpr_subdiv_max_depth', type=int, default=None,
+                              help='[Adaptive, --ghpr_init] Depth cap used while fitting the '
+                                   'GHPR visible stages; the full-cloud phase uses '
+                                   '--subdiv_max_depth (default: same cap throughout). '
+                                   'Leaves already deeper are never merged back')
     subdiv_group.add_argument('--subdiv_every', type=int, default=500)
     subdiv_group.add_argument('--subdiv_start', type=int, default=1000)
     subdiv_group.add_argument('--subdiv_stop', type=int, default=0, help='0 = never stop')
-    subdiv_group.add_argument('--distortion_mode', type=str, default='area',
+    subdiv_group.add_argument('--distortion_mode', type=str, default='dirichlet',
                               choices=['area', 'dirichlet', 'conformal', 'symmetric_dirichlet'],)
     subdiv_group.add_argument('--distortion_samples', type=int, default=128)
     subdiv_group.add_argument('--max_splits_per_round', type=int, default=0,
