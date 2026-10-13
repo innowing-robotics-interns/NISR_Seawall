@@ -1437,7 +1437,7 @@ ADAPTIVE_DEFAULTS = {
     'mu': 1.0,
     'M_per_patch': 128,
     'pretrain_loss': 'mse',
-    'gamma': 0.05,
+    'gamma': 0,
 }
 
 
@@ -1501,14 +1501,35 @@ def _adaptive_save_ckpt(model, path, extra=None):
     print(f"    Checkpoint → {path}")
 
 
+def aabb_box(points, margin=0.05, min_frac=0.1):
+    """Axis-aligned bounding cuboid of a cloud, as (center, per-axis half-extent).
+
+    Each half-extent is floored to `min_frac` of the largest one, so a flat or
+    thin cloud still gets a cuboid with volume rather than two box faces lying
+    on top of each other. `margin` then enlarges every axis by that fraction so
+    the box sits strictly outside the cloud.
+    """
+    if margin < 0:
+        raise ValueError(f"--box_margin must be >= 0, got {margin}")
+    if not 0.0 <= min_frac <= 1.0:
+        raise ValueError(f"--box_min_frac must be in [0, 1], got {min_frac}")
+    lo, hi = points.min(axis=0), points.max(axis=0)
+    center = 0.5 * (lo + hi)
+    half = 0.5 * (hi - lo)
+    half = np.maximum(half, min_frac * half.max())
+    half = half * (1.0 + margin)
+    return center.astype(np.float64), half.astype(np.float64)
+
+
 def pretrain_adaptive_box(model, epochs, M_per_patch, lr, device, log_every,
                           loss_type='mse', box_center=None, box_radius=1.0):
     """Fit every leaf patch to its own piece of the reference cube.
 
-    `box_center`/`box_radius` place and size that cube. The default is the
-    canonical [-1,1]^3; a small box at the GHPR viewpoint makes the surface grow
-    outward instead of shrinking inward. `cube_xyz` itself is left alone — it
-    stays the reference address space used by the seam check and PE.
+    `box_center`/`box_radius` place and size that cube. `box_radius` is either
+    a scalar (a cube) or a per-axis half-extent of shape (3,) (a cuboid, e.g.
+    the cloud's bounding box). A small box at the GHPR viewpoint makes the
+    surface grow outward instead of shrinking inward. `cube_xyz` itself is left
+    alone — it stays the reference address space used by the seam check and PE.
     """
     loss_fn = nn.MSELoss() if loss_type == 'mse' else nn.L1Loss()
     opt, sched = _adaptive_make_optim(model, lr, epochs)
@@ -1516,6 +1537,9 @@ def pretrain_adaptive_box(model, epochs, M_per_patch, lr, device, log_every,
 
     center = torch.zeros(3, device=device) if box_center is None else \
         torch.as_tensor(box_center, dtype=torch.float32, device=device).reshape(1, 3)
+    
+    # (1, 1) for a cube, (1, 3) for a cuboid; broadcasts against (B, 3) either way.
+    radius = torch.as_tensor(box_radius, dtype=torch.float32, device=device).reshape(1, -1)
 
     print(f"\n{'─' * 60}")
     print("  Phase 1 — box pretraining (structure validation, no subdivision)")
@@ -1523,7 +1547,7 @@ def pretrain_adaptive_box(model, epochs, M_per_patch, lr, device, log_every,
           f"K_max={model.complex.stats()['k_max']}")
     print(f"  epochs={epochs}  M_per_patch={M_per_patch}  lr={lr}  loss={loss_type}")
     print(f"  box: center={np.round(np.asarray(center.detach().cpu()).reshape(3), 5)}  "
-          f"radius={box_radius:.5f}")
+          f"half-extent={np.round(np.asarray(radius.detach().cpu()).reshape(-1), 5)}")
     print(f"{'─' * 60}")
     t0 = time.time()
 
@@ -1533,7 +1557,7 @@ def pretrain_adaptive_box(model, epochs, M_per_patch, lr, device, log_every,
         pids = torch.arange(K, device=device).repeat_interleave(M_per_patch)
         uv = torch.rand(K * M_per_patch, 2, device=device)
         with torch.no_grad():
-            target = center + box_radius * model.cube_xyz(pids, uv)
+            target = center + radius * model.cube_xyz(pids, uv)
         pred = model(pids, uv)
         loss = loss_fn(pred, target)
 
@@ -2188,6 +2212,17 @@ def run_adaptive(args):
         if args.visible_epochs <= 0:
             print(f"    [warn] --visible_epochs is 0, so phase 2a is skipped; only "
                   f"the box placement is affected")
+    elif args.box_init == 'aabb':
+        # Start from outside, but from the cloud's own bounding cuboid instead
+        # of the full [-1,1]^3 cube, so less empty space has to be shrunk away.
+        box_center, box_radius = aabb_box(pts3n, margin=args.box_margin,
+                                          min_frac=args.box_min_frac)
+        lo, hi = pts3n.min(axis=0), pts3n.max(axis=0)
+        print(f"\n  Box init: bounding cuboid of the cloud "
+              f"(margin={args.box_margin:g}, min half-extent={args.box_min_frac:g} x largest)")
+        print(f"    cloud extent={np.round(hi - lo, 5)}  center={np.round(box_center, 5)}  "
+              f"half-extent={np.round(box_radius, 5)}")
+        print(f"    box volume = {100 * np.prod(box_radius):.1f}% of the [-1,1]^3 cube")
     if args.box_radius > 0:
         box_radius = args.box_radius
     if args.box_center is not None:
@@ -2276,8 +2311,11 @@ def run_adaptive(args):
             'scale': float(meta['scale']),
         },
         'ghpr': ghpr_info,
-        'box_init': {'center': np.asarray(box_center).tolist(),
-                     'radius': float(box_radius)},
+        'box_init': {'mode': 'ghpr' if args.ghpr_init else args.box_init,
+                     'center': np.asarray(box_center).tolist(),
+                     # scalar for a cube, [x, y, z] half-extents for a cuboid
+                     'radius': (float(box_radius) if np.ndim(box_radius) == 0
+                                else np.asarray(box_radius).tolist())},
     }
     vertex_pos_json_path = os.path.join(result_dir, 'vertex_positions_normalized.json')
     vertex_pos_denorm_json_path = os.path.join(result_dir, 'vertex_positions_denormalized.json')
@@ -2634,12 +2672,28 @@ def main():
                                  'multiples of the cloud\'s median nearest-neighbour spacing. '
                                  'Too small splits GHPR\'s sparse samples into specks; too '
                                  'large bridges separate surfaces that nearly touch')
+    ghpr_group.add_argument('--box_init', type=str, default='aabb',
+                            choices=['aabb', 'cube'],
+                            help='[Adaptive, without --ghpr_init] Pretrain box start: '
+                                 "'aabb' (default) = the cloud's axis-aligned bounding "
+                                 "cuboid, padded by --box_margin; 'cube' = the old "
+                                 'canonical [-1,1]^3 box')
+    ghpr_group.add_argument('--box_margin', type=float, default=0.05,
+                            help='[Adaptive, --box_init aabb] Enlarge every half-extent of '
+                                 'the bounding cuboid by this fraction, so the box starts '
+                                 'strictly outside the cloud')
+    ghpr_group.add_argument('--box_min_frac', type=float, default=0.1,
+                            help='[Adaptive, --box_init aabb] Floor each half-extent at this '
+                                 'fraction of the largest one, so a flat cloud still gets '
+                                 'a cuboid with thickness instead of a flat sheet')
     ghpr_group.add_argument('--box_center', type=float, nargs=3, default=None,
                             help='[Adaptive] Pretrain box centre in the NORMALIZED frame, '
-                                 'overriding the GHPR viewpoint (default: origin)')
+                                 'overriding the GHPR viewpoint or the bounding-cuboid centre '
+                                 '(default: origin for --box_init cube)')
     ghpr_group.add_argument('--box_radius', type=float, default=0.0,
-                            help='[Adaptive] Pretrain box half-width, overriding the GHPR '
-                                 'inscribed radius (0 = auto; 1.0 is the old [-1,1]^3 box)')
+                            help='[Adaptive] Pretrain box half-width (a cube, same on every '
+                                 'axis), overriding the GHPR inscribed radius or the '
+                                 'bounding cuboid (0 = auto; 1.0 is the old [-1,1]^3 box)')
 
     # Tangent (μ-weighted) energy schedule
     tangent_group = parser.add_argument_group('tangent energy schedule (--adaptive)')
