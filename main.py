@@ -1610,7 +1610,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    normals=None, gamma=0.0,
                    gamma_warmup_epochs=0, gamma_warmup_delay=0,
                    normal_unsigned=False, normal_nn='kdtree',
-                   normal_w_fwd=0.1, normal_w_bwd=1.0,
+                   normal_w_fwd=0.1, normal_w_bwd=1.0, normal_hinge_tau=0.0,
                    ghpr_stages=None, visible_epochs=0, normal_off_frac=0.5,
                    ghpr_subdiv_max_depth=None):
     pts_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
@@ -1625,6 +1625,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     if normal_nn not in ('kdtree', 'batch'):
         raise ValueError(f"normal_nn must be 'kdtree' or 'batch', got {normal_nn!r}")
     nrm_tree = cKDTree(pts3n) if (use_normal and normal_nn == 'kdtree') else None
+
+    hinge_tau = normal_hinge_tau
 
     # Phase 2a fits GHPR-visible subsets (star-shaped about the viewpoint, so
     # the box can grow onto them without folding); phase 2b fits the full cloud.
@@ -1774,7 +1776,9 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             schedule_str = f"  delay={gamma_warmup_delay} warmup={gamma_warmup_epochs}"
         else:
             schedule_str = ""
-        print(f"  Normal loss: γ={gamma}  {'unsigned (1-|cos|)' if normal_unsigned else 'signed (1-cos)'}"
+        c_str = '|cos|' if normal_unsigned else 'cos'
+        form = (f"relu({normal_hinge_tau:g}-{c_str})" if hinge_tau is not None else f"1-{c_str}")
+        print(f"  Normal loss: γ={gamma}  {'unsigned' if normal_unsigned else 'signed'} {form}"
               + schedule_str
               + (f"  NN=KD-tree over full cloud ({pts3n.shape[0]} pts)"
                  if nrm_tree is not None else "  NN=within target batch")
@@ -1975,7 +1979,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                     nn_bwd = None
                 normal_loss, normal_fwd, normal_bwd = normal_constraint_loss(
                     t_u, t_v, pool_nrm, nn_fwd, pool_nrm, nn_bwd,
-                    w_fwd=normal_w_fwd, w_bwd=normal_w_bwd, unsigned=normal_unsigned)
+                    w_fwd=normal_w_fwd, w_bwd=normal_w_bwd, unsigned=normal_unsigned,
+                    hinge_tau=hinge_tau)
             else:
                 # same target subset the Chamfer term used.
                 nrm_batch = pool_nrm[ridx]
@@ -1983,7 +1988,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 nn_bwd = chunked_argmin_nn(tgt, Q) if normal_w_bwd > 0 else None
                 normal_loss, normal_fwd, normal_bwd = normal_constraint_loss(
                     t_u, t_v, nrm_batch, nn_fwd, nrm_batch, nn_bwd,
-                    w_fwd=normal_w_fwd, w_bwd=normal_w_bwd, unsigned=normal_unsigned)
+                    w_fwd=normal_w_fwd, w_bwd=normal_w_bwd, unsigned=normal_unsigned,
+                    hinge_tau=hinge_tau)
         else:
             normal_loss = normal_fwd = normal_bwd = zero
 
@@ -2023,7 +2029,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             history['ghpr_stage'].append(stage_idx + 1 if in_warmup else 0)   # 0 = full cloud
             tangent_tag = 'SymDir' if tangent_mode_eff == 'symmetric_dirichlet' else 'Tangent'
             normal_str = (f"Normal={float(normal_loss):.5f} "
-                          f"(f{float(normal_fwd):.3f}/b{float(normal_bwd):.3f})  "
+                          f"(f{float(normal_fwd):.4f}/b{float(normal_bwd):.4f})  "
                           f"γ_eff={float(gamma_eff):.3f}  "
                           if use_normal else "")
             # Mark which term is actually being optimized: '*' = in the loss,
@@ -2117,6 +2123,9 @@ def run_adaptive(args):
     else:
         pts3n, meta = utils.make_synthetic_surface(args.shape, n=args.N, noise=0)
         input_name = f'synthetic_{args.shape}'
+
+    if args.normal_hinge_tau is not None and not (-1 <= args.normal_hinge_tau < 1):
+        raise ValueError(f"--normal_hinge_tau must be in [-1, 1), got {args.normal_hinge_tau}")
 
     # check whether or not the file contains normals
     normals = meta.get('normals') if args.file else None
@@ -2364,6 +2373,7 @@ def run_adaptive(args):
         normal_nn=args.normal_nn,
         normal_w_fwd=args.normal_w_fwd,
         normal_w_bwd=args.normal_w_bwd,
+        normal_hinge_tau=args.normal_hinge_tau,
         ghpr_stages=ghpr_stages, visible_epochs=args.visible_epochs,
         normal_off_frac=args.normal_off_frac)
 
@@ -2737,6 +2747,10 @@ def main():
                               help='[Adaptive] Weight of the target→pred direction (each target '
                                    'point vs. the normal of its nearest predicted point). This is '
                                    'the coverage term; 0 disables it.')
+    normal_group.add_argument('--normal_hinge_tau', type=float, default=None,
+                              help='[Adaptive] cos threshold below which a '
+                                   'normal is penalized: 0 = more than 90° off, 0.3 ≈ 73°, '
+                                   '0.5 = 60°. Must be in [-1, 1). Default 0.3')
 
     # SVD (singular-value) Jacobian regularization
     svd_group = parser.add_argument_group('SVD tangent regularization (--adaptive)')

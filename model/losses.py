@@ -434,27 +434,31 @@ def normal_constraint_loss(t_u: torch.Tensor, t_v: torch.Tensor,
                            N_fwd: torch.Tensor, nn_fwd: torch.Tensor,
                            N_bwd: torch.Tensor = None, nn_bwd: torch.Tensor = None,
                            w_fwd: float = 0.1, w_bwd: float = 1.0,
-                           unsigned: bool = False):
+                           unsigned: bool = False, hinge_tau: float = None):
     """
     Normal constraint between the predicted surface and the target
     normals, given precomputed nearest-neighbour correspondences
 
     unsigned: use 1 - |cos| (does not conside normals' orientation)
+    hinge_tau: threshold to make the normal loss works under certain angle
     """
-    
+
+    def per_point(cos):
+        if unsigned:
+            cos = cos.abs()
+        if hinge_tau is None:
+            return 1.0 - cos
+        return torch.relu(hinge_tau - cos)
+
     n_surf = torch.cross(t_u, t_v, dim=-1)
     n_surf = n_surf / (n_surf.norm(dim=-1, keepdim=True) + 1e-8)
 
     cos_fwd = torch.sum(n_surf * N_fwd[nn_fwd], dim=-1)
-    if unsigned:
-        cos_fwd = cos_fwd.abs()
-    fwd = (1.0 - cos_fwd).mean()
+    fwd = per_point(cos_fwd).mean()
 
     if N_bwd is not None and nn_bwd is not None and w_bwd > 0:
         cos_bwd = torch.sum(n_surf[nn_bwd] * N_bwd, dim=-1)
-        if unsigned:
-            cos_bwd = cos_bwd.abs()
-        bwd = (1.0 - cos_bwd).mean()
+        bwd = per_point(cos_bwd).mean()
     else:
         bwd = torch.zeros((), device=fwd.device, dtype=fwd.dtype)
 
