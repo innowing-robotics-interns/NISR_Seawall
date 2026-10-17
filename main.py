@@ -1758,7 +1758,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             print(f"  Tangent energy: {tangent_mode} for the whole run")
     if lam_svd > 0:
         print(f"  SVD loss: λ_svd={lam_svd}  mode={svd_mode}"
-              + (f"  target={svd_target}" if svd_mode == 'arap' else "")
+              + (f"  target={svd_target}" if svd_mode == 'arap' or svd_mode == 'one_sided_arap' else "")
               + f"  eps={svd_eps}  (depth-normalized singular values)")
     if stages:
         print(f"  GHPR stages: {len(stages)} x {visible_epochs} epochs, then full cloud "
@@ -2757,13 +2757,13 @@ def main():
     svd_group.add_argument('--lam_svd', type=float, default=0.0,
                            help='Weight of the SVD Jacobian loss (0 disables)')
     svd_group.add_argument('--svd_mode', type=str, default='arap_si',
-                           choices=['arap', 'arap_si', 'conformal', 'collapse'],
+                           choices=['arap', 'arap_si', 'conformal', 'collapse', 'one_sided_arap'],
                            help='arap: (S-target)^2 · arap_si: scale-invariant '
                                 'near-isometry · conformal: (S1-S2)^2 · '
+                                'one_sided_arap: (S-target)^2 (one-sided) · '
                                 'collapse: anti-collapse penalty only')
-    svd_group.add_argument('--svd_target', type=float, default=1.0,
-                           help='Target singular value for --svd_mode arap, in '
-                                'FACE-UV units (isometric box fit → 2.0)')
+    svd_group.add_argument('--svd_target', type=float, default=0.25,
+                           help='Target singular value for --svd_mode arap or one_sided_arap,')
     svd_group.add_argument('--svd_eps', type=float, default=1e-4,
                            help='Anti-collapse floor on singular values')
     svd_group.add_argument('--svd_warmup_epochs', type=int, default=0)

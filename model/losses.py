@@ -397,6 +397,10 @@ def tangent_loss_from_jac(model=None,
         energy = torch.zeros((), device=J.device, dtype=J.dtype)
     elif mode == 'dirichlet':
         energy = 1.0*torch.mean(0.5*torch.sum(J ** 2, dim=1))
+    elif mode == "one_sided_arap":
+        # s_max = S[..., 0]
+        # energy = torch.relu(s_max - 0).pow(2).mean()
+        energy = torch.relu(S-0).pow(2).sum(dim=-1).mean()
     elif mode == 'symmetric_dirichlet':
         # -log(det(J^T J)) + tr(J^T J), per singular value
         
