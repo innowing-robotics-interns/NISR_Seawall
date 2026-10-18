@@ -232,21 +232,36 @@ def chamfer_distance(P: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
 
 
 def chamfer_distance_chunked(P: torch.Tensor, Q: torch.Tensor,
-                             chunk_size: int = 2048) -> torch.Tensor:
-    """Compute Chamfer distance in chunks to reduce memory use."""
+                             chunk_size: int = 2048,
+                             p_weights: torch.Tensor = None) -> torch.Tensor:
+    """
+    Compute Chamfer distance in chunks to reduce memory use.
+
+    p_weights: optional (N,) weight per point of P. It scales that point's own
+    P->Q term and the Q->P term of every Q point whose nearest P point it is,
+    so a weight > 1 makes both directions of its matching count more.
+    """
     N, M = P.shape[0], Q.shape[0]
 
     min_p2q = []
     for i in range(0, N, chunk_size):
         d = torch.cdist(P[i:i + chunk_size], Q)
         min_p2q.append(d.min(dim=1).values)
-    loss_P = torch.cat(min_p2q).mean()
+    loss_P = torch.cat(min_p2q)
+    if p_weights is not None:
+        loss_P = loss_P * p_weights
+    loss_P = loss_P.mean()
 
-    min_q2p = []
+    min_q2p, nn_q2p = [], []
     for i in range(0, M, chunk_size):
         d = torch.cdist(Q[i:i + chunk_size], P)
-        min_q2p.append(d.min(dim=1).values)
-    loss_Q = torch.cat(min_q2p).mean()
+        m = d.min(dim=1)
+        min_q2p.append(m.values)
+        nn_q2p.append(m.indices)
+    loss_Q = torch.cat(min_q2p)
+    if p_weights is not None:
+        loss_Q = loss_Q * p_weights[torch.cat(nn_q2p)]
+    loss_Q = loss_Q.mean()
 
     return loss_P + loss_Q
 

@@ -398,6 +398,178 @@ def match_openings(votes, n_rays, crossings, min_frac, min_crossings):
     return pairs, candidates, frac, score
 
 
+def pair_openings(xyz, nrm, opening_flat, white_flat, n_openings, n_patches,
+                  resolution, device, crossings=None, mesh_stride=2, ray_stride=2,
+                  max_rays_per_opening=20000, min_rays_per_opening=32,
+                  local_steps=None, max_gap=0.0, air_samples=3, air_min=0.67,
+                  winding_stride=0, winding_max_tris=200_000, no_air_test=False,
+                  min_frac=0.1, min_crossings=5, seed=0, verbose=True):
+    """
+    Cast rays from every opening and pair the openings that face each other.
+
+    `xyz`/`nrm` come from `sample_atlas`; `opening_flat` (openings.npz's
+    opening_id) and `white_flat` (the uv mask) are flattened in the same
+    (patch_position, u_index, v_index) order. `crossings` is the symmetric
+    matrix from `load_crossings`, or None to pair from rays alone.
+
+    Returns:
+        dict with the pairing (`pairs`, `candidates`, `frac`, `score`,
+        `votes`), the per-opening ray outcomes and cap sides, and the per-ray
+        records the pair files are built from. `nrm` is returned flipped when
+        the atlas turned out to be oriented inward.
+    """
+    log = print if verbose else (lambda *a, **k: None)
+    P, R = n_patches, resolution
+    tris = ray_mesh_triangles(P, R, mesh_stride)
+    log(f"  Casting mesh: {tris.shape[0]:,} triangles (mesh_stride={mesh_stride})")
+
+    # verify whether or not the atlas normals point outward, and flip them if not
+    vol = signed_volume(xyz, tris)
+    if vol < 0:
+        nrm = -nrm
+        log(f"  [warn] Enclosed volume is negative ({vol:.4f}): the atlas normals "
+            f"point INWARD. Flipped them for casting.")
+    else:
+        log(f"  Enclosed volume {vol:.4f} > 0: atlas normals point outward")
+
+    edge = median_edge(xyz, tris)
+    if local_steps is None:
+        local_steps = 2 * mesh_stride
+    log(f"  Median casting edge = {edge:.6f}   own-sheet window = {local_steps} grid steps")
+
+    # rays
+    rng = np.random.default_rng(seed)
+    sources = pick_ray_sources(opening_flat, n_openings, R, P, ray_stride,
+                               max_rays_per_opening, min_rays_per_opening, rng)
+    src = np.concatenate([sources[o] for o in range(n_openings)])
+    src_open = np.concatenate([np.full(sources[o].size, o, np.int64)
+                               for o in range(n_openings)])
+    n_rays = np.array([sources[o].size for o in range(n_openings)], np.int64)
+
+    # Caps that stop short of each other leave a GAP: the partner lies behind
+    # the cap, found by an inward ray. Caps that pushed past each other have
+    # CROSSED: the partner lies in front, found by an outward ray. Every source
+    # casts both.
+    log(f"  Casting {src.size:,} inward + {src.size:,} outward rays from "
+        f"{n_openings} openings...")
+    t0 = time.time()
+    scene = build_scene(xyz, tris)
+    src_nrm = nrm[src].astype(np.float64)
+    inward = trace(scene, src, xyz, nrm, -src_nrm, tris, R, edge, local_steps, opening_flat)
+    outward = trace(scene, src, xyz, nrm, src_nrm, tris, R, edge, local_steps, opening_flat)
+    log(f"    done in {time.time() - t0:.1f}s")
+    bary_err = max(inward['bary_err'], outward['bary_err'])
+    if bary_err > 0.5 * edge:
+        log(f"  [warn] Barycentric reconstruction off by {bary_err:.2e} "
+            f"(> half an edge): hit UVs below may be wrong")
+
+    # Inward: the partner's sheet is met from BEHIND. A front face means the
+    # ray started inside a fold or self-overlap.
+    outcome = np.full(src.size, OUTCOMES.index('miss'), np.int64)
+    h = inward['hit']
+    front = h & inward['toward']
+    outcome[front] = OUTCOMES.index('frontface')
+    outcome[h & ~front & (inward['open'] < 0)] = OUTCOMES.index('surface')
+    outcome[h & ~front & (inward['open'] == src_open)] = OUTCOMES.index('self')
+    cand_in = h & ~front & (inward['open'] >= 0) & (inward['open'] != src_open)
+    far_in = cand_in & (max_gap > 0) & (inward['t'] > max_gap)
+    outcome[far_in] = OUTCOMES.index('too_far')
+    cand_in &= ~far_in
+
+    # Outward: a crossed partner faces back at the ray (front-face hit). The
+    # overlap test below tells that apart from two caps facing across open air.
+    cand_out = (outward['hit'] & outward['toward'] & (outward['open'] >= 0)
+                & (outward['open'] != src_open))
+    if max_gap > 0:
+        cand_out &= outward['t'] <= max_gap
+
+    # Coarse meshes for winding numbers: the whole fitted surface (overlap test,
+    # cap side check) and its white part, i.e. the target surface (gap test).
+    stride = winding_stride
+    if stride <= 0:
+        full = P * 2 * (R - 1) ** 2
+        stride = max(1, int(np.ceil(np.sqrt(full / winding_max_tris))))
+    all_tris = ray_mesh_triangles(P, R, stride)
+    if vol < 0:
+        all_tris = all_tris[:, [0, 2, 1]]    # match the flipped normals
+    w_tris = all_tris[white_flat[all_tris].all(axis=1)]
+
+    path_frac = np.full(src.size, np.nan)
+    if no_air_test:
+        outcome[cand_in] = OUTCOMES.index('vote')
+        outcome[cand_out & ~cand_in] = OUTCOMES.index('overlap')
+        log("  Path tests: SKIPPED (--no_air_test)")
+    else:
+        t0 = time.time()
+        if cand_in.any():
+            idx = np.flatnonzero(cand_in)
+            w_path = segment_winding(xyz[src[idx]].astype(np.float64), inward['xyz'][idx],
+                                     w_tris, xyz, device, air_samples)
+            frac = (w_path < 0.5).mean(axis=1)
+            ok = frac >= air_min
+            outcome[idx[ok]] = OUTCOMES.index('vote')
+            outcome[idx[~ok]] = OUTCOMES.index('solid')
+            path_frac[idx] = frac
+        # A gap vote takes priority; an overlap only fills sources without one.
+        cand_out &= outcome != OUTCOMES.index('vote')
+        n_overlap = 0
+        if cand_out.any():
+            idx = np.flatnonzero(cand_out)
+            w_path = segment_winding(xyz[src[idx]].astype(np.float64), outward['xyz'][idx],
+                                     all_tris, xyz, device, air_samples)
+            frac = (w_path < -0.5).mean(axis=1)
+            ok = frac >= air_min
+            outcome[idx[ok]] = OUTCOMES.index('overlap')
+            path_frac[idx[ok]] = frac[ok]
+            n_overlap = int(ok.sum())
+        log(f"  Path tests ({w_tris.shape[0]:,} white / {all_tris.shape[0]:,} total "
+            f"triangles, stride {stride}): "
+            f"{int((outcome == OUTCOMES.index('vote')).sum()):,} gap votes, "
+            f"{int((outcome == OUTCOMES.index('solid')).sum()):,} through solid, "
+            f"{n_overlap:,} overlap votes [{time.time() - t0:.1f}s]")
+
+    # One record per ray: the outward hit where the source voted 'overlap',
+    # the inward hit otherwise. Gaps are signed, NEGATIVE = overlap depth.
+    use_out = outcome == OUTCOMES.index('overlap')
+
+    def merged(key):
+        a, b = inward[key], outward[key]
+        m = use_out if a.ndim == 1 else use_out[:, None]
+        return np.where(m, b, a)
+
+    gap = np.where(use_out, -outward['t'], inward['t'])
+
+    sides = cap_sides(sources, xyz, nrm, all_tris, 0.5 * edge, device, 256, rng)
+    # ~0 behind and ~-1 in front: the cap faces into an overlap. That is a
+    # crossed pair when another opening is found across it, a fold otherwise.
+    overlap_front = {o for o, (behind, front) in sides.items()
+                     if behind < 0.5 and front < -0.5}
+
+    vote = np.isin(outcome, VOTES)
+    hit_open = merged('open')
+    votes = np.zeros((n_openings, n_openings), np.int64)
+    np.add.at(votes, (src_open[vote], hit_open[vote]), 1)
+
+    # pairing
+    if crossings is None:
+        crossings, min_crossings = np.zeros((n_openings, n_openings), np.int64), 0
+    pairs, candidates, frac, score = match_openings(
+        votes, n_rays, crossings, min_frac, min_crossings)
+
+    outcome_counts = np.zeros((n_openings, len(OUTCOMES)), np.int64)
+    np.add.at(outcome_counts, (src_open, outcome), 1)
+
+    return {
+        'pairs': pairs, 'candidates': candidates, 'frac': frac, 'score': score,
+        'votes': votes, 'n_rays': n_rays, 'outcome_counts': outcome_counts,
+        'sides': sides, 'overlap_front': overlap_front,
+        'src': src, 'src_open': src_open, 'vote': vote, 'gap': gap,
+        'path_frac': path_frac, 'hit_open': hit_open, 'hit_xyz': merged('xyz'),
+        'hit_nrm': merged('nrm'), 'corners': merged('corners'), 'w': merged('w'),
+        'nrm': nrm, 'vol': vol, 'edge': edge, 'bary_err': bary_err,
+    }
+
+
 def load_crossings(path, n_openings):
     """Symmetric crossing counts between openings from intersections.npz."""
     C = np.zeros((n_openings, n_openings), np.int64)
@@ -736,145 +908,29 @@ def main():
     print(f"\n  Sampling {P} patches at {R}x{R}...")
     t0 = time.time()
     xyz, nrm, grid_uv = sample_atlas(F, patch_ids, R, args.device, args.batch_size)
-    tris = ray_mesh_triangles(P, R, args.mesh_stride)
-    print(f"    done in {time.time() - t0:.1f}s  ({tris.shape[0]:,} casting triangles, "
-          f"mesh_stride={args.mesh_stride})")
-
-    # verify whether or not the atlas normals point outward, and flip them if not
-    vol = signed_volume(xyz, tris)
-    if vol < 0:
-        nrm = -nrm
-        print(f"  [warn] Enclosed volume is negative ({vol:.4f}): the atlas normals "
-              f"point INWARD. Flipped them for casting.")
-    else:
-        print(f"  Enclosed volume {vol:.4f} > 0: atlas normals point outward")
-
-    edge = median_edge(xyz, tris)
-    local_steps = args.local_steps if args.local_steps is not None else 2 * args.mesh_stride
-    print(f"  Median casting edge = {edge:.6f}   own-sheet window = {local_steps} grid steps")
-
-    # rays
-    rng = np.random.default_rng(args.seed)
-    sources = pick_ray_sources(opening_flat, n_openings, R, P, args.ray_stride,
-                               args.max_rays_per_opening, args.min_rays_per_opening, rng)
-    src = np.concatenate([sources[o] for o in range(n_openings)])
-    src_open = np.concatenate([np.full(sources[o].size, o, np.int64)
-                               for o in range(n_openings)])
-    n_rays = np.array([sources[o].size for o in range(n_openings)], np.int64)
-
-    # Caps that stop short of each other leave a GAP: the partner lies behind
-    # the cap, found by an inward ray. Caps that pushed past each other have
-    # CROSSED: the partner lies in front, found by an outward ray. Every source
-    # casts both.
-    print(f"  Casting {src.size:,} inward + {src.size:,} outward rays from "
-          f"{n_openings} openings...")
-    t0 = time.time()
-    scene = build_scene(xyz, tris)
-    src_nrm = nrm[src].astype(np.float64)
-    inward = trace(scene, src, xyz, nrm, -src_nrm, tris, R, edge, local_steps, opening_flat)
-    outward = trace(scene, src, xyz, nrm, src_nrm, tris, R, edge, local_steps, opening_flat)
     print(f"    done in {time.time() - t0:.1f}s")
-    bary_err = max(inward['bary_err'], outward['bary_err'])
-    if bary_err > 0.5 * edge:
-        print(f"  [warn] Barycentric reconstruction off by {bary_err:.2e} "
-              f"(> half an edge): hit UVs below may be wrong")
 
-    # Inward: the partner's sheet is met from BEHIND. A front face means the
-    # ray started inside a fold or self-overlap.
-    outcome = np.full(src.size, OUTCOMES.index('miss'), np.int64)
-    h = inward['hit']
-    front = h & inward['toward']
-    outcome[front] = OUTCOMES.index('frontface')
-    outcome[h & ~front & (inward['open'] < 0)] = OUTCOMES.index('surface')
-    outcome[h & ~front & (inward['open'] == src_open)] = OUTCOMES.index('self')
-    cand_in = h & ~front & (inward['open'] >= 0) & (inward['open'] != src_open)
-    far_in = cand_in & (args.max_gap > 0) & (inward['t'] > args.max_gap)
-    outcome[far_in] = OUTCOMES.index('too_far')
-    cand_in &= ~far_in
-
-    # Outward: a crossed partner faces back at the ray (front-face hit). The
-    # overlap test below tells that apart from two caps facing across open air.
-    cand_out = (outward['hit'] & outward['toward'] & (outward['open'] >= 0)
-                & (outward['open'] != src_open))
-    if args.max_gap > 0:
-        cand_out &= outward['t'] <= args.max_gap
-
-    # Coarse meshes for winding numbers: the whole fitted surface (overlap test,
-    # cap side check) and its white part, i.e. the target surface (gap test).
-    stride = args.winding_stride
-    if stride <= 0:
-        full = P * 2 * (R - 1) ** 2
-        stride = max(1, int(np.ceil(np.sqrt(full / args.winding_max_tris))))
-    all_tris = ray_mesh_triangles(P, R, stride)
-    if vol < 0:
-        all_tris = all_tris[:, [0, 2, 1]]    # match the flipped normals
-    w_tris = all_tris[white_flat[all_tris].all(axis=1)]
-
-    path_frac = np.full(src.size, np.nan)
-    if args.no_air_test:
-        outcome[cand_in] = OUTCOMES.index('vote')
-        outcome[cand_out & ~cand_in] = OUTCOMES.index('overlap')
-        print("  Path tests: SKIPPED (--no_air_test)")
-    else:
-        t0 = time.time()
-        if cand_in.any():
-            idx = np.flatnonzero(cand_in)
-            w_path = segment_winding(xyz[src[idx]].astype(np.float64), inward['xyz'][idx],
-                                     w_tris, xyz, args.device, args.air_samples)
-            frac = (w_path < 0.5).mean(axis=1)
-            ok = frac >= args.air_min
-            outcome[idx[ok]] = OUTCOMES.index('vote')
-            outcome[idx[~ok]] = OUTCOMES.index('solid')
-            path_frac[idx] = frac
-        # A gap vote takes priority; an overlap only fills sources without one.
-        cand_out &= outcome != OUTCOMES.index('vote')
-        n_overlap = 0
-        if cand_out.any():
-            idx = np.flatnonzero(cand_out)
-            w_path = segment_winding(xyz[src[idx]].astype(np.float64), outward['xyz'][idx],
-                                     all_tris, xyz, args.device, args.air_samples)
-            frac = (w_path < -0.5).mean(axis=1)
-            ok = frac >= args.air_min
-            outcome[idx[ok]] = OUTCOMES.index('overlap')
-            path_frac[idx[ok]] = frac[ok]
-            n_overlap = int(ok.sum())
-        print(f"  Path tests ({w_tris.shape[0]:,} white / {all_tris.shape[0]:,} total "
-              f"triangles, stride {stride}): "
-              f"{int((outcome == OUTCOMES.index('vote')).sum()):,} gap votes, "
-              f"{int((outcome == OUTCOMES.index('solid')).sum()):,} through solid, "
-              f"{n_overlap:,} overlap votes [{time.time() - t0:.1f}s]")
-
-    # One record per ray: the outward hit where the source voted 'overlap',
-    # the inward hit otherwise. Gaps are signed, NEGATIVE = overlap depth.
-    use_out = outcome == OUTCOMES.index('overlap')
-
-    def merged(key):
-        a, b = inward[key], outward[key]
-        m = use_out if a.ndim == 1 else use_out[:, None]
-        return np.where(m, b, a)
-
-    gap = np.where(use_out, -outward['t'], inward['t'])
-    hit_open_all, hit_xyz_all, hit_nrm_all = merged('open'), merged('xyz'), merged('nrm')
-    corners_all, w_all = merged('corners'), merged('w')
-
-    sides = cap_sides(sources, xyz, nrm, all_tris, 0.5 * edge, args.device, 256, rng)
-    # ~0 behind and ~-1 in front: the cap faces into an overlap. That is a
-    # crossed pair when another opening is found across it, a fold otherwise.
-    overlap_front = {o for o, (behind, front) in sides.items()
-                     if behind < 0.5 and front < -0.5}
-
-    vote = np.isin(outcome, VOTES)
-    votes = np.zeros((n_openings, n_openings), np.int64)
-    np.add.at(votes, (src_open[vote], hit_open_all[vote]), 1)
-
-    # pairing
-    pairs, candidates, frac, score = match_openings(
-        votes, n_rays, crossings if have_crossings else np.zeros_like(crossings),
-        args.min_frac, args.min_crossings if have_crossings else 0)
+    res = pair_openings(
+        xyz, nrm, opening_flat, white_flat, n_openings, P, R, args.device,
+        crossings=crossings if have_crossings else None,
+        mesh_stride=args.mesh_stride, ray_stride=args.ray_stride,
+        max_rays_per_opening=args.max_rays_per_opening,
+        min_rays_per_opening=args.min_rays_per_opening,
+        local_steps=args.local_steps, max_gap=args.max_gap,
+        air_samples=args.air_samples, air_min=args.air_min,
+        winding_stride=args.winding_stride, winding_max_tris=args.winding_max_tris,
+        no_air_test=args.no_air_test, min_frac=args.min_frac,
+        min_crossings=args.min_crossings, seed=args.seed)
+    pairs, candidates, frac, score, votes = (
+        res['pairs'], res['candidates'], res['frac'], res['score'], res['votes'])
+    n_rays, outcome_counts = res['n_rays'], res['outcome_counts']
+    sides, overlap_front = res['sides'], res['overlap_front']
+    src, src_open, vote, gap, path_frac = (
+        res['src'], res['src_open'], res['vote'], res['gap'], res['path_frac'])
+    hit_open_all, hit_xyz_all, hit_nrm_all = res['hit_open'], res['hit_xyz'], res['hit_nrm']
+    corners_all, w_all = res['corners'], res['w']
+    nrm, vol, edge, bary_err = res['nrm'], res['vol'], res['edge'], res['bary_err']
     paired = {o for p in pairs for o in (p['a'], p['b'])}
-
-    outcome_counts = np.zeros((n_openings, len(OUTCOMES)), np.int64)
-    np.add.at(outcome_counts, (src_open, outcome), 1)
 
     def unpaired_reason(o):
         """Why an opening found no partner, from where its rays went."""

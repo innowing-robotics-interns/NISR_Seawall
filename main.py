@@ -36,6 +36,7 @@ from model.subdivision import subdivide_by_distortion, check_seam_continuity
 from utils.adaptive_vis import visualize_patch_configuration, plot_history
 from utils.ghpr import (ghpr_from_points, ghpr_visible, keep_connected,
                         median_nn_spacing, write_classified_ply)
+from utils.extension_mask import find_extension_openings
 from scipy.spatial import cKDTree
 try:
     import open3d as o3d
@@ -1612,7 +1613,17 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    normal_unsigned=False, normal_nn='kdtree',
                    normal_w_fwd=0.1, normal_w_bwd=1.0, normal_hinge_tau=0.0,
                    ghpr_stages=None, visible_epochs=0, normal_off_frac=0.5,
-                   ghpr_subdiv_max_depth=None):
+                   ghpr_subdiv_max_depth=None,
+                   ext_mask_epoch=0, ext_mask_every=0, ext_kwargs=None,
+                   ext_mode='no_reg', ext_cd_weight=1.0):
+    if ext_mask_epoch < 0 or ext_mask_every < 0:
+        raise ValueError("--ext_mask_epoch/--ext_mask_every must be >= 0")
+    if ext_mode not in ('no_reg', 'no_fit'):
+        raise ValueError(f"ext_mode must be 'no_reg' or 'no_fit', got {ext_mode!r}")
+    if ext_cd_weight <= 0:
+        raise ValueError(f"--ext_cd_weight must be > 0, got {ext_cd_weight}")
+    # In 'no_fit' mode the extension samples are not in the Chamfer at all.
+    use_ext_cd_weight = ext_cd_weight != 1.0 and ext_mode == 'no_reg'
     pts_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
     # Normal consistency runs only when the input actually carried normals.
     use_normal = gamma > 0 and normals is not None
@@ -1714,11 +1725,12 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                'tangent': [], 'svd': [], 'normal': [],
                'normal_fwd': [], 'normal_bwd': [],
                'total': [], 'n_leaves': [], 'tangent_mode': [],
-               'surface_phase': [], 'ghpr_stage': [],
+               'surface_phase': [], 'ghpr_stage': [], 'ext_masked': [],
                # first epoch of every GHPR stage / the full-cloud phase
                'phase_starts': ([i * visible_epochs + 1 for i in range(len(stages))]
                                 + [n_stage_epochs + 1]) if stages else []}
     events = []
+    ext_mask = None
     zero = torch.tensor(0.0, device=device)
     need_jac = (mu > 0) or (lam_svd > 0) or use_normal
 
@@ -1785,6 +1797,19 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
               + f"  weights: fwd(pred→tgt)={normal_w_fwd} bwd(tgt→pred)={normal_w_bwd}")
     elif gamma > 0:
         print(f"  Normal loss: OFF (γ={gamma} requested but the input has no normals)")
+    if ext_mask_epoch > 0:
+        print(f"  Extension mask: detect at epoch {ext_mask_epoch}"
+              + (f", re-detect every {ext_mask_every} epochs" if ext_mask_every > 0 else "")
+              + "; samples in unpaired openings under "
+              + f"{ext_kwargs.get('max_area_frac', 0.05):g} of the surface area get "
+              + ("no μ/λ_svd regularizer (fitting losses only)" if ext_mode == 'no_reg'
+                 else "no fitting loss (Chamfer/DDF/normal, both directions)")
+              + (f", Chamfer weight x{ext_cd_weight:g} (both directions)"
+                 if use_ext_cd_weight else "")
+              + ("  [warn] --ext_cd_weight ignored in 'no_fit' mode"
+                 if ext_cd_weight != 1.0 and ext_mode == 'no_fit' else "")
+              + ("  [warn] after the last epoch, never applied"
+                 if ext_mask_epoch > epochs else ""))
 
     ### Stop subdivision after normal loss activates (Currently not used)
     # if use_normal and subdiv_threshold > 0 and subdiv_every > 0:
@@ -1845,6 +1870,18 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 model, os.path.join(vis_dir, f'patch_config_{epoch:05d}.png'),
                 pts=pts3n)
 
+        # Detected against the FULL cloud and stored per cube face, so it stays
+        # valid through later subdivision until it is re-detected.
+        if ext_mask_epoch > 0 and epoch >= ext_mask_epoch and (
+                epoch == ext_mask_epoch
+                or (ext_mask_every > 0 and (epoch - ext_mask_epoch) % ext_mask_every == 0)):
+            print(f"  [ext @ {epoch}] detecting extensions "
+                  f"({model.n_patches} leaves, {pts3n.shape[0]} target pts)...")
+            ext_mask = find_extension_openings(
+                model, pts3n, device,
+                out_dir=os.path.join(vis_dir, f'extension_mask_{epoch:05d}'),
+                **(ext_kwargs or {}))
+
         # ── target pool for this phase ───────────────────────────────────
         in_warmup = epoch <= n_stage_epochs
         if in_warmup:
@@ -1873,6 +1910,16 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                         requires_grad=need_jac)
         Q = model(pids, uv)
 
+        # Samples inside a detected extension: 'no_fit' takes them out of the
+        # fitting losses (both directions), 'no_reg' out of the μ/λ_svd
+        # regularizers so the fitting losses alone shape them.
+        in_ext = ext_mask.excluded(model, pids, uv) if ext_mask is not None else None
+        fit = ~in_ext if (in_ext is not None and ext_mode == 'no_fit') else None
+        reg = ~in_ext if (in_ext is not None and ext_mode == 'no_reg') else None
+        Q_fit = Q if fit is None else Q[fit]
+        cd_w = (1.0 + (ext_cd_weight - 1.0) * in_ext.float()
+                if (use_ext_cd_weight and in_ext is not None) else None)
+
         B = min(K * M_per_patch, pool.shape[0])
         ridx = torch.randint(0, pool.shape[0], (B,), device=device)
         tgt = pool[ridx]
@@ -1900,7 +1947,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 _save_ddf_reference_snapshot(epoch, ddf_ref_points, ddf_ref_gt, pool)
 
             ddf_loss = directional_distance_loss(
-                Q,
+                Q_fit,
                 ddf_ref_points,
                 ddf_ref_gt,
                 k=ddf_k_neighbors,
@@ -1917,10 +1964,11 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         # across phases.
         cd_in_loss = (not use_ddf) or surface_loss_type == 'cd_ddf'
         if cd_in_loss:
-            cd_loss = chamfer_distance_chunked(Q, tgt, chunk_size=2048)
+            cd_loss = chamfer_distance_chunked(Q_fit, tgt, chunk_size=2048, p_weights=cd_w)
         else:
             with torch.no_grad():
-                cd_loss = chamfer_distance_chunked(Q, tgt, chunk_size=2048)
+                cd_loss = chamfer_distance_chunked(Q_fit, tgt, chunk_size=2048,
+                                                   p_weights=cd_w)
 
         if not use_ddf:
             surface_loss = cd_loss
@@ -1959,17 +2007,21 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         if use_sym and epoch == sym_dirichlet_epoch and tangent_mode != 'symmetric_dirichlet':
             print(f"  [tangent @ {epoch}] switching {tangent_mode} → symmetric_dirichlet")
 
-        tangent = (tangent_loss_from_jac(model=model, pids=pids, t_u=t_u, t_v=t_v,
+        t_u_reg, t_v_reg, pids_reg = t_u, t_v, pids
+        if reg is not None and t_u is not None:
+            t_u_reg, t_v_reg, pids_reg = t_u[reg], t_v[reg], pids[reg]
+        tangent = (tangent_loss_from_jac(model=model, pids=pids_reg, t_u=t_u_reg, t_v=t_v_reg,
                     mode=tangent_mode_eff)
                if (mu_eff > 0 and t_u is not None) else zero)
-        svd_loss = (tangent_loss_from_jac(model=model, pids=pids, t_u=t_u, t_v=t_v,
+        svd_loss = (tangent_loss_from_jac(model=model, pids=pids_reg, t_u=t_u_reg, t_v=t_v_reg,
                      mode=svd_mode, target=svd_target,
                      eps=svd_eps, normalize_patch_scale=False)
                 if (svd_eff > 0 and t_u is not None) else zero)
              
         if gamma_eff > 0 and t_u is not None:
+            t_u_fit, t_v_fit = (t_u, t_v) if fit is None else (t_u[fit], t_v[fit])
             if pool_tree is not None:
-                Q_np = Q.detach().cpu().numpy()
+                Q_np = Q_fit.detach().cpu().numpy()
                 _, fwd_np = pool_tree.query(Q_np, k=1, workers=-1)
                 nn_fwd = torch.as_tensor(fwd_np, dtype=torch.long, device=device)
                 if normal_w_bwd > 0:
@@ -1978,16 +2030,16 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 else:
                     nn_bwd = None
                 normal_loss, normal_fwd, normal_bwd = normal_constraint_loss(
-                    t_u, t_v, pool_nrm, nn_fwd, pool_nrm, nn_bwd,
+                    t_u_fit, t_v_fit, pool_nrm, nn_fwd, pool_nrm, nn_bwd,
                     w_fwd=normal_w_fwd, w_bwd=normal_w_bwd, unsigned=normal_unsigned,
                     hinge_tau=hinge_tau)
             else:
                 # same target subset the Chamfer term used.
                 nrm_batch = pool_nrm[ridx]
-                nn_fwd = chunked_argmin_nn(Q, tgt)
-                nn_bwd = chunked_argmin_nn(tgt, Q) if normal_w_bwd > 0 else None
+                nn_fwd = chunked_argmin_nn(Q_fit, tgt)
+                nn_bwd = chunked_argmin_nn(tgt, Q_fit) if normal_w_bwd > 0 else None
                 normal_loss, normal_fwd, normal_bwd = normal_constraint_loss(
-                    t_u, t_v, nrm_batch, nn_fwd, nrm_batch, nn_bwd,
+                    t_u_fit, t_v_fit, nrm_batch, nn_fwd, nrm_batch, nn_bwd,
                     w_fwd=normal_w_fwd, w_bwd=normal_w_bwd, unsigned=normal_unsigned,
                     hinge_tau=hinge_tau)
         else:
@@ -2027,6 +2079,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             history['surface_phase'].append(
                 ('cd_ddf' if surface_loss_type == 'cd_ddf' else 'ddf') if use_ddf else 'chamfer')
             history['ghpr_stage'].append(stage_idx + 1 if in_warmup else 0)   # 0 = full cloud
+            masked = 0.0 if in_ext is None else float(in_ext.float().mean())
+            history['ext_masked'].append(masked)
             tangent_tag = 'SymDir' if tangent_mode_eff == 'symmetric_dirichlet' else 'Tangent'
             normal_str = (f"Normal={float(normal_loss):.5f} "
                           f"(f{float(normal_fwd):.4f}/b{float(normal_bwd):.4f})  "
@@ -2044,6 +2098,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                   f"Total={float(loss):.5f}  μ_eff={float(mu_eff):.3f}  "
                   f"λsvd_eff={float(svd_eff):.3f}  leaves={model.n_patches}  "
                   + (f"stage={stage_idx + 1 if in_warmup else 'full'}  " if stages else "")
+                  + (f"ext_masked={100 * masked:.2f}%  " if ext_mask is not None else "")
                   + f"[{time.time() - t0:.1f}s]")
 
         # Also checkpoint the last epoch of every GHPR stage, so each stage's
@@ -2375,7 +2430,13 @@ def run_adaptive(args):
         normal_w_bwd=args.normal_w_bwd,
         normal_hinge_tau=args.normal_hinge_tau,
         ghpr_stages=ghpr_stages, visible_epochs=args.visible_epochs,
-        normal_off_frac=args.normal_off_frac)
+        normal_off_frac=args.normal_off_frac,
+        ext_mask_epoch=args.ext_mask_epoch, ext_mask_every=args.ext_mask_every,
+        ext_mode=args.ext_mode, ext_cd_weight=args.ext_cd_weight,
+        ext_kwargs={'resolution': args.ext_resolution, 'nn_scale': args.ext_nn_scale,
+                    'max_area_frac': args.ext_max_area_frac,
+                    'min_opening_vertices': args.ext_min_opening_vertices,
+                    'weld_tol': args.ext_weld_tol, 'face_res': args.ext_face_res})
 
     # ── final outputs ────────────────────────────────────────────────────
     model.eval()
@@ -2429,12 +2490,12 @@ def main():
     # Input/output
     parser.add_argument('--file', type=str, default=None,
                         help='Point cloud file (.ply/.xyz/.txt/.npy). Omit for synthetic demo')
-    parser.add_argument('--shape', type=str, default='flat_sheet',
+    parser.add_argument('--shape', type=str, default='box',
                         choices=['saddle', 'hemisphere','box', 'torus_patch', 'wavy', 'sphere', 'flat_sheet', 'stepped_sheet'],
                         help='Synthetic surface type for demo mode')
     parser.add_argument('--result_dir', type=str, default='results_sheet',
                         help='Output directory (auto-increments if exists)')
-    parser.add_argument('--N', type=int, default=5000,
+    parser.add_argument('--N', type=int, default=100000,
                         help='# points to use (downsample if larger). -1 keeps all.')
     parser.add_argument('--mesh_res', type=int, default=100,
                         help='Mesh grid resolution PER PATCH for export')
@@ -2521,10 +2582,10 @@ def main():
                         help='Epochs for flat-sheet initialization pretraining')
     parser.add_argument('--pretrain_loss', type=str, default='l1', choices=['mse','cd','l1'],
                         help='Pointwise loss for flat-sheet initialization pretraining')
-    parser.add_argument('--pretrain_mode', type=str, default='auto',
+    parser.add_argument('--pretrain_mode', type=str, default='closed_shape',
                         choices=['auto', 'flat', 'closed_shape'],
                         help='Initialization pretraining mode: flat sheet, closed shape, or auto-select based on atlas')
-    parser.add_argument('--pretrain_shape', type=str, default='sphere',
+    parser.add_argument('--pretrain_shape', type=str, default='box',
                         choices=['saddle', 'hemisphere', 'box', 'torus_patch', 'wavy', 'sphere', 'flat_sheet', 'stepped_sheet'],
                         help='Synthetic shape used for closed-shape pretraining')
     parser.add_argument('--pretrain_shape_samples', type=int, default=200000,
@@ -2612,7 +2673,7 @@ def main():
     ddf_group.add_argument('--ddf_mu_decay', type=float, default=1,
                            help='[DDF] Multiplier applied to tangent-loss weight μ once training switches '
                                 'from Chamfer to DDF (e.g. 0.5 halves μ during the DDF phase)')
-    ddf_group.add_argument('--ddf_n_reference_points', type=int, default=100000,
+    ddf_group.add_argument('--ddf_n_reference_points', type=int, default=75000,
                            help='[DDF] Number of reference points sampled near the target surface')
     ddf_group.add_argument('--ddf_k_neighbors', type=int, default=5,
                            help='[DDF] Number of nearest neighbors used to approximate the closest surface point')
@@ -2768,6 +2829,43 @@ def main():
                            help='Anti-collapse floor on singular values')
     svd_group.add_argument('--svd_warmup_epochs', type=int, default=0)
     svd_group.add_argument('--svd_warmup_delay', type=int, default=0)
+
+    # Extension mask: run uv_hole_mask -> opening_labels -> pair_opening during
+    # training and treat the unpaired, small openings differently in the loss.
+    ext_group = parser.add_argument_group('extension mask (--adaptive)')
+    ext_group.add_argument('--ext_mask_epoch', type=int, default=0,
+                           help='[Adaptive] Epoch at which extensions are detected; from '
+                                'then on their samples are handled per --ext_mode (0 = off)')
+    ext_group.add_argument('--ext_mode', type=str, default='no_reg',
+                           choices=['no_reg', 'no_fit'],
+                           help="[Adaptive] What extension samples lose: 'no_reg' (default) "
+                                '= the μ tangent and λ_svd regularizers, so Chamfer alone '
+                                "shapes them; 'no_fit' = the fitting losses (Chamfer/DDF/"
+                                'normal, both directions), so the regularizers alone do')
+    ext_group.add_argument('--ext_cd_weight', type=float, default=1.0,
+                           help="[Adaptive, --ext_mode no_reg] Chamfer weight of extension "
+                                'samples, in both directions: their own distance to the cloud, '
+                                'and that of every cloud point whose nearest sample is in the '
+                                'extension (1 = same as the rest)')
+    ext_group.add_argument('--ext_mask_every', type=int, default=0,
+                           help='[Adaptive] Re-detect every N epochs after --ext_mask_epoch '
+                                '(0 = detect once and keep that mask)')
+    ext_group.add_argument('--ext_max_area_frac', type=float, default=0.05,
+                           help='[Adaptive] An unpaired opening is masked only when its 3D '
+                                'area is at most this fraction of the whole surface area')
+    ext_group.add_argument('--ext_resolution', type=int, default=64,
+                           help='[Adaptive] UV grid per leaf per side for detection '
+                                '(uv_hole_mask --resolution)')
+    ext_group.add_argument('--ext_nn_scale', type=float, default=10.0,
+                           help='[Adaptive] Hole threshold = this x the cloud\'s median NN '
+                                'spacing (uv_hole_mask --nn_scale)')
+    ext_group.add_argument('--ext_min_opening_vertices', type=int, default=10,
+                           help='[Adaptive] Drop black components smaller than this '
+                                '(opening_labels --min_opening_vertices)')
+    ext_group.add_argument('--ext_weld_tol', type=float, default=1e-5,
+                           help='[Adaptive] opening_labels --weld_tol')
+    ext_group.add_argument('--ext_face_res', type=int, default=1024,
+                           help='[Adaptive] Resolution per cube face of the stored mask')
 
     # Subdivision policy
     subdiv_group = parser.add_argument_group('subdivision policy (--adaptive)')
