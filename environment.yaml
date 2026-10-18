@@ -18,3 +18,4 @@ dependencies:
       - torchaudio
       - opencv-python==4.10.0.84
       - open3d==0.18.0
+      - tensorboard>=2.16

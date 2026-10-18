@@ -43,6 +43,67 @@ try:
 except ImportError:
     o3d = None
 
+
+# TensorBoard logging is optional: every helper is a no-op when the writer is
+# None, so training works unchanged without the `tensorboard` package.
+def _create_tb_writer(result_dir, enabled, args=None):
+    if not enabled:
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        print("  [warn] --tensorboard requested but the 'tensorboard' package is "
+              "not installed (pip install tensorboard); continuing without it.")
+        return None
+    tb_dir = os.path.join(result_dir, 'tensorboard')
+    os.makedirs(tb_dir, exist_ok=True)
+    writer = SummaryWriter(tb_dir)
+    if args is not None:
+        writer.add_text('config/args',
+                        '```\n' + json.dumps(vars(args), indent=2) + '\n```', 0)
+    print(f"  TensorBoard → {tb_dir}   (tensorboard --logdir {tb_dir})")
+    return writer
+
+
+def _tb_log_scalars(writer, prefix, values, step):
+    if writer is None:
+        return
+    for name, value in values.items():
+        if value is not None:
+            writer.add_scalar(f'{prefix}/{name}', float(value), step)
+    writer.flush()
+
+
+def _tb_log_image(writer, tag, image_path, step=0):
+    if writer is None or not os.path.exists(image_path):
+        return
+    try:
+        from PIL import Image
+        image = np.asarray(Image.open(image_path).convert('RGB'))
+        writer.add_image(tag, image, step, dataformats='HWC')
+        writer.flush()
+    except Exception as exc:
+        print(f"  [warn] TensorBoard image logging failed for {image_path}: {exc}")
+
+
+def _tb_log_mesh(writer, tag, verts, faces, step=0):
+    if writer is None:
+        return
+    try:
+        writer.add_mesh(tag,
+                        vertices=torch.as_tensor(verts, dtype=torch.float32)[None],
+                        faces=torch.as_tensor(faces, dtype=torch.int32)[None],
+                        global_step=step)
+        writer.flush()
+    except Exception as exc:
+        print(f"  [warn] TensorBoard mesh logging failed for {tag}: {exc}")
+
+
+def _tb_close(writer):
+    if writer is not None:
+        writer.close()
+
+
 # Multi-patch training with a single or two-sheet atlas.
 def _build_forward_model(atlas_mode: str,
                          n_patches: int,
@@ -205,7 +266,8 @@ def train_multi_patch(pts3n: np.ndarray,
                       ddf_beta: float = 20.0,
                       ddf_resample_every: int = 500,
                       ddf_chunk_size: int = 2048,
-                      save_ddf_reference_every: int = 0):
+                      save_ddf_reference_every: int = 0,
+                      tb_writer=None):
     """
     Train the multi-patch model and inverse map.
 
@@ -1023,6 +1085,21 @@ def train_multi_patch(pts3n: np.ndarray,
                 phase = 'chamfer'
             history['phase'].append(phase)
 
+            _tb_log_scalars(tb_writer, 'train', {
+                'total': loss,
+                'cd': cd_loss,
+                'cycle': cycle_loss,
+                'param': param_loss,
+                'tangent': tangent_loss,
+                'svd': svd_loss,
+                'normal': normal_loss,
+                'outer_boundary': outer_boundary_loss,
+                'mu_eff': mu_eff,
+                'svd_eff': svd_eff,
+                'gamma_eff': gamma_eff,
+                'lr': opt.param_groups[0]['lr'],
+            }, epoch)
+
             elapsed = time.time() - t0
             # mu_str = f"  μ_eff={float(mu_eff):.4f}" if (mu_warmup_epochs > 0 and mu > 0) else ""
             recon_label = {'mse': 'MSE', 'ddf': 'DDF', 'chamfer': 'CD ', 'cd_ddf': 'CD & DDF'}[phase]
@@ -1075,7 +1152,8 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
                                     loss_type: str = 'mse',
                                     atlas_mode: str = 'single_sheet',
                                     two_sheet_side_rows: int = 2,
-                                    two_sheet_side_cols: int = 2):
+                                    two_sheet_side_cols: int = 2,
+                                    tb_writer=None):
     """
     Pretrain only the multi-patch forward map F. 
 
@@ -1180,6 +1258,8 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
             history['epoch'].append(epoch)
             history['plane'].append(float(plane_loss))
             history['total'].append(float(plane_loss))
+            _tb_log_scalars(tb_writer, 'pretrain_flat',
+                            {'plane': plane_loss, 'lr': opt.param_groups[0]['lr']}, epoch)
 
             elapsed = time.time() - t0
             print(f"  Epoch {epoch:5d}/{epochs}  |  "
@@ -1215,7 +1295,8 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
                                       no_presplit: bool = False,
                                       six_sheet_face_rows: int = 2,
                                       six_sheet_face_cols: int = 2,
-                                      face_aware_box_supervision: bool = False):
+                                      face_aware_box_supervision: bool = False,
+                                      tb_writer=None):
     """
     Pretrain the multi-patch forward map on a synthetic closed shape.
 
@@ -1388,6 +1469,13 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
             history['tangent'].append(float(tangent_loss))
             history['mu_eff'].append(float(mu_eff))
             history['total'].append(float(loss))
+            _tb_log_scalars(tb_writer, 'pretrain_closed', {
+                'total': loss,
+                'cd': cd_loss,
+                'tangent': tangent_loss,
+                'mu_eff': mu_eff,
+                'lr': opt.param_groups[0]['lr'],
+            }, epoch)
 
             elapsed = time.time() - t0
             print(f"  Epoch {epoch:5d}/{epochs}  |  "
@@ -1572,7 +1660,8 @@ def aabb_box(points, margin=0.05, min_frac=0.1):
 
 
 def pretrain_adaptive_box(model, epochs, M_per_patch, lr, device, log_every,
-                          loss_type='mse', box_center=None, box_radius=1.0):
+                          loss_type='mse', box_center=None, box_radius=1.0,
+                          tb_writer=None):
     """Fit every leaf patch to its own piece of the reference cube.
 
     `box_center`/`box_radius` place and size that cube. `box_radius` is either
@@ -1620,6 +1709,8 @@ def pretrain_adaptive_box(model, epochs, M_per_patch, lr, device, log_every,
         if epoch % log_every == 0 or epoch == 1:
             history['epoch'].append(epoch)
             history['loss'].append(float(loss))
+            _tb_log_scalars(tb_writer, 'pretrain_box',
+                            {'box': loss, 'lr': opt.param_groups[0]['lr']}, epoch)
             print(f"  Epoch {epoch:5d}/{epochs}  |  Box={float(loss):.6f}  "
                   f"[{time.time() - t0:.1f}s]")
 
@@ -1664,13 +1755,20 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    ghpr_stages=None, visible_epochs=0, normal_off_frac=0.5,
                    ghpr_subdiv_max_depth=None,
                    ext_mask_epoch=0, ext_mask_every=0, ext_kwargs=None,
-                   ext_mode='no_reg', ext_cd_weight=1.0):
+                   ext_mode='no_reg', ext_cd_weight=1.0,
+                   lambda_ext_area=0.0, tb_writer=None):
     if ext_mask_epoch < 0 or ext_mask_every < 0:
         raise ValueError("--ext_mask_epoch/--ext_mask_every must be >= 0")
     if ext_mode not in ('no_reg', 'no_fit'):
         raise ValueError(f"ext_mode must be 'no_reg' or 'no_fit', got {ext_mode!r}")
     if ext_cd_weight <= 0:
         raise ValueError(f"--ext_cd_weight must be > 0, got {ext_cd_weight}")
+    if lambda_ext_area < 0:
+        raise ValueError(f"--lambda_ext_area must be >= 0, got {lambda_ext_area}")
+    if lambda_ext_area > 0 and ext_mask_epoch <= 0:
+        raise ValueError(
+            "--lambda_ext_area requires --ext_mask_epoch > 0: the area penalty is "
+            "evaluated only on samples inside a detected extension mask.")
     # In 'no_fit' mode the extension samples are not in the Chamfer at all.
     use_ext_cd_weight = ext_cd_weight != 1.0 and ext_mode == 'no_reg'
     pts_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
@@ -1772,7 +1870,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     opt, sched = _adaptive_make_optim(model, lr, epochs)
     history = {'epoch': [], 'cd': [], 'ddf': [], 'surface': [],
                'tangent': [], 'svd': [], 'normal': [],
-               'normal_fwd': [], 'normal_bwd': [],
+               'normal_fwd': [], 'normal_bwd': [], 'ext_area': [],
                'total': [], 'n_leaves': [], 'tangent_mode': [],
                'surface_phase': [], 'ghpr_stage': [], 'ext_masked': [],
                # first epoch of every GHPR stage / the full-cloud phase
@@ -1781,7 +1879,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     events = []
     ext_mask = None
     zero = torch.tensor(0.0, device=device)
-    need_jac = (mu > 0) or (lam_svd > 0) or use_normal
+    need_jac = (mu > 0) or (lam_svd > 0) or use_normal or (lambda_ext_area > 0)
 
     print(f"\n{'─' * 60}")
     print("  Phase 2 — adaptive training with distortion-driven subdivision")
@@ -2044,7 +2142,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             mu_eff *= ddf_mu_decay
 
         # One Jacobian, shared by all Jacobian-based terms.
-        if need_jac and (mu_eff > 0 or svd_eff > 0 or gamma_eff > 0):
+        if need_jac and (mu_eff > 0 or svd_eff > 0 or gamma_eff > 0
+                         or (lambda_ext_area > 0 and in_ext is not None)):
             t_u, t_v = surface_jacobian(Q, uv)
         else:
             t_u = t_v = None
@@ -2066,7 +2165,15 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                      mode=svd_mode, target=svd_target,
                      eps=svd_eps, normalize_patch_scale=False)
                 if (svd_eff > 0 and t_u is not None) else zero)
-             
+
+        # Area of the extension membrane: ||dF/du x dF/dv|| is the local 3D area
+        # element, so averaging it over extension samples shrinks the extension.
+        if (lambda_ext_area > 0 and t_u is not None and in_ext is not None
+                and bool(in_ext.any())):
+            ext_area_loss = torch.cross(t_u[in_ext], t_v[in_ext], dim=-1).norm(dim=-1).mean()
+        else:
+            ext_area_loss = zero
+
         if gamma_eff > 0 and t_u is not None:
             t_u_fit, t_v_fit = (t_u, t_v) if fit is None else (t_u[fit], t_v[fit])
             if pool_tree is not None:
@@ -2094,7 +2201,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         else:
             normal_loss = normal_fwd = normal_bwd = zero
 
-        loss = surface_loss + mu_eff * tangent + svd_eff * svd_loss + gamma_eff * normal_loss
+        loss = (surface_loss + mu_eff * tangent + svd_eff * svd_loss
+                + gamma_eff * normal_loss + lambda_ext_area * ext_area_loss)
         opt.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(list(model.parameters()), 1.0)
@@ -2121,6 +2229,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             history['normal'].append(float(normal_loss))
             history['normal_fwd'].append(float(normal_fwd))
             history['normal_bwd'].append(float(normal_bwd))
+            history['ext_area'].append(float(ext_area_loss))
             history['surface'].append(float(surface_loss))
             history['total'].append(float(loss))
             history['n_leaves'].append(model.n_patches)
@@ -2130,11 +2239,31 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             history['ghpr_stage'].append(stage_idx + 1 if in_warmup else 0)   # 0 = full cloud
             masked = 0.0 if in_ext is None else float(in_ext.float().mean())
             history['ext_masked'].append(masked)
+            _tb_log_scalars(tb_writer, 'train', {
+                'total': loss,
+                'cd': cd_loss,
+                'ddf': ddf_loss,
+                'tangent': tangent,
+                'svd': svd_loss,
+                'normal': normal_loss,
+                'normal_fwd': normal_fwd,
+                'normal_bwd': normal_bwd,
+                'ext_area': ext_area_loss,
+                'surface': surface_loss,
+                'mu_eff': mu_eff,
+                'svd_eff': svd_eff,
+                'gamma_eff': gamma_eff,
+                'n_leaves': model.n_patches,
+                'ext_masked_frac': masked,
+                'lr': opt.param_groups[0]['lr'],
+            }, epoch)
             tangent_tag = 'SymDir' if tangent_mode_eff == 'symmetric_dirichlet' else 'Tangent'
             normal_str = (f"Normal={float(normal_loss):.5f} "
                           f"(f{float(normal_fwd):.4f}/b{float(normal_bwd):.4f})  "
                           f"γ_eff={float(gamma_eff):.3f}  "
                           if use_normal else "")
+            ext_area_str = (f"ExtArea={float(ext_area_loss):.5f}  "
+                            if lambda_ext_area > 0 else "")
             # Mark which term is actually being optimized: '*' = in the loss,
             # '(·)' = evaluated for monitoring only.
             cd_str = (f"CD={float(cd_loss):.5f}" if cd_in_loss
@@ -2143,7 +2272,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                        else ("DDF=--  " if use_ddf_at_all else ""))
             print(f"  Epoch {epoch:5d}/{epochs}  |  {cd_str}  {ddf_str}"
                   f"{tangent_tag}={float(tangent):.5f}  SVD={float(svd_loss):.5f}  "
-                  f"{normal_str}"
+                  f"{normal_str}{ext_area_str}"
                   f"Total={float(loss):.5f}  μ_eff={float(mu_eff):.3f}  "
                   f"λsvd_eff={float(svd_eff):.3f}  leaves={model.n_patches}  "
                   + (f"stage={stage_idx + 1 if in_warmup else 'full'}  " if stages else "")
@@ -2218,6 +2347,7 @@ def run_adaptive(args):
     result_dir = utils._get_unique_folder(args.result_dir)
     os.makedirs(result_dir, exist_ok=True)
     print(f"  Output directory: {result_dir}")
+    tb_writer = _create_tb_writer(result_dir, args.tensorboard, args)
 
     # point cloud loader 
     downsample_n = None if args.N is not None and args.N < 0 else args.N
@@ -2395,24 +2525,32 @@ def run_adaptive(args):
             model, epochs=args.pretrain_epochs, M_per_patch=args.M_per_patch,
             lr=args.lr, device=args.device, log_every=args.log_every,
             loss_type=args.pretrain_loss,
-            box_center=box_center, box_radius=box_radius)
+            box_center=box_center, box_radius=box_radius,
+            tb_writer=tb_writer)
 
-        visualize_patch_configuration(
-            model, os.path.join(result_dir, 'patch_config_pretrain.png'))
+        pretrain_config_png = os.path.join(result_dir, 'patch_config_pretrain.png')
+        visualize_patch_configuration(model, pretrain_config_png)
+        _tb_log_image(tb_writer, 'figures/patch_config_pretrain',
+                      pretrain_config_png, args.pretrain_epochs)
         verts, faces = utils.sample_multi_patch_grid(
             model, resolution=args.mesh_res, device=args.device)
         utils.export_ply(verts, faces,
                          os.path.join(result_dir, 'pretrain_box.ply'))
         utils.export_ply(utils.unnormalize_vertices(verts, meta), faces,
                          os.path.join(result_dir, 'pretrain_box_original.ply'))
+        _tb_log_mesh(tb_writer, 'mesh/pretrain_box', verts, faces,
+                     step=args.pretrain_epochs)
         _adaptive_save_ckpt(model, os.path.join(result_dir, 'pretrain_checkpoint.pt'),
                             {'phase': 'pretrain', 'history': pretrain_history,
                              'args': vars(args)})
         if args.pretrain_only:
-            plot_history(pretrain_history,
-                         os.path.join(result_dir, 'pretrain_history.png'))
+            pretrain_history_png = os.path.join(result_dir, 'pretrain_history.png')
+            plot_history(pretrain_history, pretrain_history_png)
+            _tb_log_image(tb_writer, 'figures/pretrain_history',
+                          pretrain_history_png, args.pretrain_epochs)
             print("  Pretraining complete (pretrain_only). Inspect the seam "
                   "check, pretrain_box.ply and patch_config_pretrain.png.")
+            _tb_close(tb_writer)
             return
 
     checkpoint_extra = {
@@ -2482,10 +2620,12 @@ def run_adaptive(args):
         normal_off_frac=args.normal_off_frac,
         ext_mask_epoch=args.ext_mask_epoch, ext_mask_every=args.ext_mask_every,
         ext_mode=args.ext_mode, ext_cd_weight=args.ext_cd_weight,
+        lambda_ext_area=args.lambda_ext_area,
         ext_kwargs={'resolution': args.ext_resolution, 'nn_scale': args.ext_nn_scale,
                     'max_area_frac': args.ext_max_area_frac,
                     'min_opening_vertices': args.ext_min_opening_vertices,
-                    'weld_tol': args.ext_weld_tol, 'face_res': args.ext_face_res})
+                    'weld_tol': args.ext_weld_tol, 'face_res': args.ext_face_res},
+        tb_writer=tb_writer)
 
     # ── final outputs ────────────────────────────────────────────────────
     model.eval()
@@ -2493,9 +2633,13 @@ def run_adaptive(args):
     print(f"  Final seam check: max gap={seam['max_gap']:.3e}  "
           f"mean gap={seam['mean_gap']:.3e}")
 
-    visualize_patch_configuration(
-        model, os.path.join(result_dir, 'patch_config_final.png'), pts=pts3n)
-    plot_history(history, os.path.join(result_dir, 'history.png'))
+    final_config_png = os.path.join(result_dir, 'patch_config_final.png')
+    visualize_patch_configuration(model, final_config_png, pts=pts3n)
+    _tb_log_image(tb_writer, 'figures/patch_config_final',
+                  final_config_png, args.epochs)
+    history_png = os.path.join(result_dir, 'history.png')
+    plot_history(history, history_png)
+    _tb_log_image(tb_writer, 'figures/history', history_png, args.epochs)
 
     verts, faces = utils.sample_multi_patch_grid(
         model, resolution=args.mesh_res, device=args.device)
@@ -2506,6 +2650,7 @@ def run_adaptive(args):
                      os.path.join(result_dir, 'learned_sheet.ply'))
     utils.export_obj(verts_orig, faces,
                      os.path.join(result_dir, 'learned_sheet.obj'))
+    _tb_log_mesh(tb_writer, 'mesh/learned_sheet', verts, faces, step=args.epochs)
     if args.save_vertex_pos_every > 0 and os.path.exists(vertex_pos_json_path):
         utils.write_denormalized_vertex_positions_json(
             normalized_json_path=vertex_pos_json_path,
@@ -2522,6 +2667,7 @@ def run_adaptive(args):
         json.dump({'args': vars(args), 'subdivision_events': events,
                    'final_stats': model.complex.stats(),
                    'seam_check': seam}, f, indent=2)
+    _tb_close(tb_writer)
     print(f"  Run complete → {result_dir}")
 
 
@@ -2551,6 +2697,9 @@ def main():
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--log_every', type=int, default=200)
+    parser.add_argument('--tensorboard', action='store_true', default=False,
+                        help='Log training scalars, final figures and the learned mesh '
+                             'to <result_dir>/tensorboard for TensorBoard')
     parser.add_argument('--multi_patch', action='store_true', default=True,
                         help='Use multi-patch feature complex mode')
     parser.add_argument('--atlas_mode', type=str, default='single_sheet',
@@ -2896,6 +3045,11 @@ def main():
                                 'samples, in both directions: their own distance to the cloud, '
                                 'and that of every cloud point whose nearest sample is in the '
                                 'extension (1 = same as the rest)')
+    ext_group.add_argument('--lambda_ext_area', type=float, default=0.0,
+                           help='[Adaptive] Weight of the extension-area penalty: the mean '
+                                '||dF/du x dF/dv|| over samples inside detected extensions, '
+                                'which shrinks their 3D area (0 = off; requires '
+                                '--ext_mask_epoch > 0)')
     ext_group.add_argument('--ext_mask_every', type=int, default=0,
                            help='[Adaptive] Re-detect every N epochs after --ext_mask_epoch '
                                 '(0 = detect once and keep that mask)')
@@ -2942,6 +3096,11 @@ def main():
         parser.set_defaults(**ADAPTIVE_DEFAULTS)
 
     args = parser.parse_args()
+
+    if args.lambda_ext_area > 0 and not args.adaptive:
+        parser.error(
+            "--lambda_ext_area is only supported with --adaptive: extension masks "
+            "are detected on the adaptive cube atlas.")
 
     if args.adaptive:
         return run_adaptive(args)
@@ -3033,6 +3192,7 @@ def main():
     pretrain_ckpt_path = os.path.join(result_dir, 'pretrain_checkpoint.pt')
 
     print(f"  Output directory: {result_dir}")
+    tb_writer = _create_tb_writer(result_dir, args.tensorboard, args)
 
     # Training
     print(f"\n{'='*60}")
@@ -3079,6 +3239,7 @@ def main():
                 six_sheet_face_rows=args.six_sheet_face_rows,
                 six_sheet_face_cols=args.six_sheet_face_cols,
                 face_aware_box_supervision=args.face_aware_box_supervision,
+                tb_writer=tb_writer,
             )
         else:
             F_model, pretrain_history = pretrain_multi_patch_flat_sheet(
@@ -3099,6 +3260,7 @@ def main():
                 two_sheet_side_cols=args.two_sheet_side_cols,
                 six_sheet_face_rows=args.six_sheet_face_rows,
                 six_sheet_face_cols=args.six_sheet_face_cols,
+                tb_writer=tb_writer,
             )
         F_model.eval()
         pretrained_F_state = {
@@ -3114,6 +3276,8 @@ def main():
             active_patch_ids=list(range(F_model.n_patches)),
         )
         utils.export_ply(verts, faces, init_ply_path)
+        _tb_log_mesh(tb_writer, 'mesh/initialized_sheet', verts, faces,
+                     step=args.pretrain_epochs)
 
         torch.save({
             'mode': 'multi_patch_pretrain_flat_sheet' if pretrain_mode == 'flat' else 'multi_patch_pretrain_closed_shape',
@@ -3133,6 +3297,7 @@ def main():
             print(f"    {init_ply_path}     — initialized flat-sheet mesh")
             print(f"    {pretrain_ckpt_path}         — pretrained forward-map weights")
             print(f"{'='*60}\n")
+            _tb_close(tb_writer)
             return
 
         print(f"\n{'='*60}")
@@ -3225,6 +3390,7 @@ def main():
             ddf_resample_every=args.ddf_resample_every,
             ddf_chunk_size=args.ddf_chunk_size,
             save_ddf_reference_every=args.save_ddf_reference_every,
+            tb_writer=tb_writer,
         )
         F_model.eval()
         if G_model is not None:
@@ -3239,6 +3405,8 @@ def main():
             resolution=args.mesh_res, device=args.device,
             active_patch_ids=active_ids,
         )
+        _tb_log_image(tb_writer, 'figures/result', result_png, args.epochs)
+        _tb_log_mesh(tb_writer, 'mesh/learned_sheet', verts, faces, step=args.epochs)
 
         torch.save({
             'mode': 'multi_patch',
@@ -3283,6 +3451,7 @@ def main():
     print(f"    {ckpt_path}         — model weights + normalization transform")
     print(f"    {result_log}        — hyperparams + loss log")
     print(f"{'='*60}\n")
+    _tb_close(tb_writer)
 
 
 if __name__ == '__main__':

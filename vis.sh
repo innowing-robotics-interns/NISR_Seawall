@@ -8,11 +8,11 @@
 # INPUT_FILE="3d_test_models/${FILE}"
 # OUTPUT_DIR="logs/log_3dDirichletMSE/${FILE%.*}_boxInit_24Patches_M900_6Atlas_pretrain2k_MED_FreezeUV_dirichletCollapse0.08_10k"
 
-
+OUTPUT_DIR="logs/adaptive/horse_rotate_CD_24Patches_M1100_6Atlas_5k_mu0.08_dirichlet_refP25k_ddfBeta0_ddfSigma0.05_lamDDF1_muDecay1_noCollapse"
 
 python utils/patch_vis.py \
-    --ckpt ${OUTPUT_DIR}/checkpoint_2000.pt \
+    --ckpt ${OUTPUT_DIR}/checkpoint_4000.pt \
     --out_dir ${OUTPUT_DIR} \
     --n_images 4 \
-    --subdivision_depth "-1" \
+    --resolution 32
     # --input_file ${INPUT_FILE} \
