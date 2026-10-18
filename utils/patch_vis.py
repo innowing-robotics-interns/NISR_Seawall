@@ -23,6 +23,7 @@ import os
 import argparse
 import importlib.util
 import glob
+import json
 import sys
 
 import numpy as np
@@ -39,6 +40,7 @@ for _root in (os.path.dirname(_HERE), _HERE, os.getcwd()):
         sys.path.insert(0, _root)
 
 from model.model import AdaptiveCubeForwardMap  # noqa: E402
+from model.losses import surface_jacobian, tangent_loss_from_jac  # noqa: E402
 
 # Load the texture
 def load_checkerboard_textures(texture_path, pattern="Slide{}.jpg", n_images=4):
@@ -228,6 +230,231 @@ def _filter_patch_mesh_by_occupancy(verts, uv, faces, occ_mask):
     return verts[kept_indices], uv[kept_indices], faces_kept
 
 
+# Singular-value (SVD loss) diagnostics
+def svd_loss_per_sample(t_u, t_v, mode, target, eps, chunk=65536):
+    """
+    Per-sample value of the SVD term, computed by the training function
+    `tangent_loss_from_jac` itself, vmapped so each sample is its own batch of
+    one. It therefore follows whatever equation losses.py holds for `mode`, and
+    its mean equals what `tangent_loss_from_jac` returns for the whole batch
+    (checked by `check_svd_decomposition`).
+
+    `t_u`, `t_v` must already be in the wanted units (leaf-local or face-UV).
+    """
+    def one(tu, tv):
+        return tangent_loss_from_jac(t_u=tu[None], t_v=tv[None], mode=mode,
+                                     target=target, eps=eps)
+    f = torch.func.vmap(one)
+    return torch.cat([f(t_u[i:i + chunk], t_v[i:i + chunk])
+                      for i in range(0, t_u.shape[0], chunk)])
+
+
+def check_svd_decomposition(t_u, t_v, mode, target, eps, n=4096):
+    """
+    Raise if the per-sample values do not average to the batch loss, i.e. the
+    mode couples samples (e.g. a batch-wide normalization) and cannot be split
+    into a per-vertex field.
+    """
+    t_u, t_v = t_u[:n], t_v[:n]
+    batch = float(tangent_loss_from_jac(t_u=t_u, t_v=t_v, mode=mode, target=target, eps=eps))
+    per = float(svd_loss_per_sample(t_u, t_v, mode, target, eps).mean())
+    if not np.isclose(per, batch, rtol=1e-4, atol=1e-7):
+        raise RuntimeError(
+            f"svd_mode '{mode}': mean of per-sample values {per:.6g} != batch loss "
+            f"{batch:.6g}. This mode couples samples, so it has no per-vertex value.")
+
+
+def _patch_jacobian(F, patch_idx, uv, device, normalize_patch_scale=False,
+                    batch_size=4096):
+    """
+    Tangents t_u, t_v of F at the given UV samples, detached.
+
+    Evaluated at the export mesh's own UVs, so row k belongs to vertex k. Units
+    match `tangent_loss_from_jac`: the leaf's local UV, or face-UV when
+    `normalize_patch_scale` (adaptive atlas only, divides by the leaf size, as
+    the function's own normalize_patch_scale does).
+
+    Returns:
+        Tuple `(t_u, t_v)`, each (n, 3).
+    """
+    scale = 1.0
+    if normalize_patch_scale and hasattr(F.complex, 'leaf_rect'):
+        F.complex._sync_device()
+        scale = float(F.complex.leaf_rect[patch_idx, 2])
+
+    # Exactly on a leaf corner / edge, mvc_weights_torch switches to its one-hot
+    # / linear branch, whose uv-gradient is zero / wrong across the edge. Pull
+    # the grid's boundary samples a hair inside to get the limit value instead.
+    uv_all = torch.as_tensor(uv, dtype=torch.float32, device=device).clamp(1e-4, 1.0 - 1e-4)
+    tu_out, tv_out = [], []
+    for i in range(0, uv_all.shape[0], batch_size):
+        with torch.enable_grad():
+            uv_b = uv_all[i:i + batch_size].clone().requires_grad_(True)
+            Q = F(patch_idx, uv_b)
+            # create_graph=True keeps the graph alive across the three
+            # per-coordinate grads inside surface_jacobian.
+            t_u, t_v = surface_jacobian(Q, uv_b, create_graph=True)
+        tu_out.append(t_u.detach() / scale)
+        tv_out.append(t_v.detach() / scale)
+    return torch.cat(tu_out, dim=0), torch.cat(tv_out, dim=0)
+
+
+def _patch_svd(F, patch_idx, uv, device, svd_cfg, normalize_patch_scale=False):
+    """
+    Singular values and per-sample SVD loss of one patch at the given UVs.
+
+    Returns:
+        Tuple `(sigma, loss)`: (n, 2) float32 with sigma1 >= sigma2, and (n,)
+        float32 from `svd_loss_per_sample`.
+    """
+    t_u, t_v = _patch_jacobian(F, patch_idx, uv, device, normalize_patch_scale)
+    with torch.no_grad():
+        sigma = torch.linalg.svdvals(torch.stack([t_u, t_v], dim=2))
+        loss = svd_loss_per_sample(t_u, t_v, **svd_cfg)
+    return (sigma.cpu().numpy().astype(np.float32),
+            loss.cpu().numpy().astype(np.float32))
+
+
+def _svd_stats(sigma, loss):
+    """Summary of one set of singular values and their SVD loss."""
+    s1 = sigma[:, 0]
+    return {
+        'n_samples': int(s1.size),
+        'loss_mean': float(loss.mean()),
+        'frac_penalized': float((loss > 0).mean()),
+        'sigma1_mean': float(s1.mean()),
+        'sigma1_p50': float(np.percentile(s1, 50)),
+        'sigma1_p90': float(np.percentile(s1, 90)),
+        'sigma1_p99': float(np.percentile(s1, 99)),
+        'sigma1_max': float(s1.max()),
+        'sigma2_mean': float(sigma[:, 1].mean()),
+        'area_mean': float((s1 * sigma[:, 1]).mean()),
+    }
+
+
+def _write_svd_ply(path, verts, faces, sigma, loss, patch, svd_cfg, color_by, color_max):
+    """
+    Binary PLY of the surface with per-vertex singular-value fields.
+
+    The float properties svd_loss, sigma1, sigma2, area (= sigma1 * sigma2)
+    and patch can be picked as scalar fields in CloudCompare / MeshLab. The
+    colours show `color_by` ('loss' or 'sigma1') on the FIXED range
+    [0, color_max] (blue = 0, white = color_max / 2, red = color_max or more),
+    so exports of different checkpoints compare by eye as long as they share
+    color_max.
+    """
+    import matplotlib
+    values = loss if color_by == 'loss' else sigma[:, 0]
+    ratio = np.clip(values / color_max, 0.0, 1.0)
+    rgb = (matplotlib.colormaps['coolwarm'](ratio)[:, :3] * 255).round().astype(np.uint8)
+
+    vdtype = np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                       ('red', 'u1'), ('green', 'u1'), ('blue', 'u1'),
+                       ('svd_loss', '<f4'), ('sigma1', '<f4'), ('sigma2', '<f4'),
+                       ('area', '<f4'), ('patch', '<f4')])
+    varr = np.empty(verts.shape[0], dtype=vdtype)
+    varr['x'], varr['y'], varr['z'] = verts[:, 0], verts[:, 1], verts[:, 2]
+    varr['red'], varr['green'], varr['blue'] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    varr['svd_loss'] = loss
+    varr['sigma1'], varr['sigma2'] = sigma[:, 0], sigma[:, 1]
+    varr['area'] = sigma[:, 0] * sigma[:, 1]
+    varr['patch'] = patch
+
+    fdtype = np.dtype([('n', 'u1'), ('v0', '<i4'), ('v1', '<i4'), ('v2', '<i4')])
+    farr = np.empty(faces.shape[0], dtype=fdtype)
+    farr['n'] = 3
+    farr['v0'], farr['v1'], farr['v2'] = faces[:, 0], faces[:, 1], faces[:, 2]
+
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"comment svd_mode {svd_cfg['mode']} svd_target {svd_cfg['target']} "
+        f"color_by {color_by} color_max {color_max}\n"
+        f"element vertex {verts.shape[0]}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        "property float svd_loss\nproperty float sigma1\nproperty float sigma2\n"
+        "property float area\nproperty float patch\n"
+        f"element face {faces.shape[0]}\n"
+        "property list uchar int vertex_indices\n"
+        "end_header\n"
+    )
+    with open(path, 'wb') as f:
+        f.write(header.encode('ascii'))
+        f.write(varr.tobytes())
+        f.write(farr.tobytes())
+
+
+def export_svd_diagnostics(parts, meta, save_dir, name, svd_cfg, units,
+                           unnormalize=True, leaf_patches=None,
+                           color_by='loss', color_max=None):
+    """
+    Write the singular-value PLY and svd_stats.json for one checkpoint.
+
+    Args:
+        parts: List of `(patch_id, verts, faces, sigma, loss)`, verts in the
+            normalized frame, one entry per exported patch.
+        svd_cfg: dict(mode, target, eps) the loss was computed with.
+        color_by: 'loss' (svd_loss) or 'sigma1', the field the colours show.
+        color_max: Top of the colour range (None = this checkpoint's p99 of
+            the `color_by` field).
+
+    Returns:
+        The stats dict written to svd_stats.json.
+    """
+    per_patch = []
+    for cid, _, _, sigma, loss in parts:
+        row = {'patch': int(cid), **_svd_stats(sigma, loss)}
+        if leaf_patches is not None:
+            row.update({'face': int(leaf_patches[cid].face),
+                        'depth': int(leaf_patches[cid].depth)})
+        per_patch.append(row)
+
+    offsets = np.cumsum([0] + [p[1].shape[0] for p in parts[:-1]])
+    verts = np.concatenate([p[1] for p in parts], axis=0)
+    faces = np.concatenate([p[2] + o for p, o in zip(parts, offsets)], axis=0)
+    sigma = np.concatenate([p[3] for p in parts], axis=0)
+    loss = np.concatenate([p[4] for p in parts], axis=0)
+    patch = np.concatenate([np.full(p[1].shape[0], p[0], np.float32) for p in parts])
+    if unnormalize:
+        verts = verts * meta['scale'] + meta['center']
+    if color_max is None:
+        values = loss if color_by == 'loss' else sigma[:, 0]
+        color_max = float(np.percentile(values, 99))
+        if color_max <= 0:
+            # A one-sided loss can be zero on 99% of the surface.
+            color_max = float(values.max()) if values.max() > 0 else 1.0
+
+    ply_path = os.path.join(save_dir, f"{name}_svd.ply")
+    _write_svd_ply(ply_path, verts, faces, sigma, loss, patch, svd_cfg,
+                   color_by, color_max)
+
+    stats = {
+        'svd_mode': svd_cfg['mode'],
+        'svd_target': float(svd_cfg['target']),
+        'svd_eps': float(svd_cfg['eps']),
+        'units': units,
+        'color_by': color_by,
+        'color_max': float(color_max),
+        'note': ('svd_loss comes from model.losses.tangent_loss_from_jac with the '
+                 'mode/target/eps above. sigma is in the model\'s normalized frame '
+                 '(not rescaled by unnormalize). loss_mean is the unweighted mean '
+                 'over all UV samples, every patch sampled equally, the same '
+                 'estimator as the SVD term in the training log.'),
+        'overall': _svd_stats(sigma, loss),
+        'per_patch': sorted(per_patch, key=lambda r: -r['loss_mean']),
+    }
+    with open(os.path.join(save_dir, 'svd_stats.json'), 'w') as f:
+        json.dump(stats, f, indent=2)
+
+    o = stats['overall']
+    print(f"    SVD ({svd_cfg['mode']}, target={svd_cfg['target']:g}, {units} units): "
+          f"loss mean={o['loss_mean']:.6f}  penalized on "
+          f"{100 * o['frac_penalized']:.2f}% of samples  sigma1 p50/p90/max="
+          f"{o['sigma1_p50']:.4f}/{o['sigma1_p90']:.4f}/{o['sigma1_max']:.4f}")
+    print(f"    Singular-value PLY → {ply_path}")
+    return stats
+
 
 # Export functions
 def export_checkerboard_patches(F, meta, save_dir, texture_path,
@@ -239,9 +466,17 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
                                  active_patch_ids=None,
                                  patch_points_by_id=None,
                                  subdivision_depth=1,
-                                 min_points_per_cell=1):
+                                 min_points_per_cell=1,
+                                 svd_cfg=None,
+                                 svd_normalize=False,
+                                 svd_color_by='loss',
+                                 svd_color_max=None):
     """
     Export checkerboard-textured patch meshes and a combined scene.
+
+    With `svd_cfg` = dict(mode, target, eps) set, also writes `<name>_svd.ply`
+    (per-vertex singular values and SVD loss from `tangent_loss_from_jac`) and
+    `svd_stats.json`.
     """
     os.makedirs(save_dir, exist_ok=True)
     textures = load_checkerboard_textures(texture_path, pattern=texture_pattern,
@@ -265,8 +500,16 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
 
     meshes = []          # textured (OBJ) versions
     colored_meshes = []  # vertex-colored (PLY) versions
+    svd_parts = []       # (patch_id, verts, faces, sigma, loss), single-sided
 
     use_legacy_sampling = subdivision_depth <= 0 or patch_points_by_id is None
+
+    if svd_cfg is not None:
+        # The per-vertex field is only meaningful if the mode splits into
+        # per-sample terms; verify on random samples of one patch.
+        rand_uv = np.random.default_rng(0).random((4096, 2), dtype=np.float32)
+        t_u, t_v = _patch_jacobian(F, patch_ids[0], rand_uv, device, svd_normalize)
+        check_svd_decomposition(t_u, t_v, **svd_cfg)
 
     for export_idx, cid in enumerate(patch_ids):
         verts, uv, faces = _sample_patch_grid(F, cid, resolution, device)
@@ -281,6 +524,11 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
                 print(f"    Patch {cid:02d} skipped after occupancy filtering")
                 continue
         tex_img = textures[export_idx % n_textures]
+
+        if svd_cfg is not None:
+            # Before double-siding, so each vertex carries one value.
+            sigma, loss = _patch_svd(F, cid, uv, device, svd_cfg, svd_normalize)
+            svd_parts.append((cid, verts, faces, sigma, loss))
 
         if debug_uv_png:
             # Use the original UV layout before optional geometry duplication.
@@ -340,6 +588,13 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
         ply_scene_path = os.path.join(save_dir, ply_scene_name)
         combined_colored.export(ply_scene_path)
         print(f"    Combined checkerboard scene (PLY) → {ply_scene_path}")
+
+    if svd_parts:
+        export_svd_diagnostics(
+            svd_parts, meta, save_dir, name or 'checkerboard', svd_cfg,
+            units='face-UV' if svd_normalize else 'leaf-local UV',
+            unnormalize=unnormalize, leaf_patches=leaf_patches,
+            color_by=svd_color_by, color_max=svd_color_max)
 
     return meshes
 
@@ -611,6 +866,29 @@ def main():
                             'from every patch including empty/inactive ones.')
     parser.add_argument('--min_points_per_cell', type=int, default=10,
                         help='Minimum number of input points required for a subdivided UV cell to be kept')
+    parser.add_argument('--svd_mode', type=str, default=None,
+                        help="Mode passed to model.losses.tangent_loss_from_jac for the "
+                             "svd_loss field (default: the checkpoint's own --svd_mode)")
+    parser.add_argument('--svd_target', type=float, default=None,
+                        help="'target' passed to tangent_loss_from_jac (default: the "
+                             "checkpoint's own --svd_target)")
+    parser.add_argument('--svd_color_by', type=str, default='loss',
+                        choices=['loss', 'sigma1'],
+                        help="Field the _svd.ply colours show: 'loss' = svd_loss from "
+                             "tangent_loss_from_jac (default), 'sigma1' = largest "
+                             "singular value. Every field stays in the PLY either way")
+    parser.add_argument('--svd_color_max', type=float, default=None,
+                        help='Value shown as full red in the _svd.ply. Default: the '
+                             'FIRST checkpoint\'s p99 of the --svd_color_by field; every '
+                             'later checkpoint reuses it so colours compare')
+    parser.add_argument('--svd_units', type=str, default='local',
+                        choices=['local', 'face'],
+                        help="'local' = each leaf's own [0,1]^2 UV, as main.py currently "
+                             "computes the SVD loss (normalize_patch_scale=False); "
+                             "'face' = divided by leaf size, depth-independent "
+                             "(adaptive only)")
+    parser.add_argument('--no_svd', action='store_true',
+                        help='Skip the singular-value PLY and svd_stats.json')
     args = parser.parse_args()
 
     ckpt_paths = _resolve_checkpoint_paths(args.ckpt)
@@ -620,6 +898,8 @@ def main():
     if len(ckpt_paths) > 1:
         print(f"  Found {len(ckpt_paths)} checkpoint files in {os.path.abspath(args.ckpt)}")
 
+    svd_rows = []        # one summary row per checkpoint, for svd_summary.csv
+    svd_color_max = args.svd_color_max
     for ckpt_path in ckpt_paths:
         ckpt_name = os.path.splitext(os.path.basename(ckpt_path))[0]
         export_dir = os.path.join(args.out_dir, ckpt_name)
@@ -657,6 +937,24 @@ def main():
             print(f"  Active patches in checkpoint: {len(active_patch_ids)}")
         print(f"  Exporting checkpoint {ckpt_name} → {export_dir}")
 
+        svd_cfg = None
+        if not args.no_svd:
+            mode = args.svd_mode or ckpt_args.get('svd_mode')
+            if mode is None:
+                print("  [warn] The checkpoint records no svd_mode (not an adaptive "
+                      "run?) and --svd_mode was not given; skipping the SVD export.")
+            else:
+                target = (args.svd_target if args.svd_target is not None
+                          else ckpt_args.get('svd_target', 1.0))
+                svd_cfg = {'mode': mode, 'target': float(target),
+                           'eps': float(ckpt_args.get('svd_eps', 1e-4))}
+                if not ckpt_args.get('lam_svd'):
+                    print(f"  [note] lam_svd was 0 in this run: svd_loss shows what "
+                          f"'{mode}' WOULD be, the term was not trained.")
+        stats_path = os.path.join(export_dir, 'svd_stats.json')
+        if os.path.exists(stats_path):
+            os.remove(stats_path)    # never summarize a stale file from an earlier run
+
         export_checkerboard_patches(
             F, meta,
             save_dir=export_dir,
@@ -674,7 +972,35 @@ def main():
             patch_points_by_id=patch_points_by_id,
             subdivision_depth=args.subdivision_depth,
             min_points_per_cell=args.min_points_per_cell,
+            svd_cfg=svd_cfg,
+            svd_normalize=args.svd_units == 'face',
+            svd_color_by=args.svd_color_by,
+            svd_color_max=svd_color_max,
         )
+
+        if svd_cfg is not None and os.path.exists(stats_path):
+            with open(stats_path) as f:
+                stats = json.load(f)
+            svd_color_max = stats['color_max']     # fixed for later checkpoints
+            svd_rows.append((ckpt_name, F.n_patches, stats['overall']))
+
+    # Same mode, target and units for every checkpoint of a run, so the rows
+    # compare directly.
+    if len(svd_rows) > 1:
+        keys = ('loss_mean', 'frac_penalized', 'sigma1_p50', 'sigma1_p90',
+                'sigma1_p99', 'sigma1_max', 'area_mean')
+        csv_path = os.path.join(args.out_dir, 'svd_summary.csv')
+        with open(csv_path, 'w') as f:
+            f.write('checkpoint,n_patches,' + ','.join(keys) + '\n')
+            for name, n, o in svd_rows:
+                f.write(f"{name},{n}," + ','.join(f"{o[k]:.6g}" for k in keys) + '\n')
+        print(f"\n  SVD loss per checkpoint:")
+        print(f"    {'checkpoint':<24} {'patches':>7} {'loss mean':>11} "
+              f"{'% penal.':>9} {'s1 p90':>8}")
+        for name, n, o in svd_rows:
+            print(f"    {name:<24} {n:>7} {o['loss_mean']:>11.6f} "
+                  f"{100 * o['frac_penalized']:>8.2f}% {o['sigma1_p90']:>8.4f}")
+        print(f"    → {csv_path}")
 
     print(f"\n  Done. Textured patches → {args.out_dir}")
 
