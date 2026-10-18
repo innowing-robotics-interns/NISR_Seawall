@@ -148,6 +148,15 @@ def train_multi_patch(pts3n: np.ndarray,
                       mu_warmup_delay: int = 0,
                       schedule: str = 'cosine',
                       gamma: float = 1.0,
+                      gamma_warmup_epochs: int = 0,
+                      gamma_warmup_delay: int = 0,
+                      normal_hinge_tau: float = None,
+                      lam_svd: float = 0.0,
+                      svd_mode: str = 'arap_si',
+                      svd_target: float = 0.25,
+                      svd_eps: float = 1e-4,
+                      svd_warmup_epochs: int = 0,
+                      svd_warmup_delay: int = 0,
                       lam: float = 1.0,
                       lam2: float = 1.0,
                       lambda_bcd: float = 0.1,
@@ -497,7 +506,7 @@ def train_multi_patch(pts3n: np.ndarray,
     opt = torch.optim.Adam(opt_params, lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
 
-    history = {'cd': [], 'cycle': [], 'param': [], 'tangent': [], 'normal': [],
+    history = {'cd': [], 'cycle': [], 'param': [], 'tangent': [], 'svd': [], 'normal': [],
                'outer_boundary': [],
                'mu_eff': [], 'total': [], 'epoch': [], 'phase': []}
     
@@ -532,6 +541,17 @@ def train_multi_patch(pts3n: np.ndarray,
     if mu_warmup_epochs > 0 and mu > 0:
         print(f"  μ warmup: {mu_warmup_schedule} ramp over {mu_warmup_epochs} epochs "
               f"(0.0 → {mu})")
+    if gamma > 0:
+        form = f"relu({normal_hinge_tau:g}-cos)" if normal_hinge_tau is not None else "1-cos"
+        print(f"  Normal loss: γ={gamma}  {form}"
+              + (f"  delay={gamma_warmup_delay} warmup={gamma_warmup_epochs}"
+                 if (gamma_warmup_delay > 0 or gamma_warmup_epochs > 0) else ""))
+    if lam_svd > 0:
+        print(f"  SVD loss: λ_svd={lam_svd}  mode={svd_mode}"
+              + (f"  target={svd_target}" if svd_mode in ('arap', 'one_sided_arap') else "")
+              + f"  eps={svd_eps}"
+              + (f"  delay={svd_warmup_delay} warmup={svd_warmup_epochs}"
+                 if (svd_warmup_delay > 0 or svd_warmup_epochs > 0) else ""))
     print(f"  Epochs={epochs}  lr={lr}  device={device}")
     print(f"{'─'*60}")
     t0 = time.time()
@@ -576,6 +596,15 @@ def train_multi_patch(pts3n: np.ndarray,
                 'lr': lr,
                 'mu': mu,
                 'gamma': gamma,
+                'gamma_warmup_epochs': gamma_warmup_epochs,
+                'gamma_warmup_delay': gamma_warmup_delay,
+                'normal_hinge_tau': normal_hinge_tau,
+                'lam_svd': lam_svd,
+                'svd_mode': svd_mode,
+                'svd_target': svd_target,
+                'svd_eps': svd_eps,
+                'svd_warmup_epochs': svd_warmup_epochs,
+                'svd_warmup_delay': svd_warmup_delay,
                 'lam': lam,
                 'lam2': lam2,
                 'lambda_bcd': lambda_bcd,
@@ -902,21 +931,32 @@ def train_multi_patch(pts3n: np.ndarray,
         else:
             param_loss = zero
 
-        # Loss 4 and 5: tangent and normal regularization.
-        do_reg = (mu > 0 or gamma > 0) and (epoch % reg_every == 0)
+        # Loss 4, 5 and 6: tangent, SVD and normal regularization.
         mu_eff = mu_warmup_schedule(epoch, mu_warmup_epochs, mu,
                                     schedule=schedule, delay_epochs=mu_warmup_delay) if mu > 0 else 0.0
+        svd_eff = mu_warmup_schedule(epoch, svd_warmup_epochs, lam_svd,
+                                     schedule=schedule, delay_epochs=svd_warmup_delay) if lam_svd > 0 else 0.0
+        gamma_eff = mu_warmup_schedule(epoch, gamma_warmup_epochs, gamma,
+                                       schedule=schedule, delay_epochs=gamma_warmup_delay) if gamma > 0 else 0.0
         if use_ddf_phase:
             mu_eff *= ddf_mu_decay
+        do_reg = (mu_eff > 0 or svd_eff > 0 or gamma_eff > 0) and (epoch % reg_every == 0)
         if do_reg:
             t_u, t_v = surface_jacobian(Q_flat, uv_flat)
 
             if mu_eff > 0:
                 tangent_loss = tangent_loss_from_jac(None, None, t_u, t_v)
             else:
-                tangent_loss = torch.zeros((), device=Q.device, dtype=Q.dtype)
+                tangent_loss = zero
 
-            if gamma > 0:
+            if svd_eff > 0:
+                svd_loss = tangent_loss_from_jac(None, None, t_u, t_v,
+                                                 mode=svd_mode, target=svd_target,
+                                                 eps=svd_eps, normalize_patch_scale=False)
+            else:
+                svd_loss = zero
+
+            if gamma_eff > 0:
                 if no_presplit:
                     raise NotImplementedError("Normal consistency is not supported with --no_presplit")
                 n_surf = torch.cross(t_u, t_v, dim=-1)
@@ -927,11 +967,15 @@ def train_multi_patch(pts3n: np.ndarray,
                 n_target = torch.gather(
                     tgt_nrm, 1, nn_idx.unsqueeze(-1).expand(-1, -1, 3))
                 cos = torch.sum(n_surf * n_target, dim=-1)
-                normal_loss = (1.0 - cos).mean()
+                if normal_hinge_tau is None:
+                    normal_loss = (1.0 - cos).mean()
+                else:
+                    normal_loss = torch.relu(normal_hinge_tau - cos).mean()
             else:
                 normal_loss = zero
         else:
             tangent_loss = zero
+            svd_loss = zero
             normal_loss = zero
 
         if lambda_outer_boundary > 0:
@@ -949,7 +993,8 @@ def train_multi_patch(pts3n: np.ndarray,
                 + lam * cycle_loss
                 + lam2 * param_loss
                 + mu_eff * tangent_loss
-                + gamma * normal_loss
+                + svd_eff * svd_loss
+                + gamma_eff * normal_loss
                 + lambda_outer_boundary * outer_boundary_loss)
         loss.backward()
 
@@ -963,6 +1008,7 @@ def train_multi_patch(pts3n: np.ndarray,
             history['cycle'].append(float(cycle_loss))
             history['param'].append(float(param_loss))
             history['tangent'].append(float(tangent_loss))
+            history['svd'].append(float(svd_loss))
             history['normal'].append(float(normal_loss))
             history['outer_boundary'].append(float(outer_boundary_loss))
             # history['mu_eff'].append(float(mu_eff))
@@ -985,10 +1031,13 @@ def train_multi_patch(pts3n: np.ndarray,
                   f"Cycle={float(cycle_loss):.5f}  "
                   f"Param={float(param_loss):.5f}  "
                   f"Tangent={float(tangent_loss):.5f}  "
+                  f"SVD={float(svd_loss):.5f}  "
                   f"Normal={float(normal_loss):.5f}  "
                   f"Outer={float(outer_boundary_loss):.5f}  "
-                  f"Total={float(loss):.5f}"
+                  f"Total={float(loss):.5f}  "
                   f"μ_eff={float(mu_eff):.4f}  "
+                  f"λsvd_eff={float(svd_eff):.4f}  "
+                  f"γ_eff={float(gamma_eff):.4f}  "
                   f"[{elapsed:.1f}s]")
             # vf = F.complex.vertex_features
             # vf_delta = (vf.detach() - vertex_features_init).norm().item()
@@ -2780,10 +2829,10 @@ def main():
     # Normal consistency (γ-weighted); --gamma itself is a shared option above.
     normal_group = parser.add_argument_group('normal consistency (--adaptive)')
     normal_group.add_argument('--gamma_warmup_epochs', type=int, default=0,
-                              help='[Adaptive] Ramp γ from 0 to --gamma over this many '
+                              help='Ramp γ from 0 to --gamma over this many '
                                    'epochs (0 = full weight immediately)')
     normal_group.add_argument('--gamma_warmup_delay', type=int, default=0,
-                              help='[Adaptive] Keep γ at 0 for this many epochs before the ramp')
+                              help='Keep γ at 0 for this many epochs before the ramp')
     normal_group.add_argument('--normal_off_frac', type=float, default=1,
                               help='[Adaptive, >1 GHPR stage] Fraction of --visible_epochs at '
                                    'the start of every phase (each GHPR stage and the '
@@ -2809,12 +2858,12 @@ def main():
                                    'point vs. the normal of its nearest predicted point). This is '
                                    'the coverage term; 0 disables it.')
     normal_group.add_argument('--normal_hinge_tau', type=float, default=None,
-                              help='[Adaptive] cos threshold below which a '
+                              help='cos threshold below which a '
                                    'normal is penalized: 0 = more than 90° off, 0.3 ≈ 73°, '
                                    '0.5 = 60°. Must be in [-1, 1). Default 0.3')
 
     # SVD (singular-value) Jacobian regularization
-    svd_group = parser.add_argument_group('SVD tangent regularization (--adaptive)')
+    svd_group = parser.add_argument_group('SVD tangent regularization')
     svd_group.add_argument('--lam_svd', type=float, default=0.0,
                            help='Weight of the SVD Jacobian loss (0 disables)')
     svd_group.add_argument('--svd_mode', type=str, default='arap_si',
@@ -3109,6 +3158,15 @@ def main():
             mu_warmup_delay=args.mu_warmup_delay,
             schedule=args.schedule,
             gamma=args.gamma,
+            gamma_warmup_epochs=args.gamma_warmup_epochs,
+            gamma_warmup_delay=args.gamma_warmup_delay,
+            normal_hinge_tau=args.normal_hinge_tau,
+            lam_svd=args.lam_svd,
+            svd_mode=args.svd_mode,
+            svd_target=args.svd_target,
+            svd_eps=args.svd_eps,
+            svd_warmup_epochs=args.svd_warmup_epochs,
+            svd_warmup_delay=args.svd_warmup_delay,
             lam=args.lam,
             lam2=args.lam2,
             lambda_bcd=args.lambda_bcd,
