@@ -20,9 +20,11 @@ must contain 18 channels and this module does not apply.
 
 This module is standalone and is not wired into the NISR training loop.
 ``nvdiffrast`` is imported lazily because it is only needed by the renderer;
-``UniformLaplacian`` is pure torch.  The ``views`` tensor contains
-world-to-camera matrices ``(B, 4, 4)`` with columns ``[right, up, look, eye]``,
-and vertices must already be in the normalized frame used for the reference.
+``UniformLaplacian`` is pure torch.  Integration gaps with NISR's atlas
+representation are documented in ``ngf_rendering_loss_notes.md`` next to this
+file.  The ``views`` tensor contains world-to-camera matrices ``(B, 4, 4)``
+with columns ``[right, up, look, eye]``, and vertices must already be in the
+normalized frame used for the reference.
 
 Example:
     renderer = NGFRenderer(width=256, height=256, fov=45.0)
