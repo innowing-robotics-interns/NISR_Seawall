@@ -18,8 +18,9 @@ A point cloud observes only the front surface, so this module rasterizes one
 layer.  NGF's mesh trainer peels three layers; for that variant the reference
 must contain 18 channels and this module does not apply.
 
-This module is standalone and is not wired into the NISR training loop.
-``nvdiffrast`` is imported lazily because it is only needed by the renderer;
+The module is wired into ``train_multi_patch`` behind ``--lambda_render``
+(fixed-grid single-sheet atlas only). ``nvdiffrast`` is imported lazily because
+it is only needed by the renderer;
 ``UniformLaplacian`` is pure torch.  Integration gaps with NISR's atlas
 representation are documented in ``ngf_rendering_loss_notes.md`` next to this
 file.  The ``views`` tensor contains world-to-camera matrices ``(B, 4, 4)``
@@ -98,8 +99,10 @@ class NGFRenderer:
                 f'normals must match vertices, got {tuple(normals.shape)}')
 
         device = vertices.device
-        views = views.to(device=device, dtype=vertices.dtype)
-        faces = faces.to(device=device, dtype=torch.int32)
+        vertices = vertices.contiguous()
+        normals = normals.contiguous()
+        views = views.to(device=device, dtype=vertices.dtype).contiguous()
+        faces = faces.to(device=device, dtype=torch.int32).contiguous()
 
         mvps = self.proj.to(device=device, dtype=vertices.dtype) @ views
         v_hom = torch.nn.functional.pad(vertices, (0, 1), 'constant', 1.0)

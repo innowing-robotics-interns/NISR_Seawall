@@ -10,9 +10,12 @@
 
 # FILE="max-planck.ply"
 # FILE="bunny_points.ply"
-FILE="horse_rotate.ply"
-INPUT_FILE="3d_test_models/${FILE}"
-OUTPUT_DIR="logs/adaptive/${FILE%.*}_CD_24Patches_M1100_6Atlas_5k_mu0.08_dirichlet_refP25k_ddfBeta0_ddfSigma0.05_lamDDF1_muDecay1_noCollapse_extArea1"
+# FILE="xyzrgb_dragon_points.ply"
+# FILE="lucy_points.ply"
+# FILE="120477.ply"
+FILE="${FILE:-dancing_children100K.ply}"
+INPUT_FILE="${INPUT_FILE:-normalized_shapes/${FILE}}"
+OUTPUT_DIR="${OUTPUT_DIR:-logs/adaptive/${FILE%.*}_CD_noCollapse_extArea1_noFit_allUnpaired}"
 
 
 # python main.py \
@@ -155,28 +158,42 @@ OUTPUT_DIR="logs/adaptive/${FILE%.*}_CD_24Patches_M1100_6Atlas_5k_mu0.08_dirichl
 #     --lambda_chamfer 1 \
 #     --lambda_ddf 1 \
 
+EPOCHS="${EPOCHS:-10000}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-500}"
+PATCH_VIS="${PATCH_VIS:-0}"
+INIT_CKPT="${INIT_CKPT:-}"
+INIT_CKPT_REUSE_NORMALIZATION="${INIT_CKPT_REUSE_NORMALIZATION:-0}"
+
+INIT_ARGS=()
+if [[ -n "${INIT_CKPT}" ]]; then
+    INIT_ARGS+=(--init_ckpt "${INIT_CKPT}")
+fi
+if [[ "${INIT_CKPT_REUSE_NORMALIZATION}" == "1" ]]; then
+    INIT_ARGS+=(--init_ckpt_reuse_normalization)
+fi
+
 # Start from the inside
 python main.py \
     --adaptive \
     --visible_epochs 1000 \
-    --epochs 10000 \
+    --epochs ${EPOCHS} \
     --file ${INPUT_FILE} \
     --result_dir ${OUTPUT_DIR} \
     --subdiv_threshold 0.1 \
     --subdiv_max_depth 7 \
     --lam_svd 0.08 \
     --mu 0.08 \
-    --svd_mode conformal \
+    --svd_mode collapse \
     --svd_warmup_delay 3000 \
     --svd_warmup_epochs 500 \
     --pretrain_epochs 500 \
-    --M_per_patch 128 \
-    --L 4 \
+    --M_per_patch 64 \
+    --L 0 \
     --log_every 500 \
-    --checkpoint_every 500 \
+    --checkpoint_every ${CHECKPOINT_EVERY} \
     --tangent_mode dirichlet \
     --sym_dirichlet_epoch 0 \
-    --gamma 0.08 \
+    --gamma 0.0 \
     --gamma_warmup_delay 5000 \
     --gamma_warmup_epochs 1000 \
     --normal_hinge_tau 0.3 \

@@ -1212,6 +1212,13 @@ def visualise_multi_patch(F, pts3n, assignments, history, out_path,
     ax5.plot(ep, history['cd'], color='#58a6ff', lw=1.8, label='Chamfer (CD)')
     ax5.plot(ep, history['tangent'], color='#d2a8ff', lw=1.8, label='Tangent (μ)')
     ax5.plot(ep, history['total'], color='#f78166', lw=2.2, label='Total', ls='--')
+    if 'render' in history and len(history['render']) == len(ep):
+        render_curve = np.asarray(history['render'], dtype=float)
+        # Zeros outside the render window would spike on a log axis.
+        render_curve[~(render_curve > 0)] = np.nan
+        if np.any(~np.isnan(render_curve)):
+            ax5.plot(ep, render_curve, color='#79c0ff', lw=1.4,
+                     label='Render (NGF)')
     ax5.set_yscale('log')
     ax5.set_xlabel("Epoch", fontsize=8)
     ax5.set_ylabel("Loss (log)", fontsize=8)
@@ -1626,7 +1633,21 @@ def _save_run_metadata(log_path: str, args, input_file: str, result_dir: str,
             'L_inverse_map_frequencies': _safe_getattr(args, 'L_inv', None),
             'lambda1_cycle_weight': _safe_getattr(args, 'lam', None),
             'lambda2_param_weight': _safe_getattr(args, 'lam2', None),
+            'lambda_render': _safe_getattr(args, 'lambda_render', 0.0),
+            'render_start_epoch': _safe_getattr(args, 'render_start_epoch', None),
+            'render_warmup_epochs': _safe_getattr(args, 'render_warmup_epochs', None),
+            'render_every': _safe_getattr(args, 'render_every', None),
+            'render_views': _safe_getattr(args, 'render_views', None),
+            'render_batch': _safe_getattr(args, 'render_batch', None),
+            'render_resolution': _safe_getattr(args, 'render_resolution', None),
+            'render_mesh_res': _safe_getattr(args, 'render_mesh_res', None),
+            'render_min_coverage': _safe_getattr(args, 'render_min_coverage', None),
         })
+        render_mesh_res = _safe_getitem(history, 'render_mesh_resolution', None)
+        if render_mesh_res:
+            hyperparams['render_mesh_resolution_effective'] = render_mesh_res
+            hyperparams['render_target_views'] = _safe_getitem(
+                history, 'render_target_views', None)
     else:
         hyperparams.update({
             'L_fourier_frequencies': _safe_getattr(args, 'L', None),
@@ -1648,6 +1669,10 @@ def _save_run_metadata(log_path: str, args, input_file: str, result_dir: str,
         loss_hist['tangent_loss'] = _safe_getitem(history, 'tangent', None)
     if _safe_getitem(history, 'normal', None) is not None:
         loss_hist['normal_loss'] = _safe_getitem(history, 'normal', None)
+    if _safe_getitem(history, 'render', None) is not None:
+        loss_hist['render_loss'] = _safe_getitem(history, 'render', None)
+    if _safe_getitem(history, 'render_eff', None) is not None:
+        loss_hist['render_weight_effective'] = _safe_getitem(history, 'render_eff', None)
 
 
     center = _safe_getitem(meta, 'center', None)

@@ -13,6 +13,7 @@ OUTPUT_DIR="logs/adaptive/horse_rotate_CD_24Patches_M1100_6Atlas_5k_mu0.08_diric
 python utils/patch_vis.py \
     --ckpt ${OUTPUT_DIR}/checkpoint_4000.pt \
     --out_dir ${OUTPUT_DIR} \
+    --no_obj \
     --n_images 4 \
     --resolution 32
     # --input_file ${INPUT_FILE} \

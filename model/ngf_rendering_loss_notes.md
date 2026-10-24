@@ -2,188 +2,178 @@
 
 Module: [`ngf_rendering_loss.py`](ngf_rendering_loss.py)  
 Branch: `renderloss`  
-Status: renderer and loss verified; deliberately **not wired into `main.py`**.
+Status: **wired into `main.py`** for fixed-grid (`single_sheet`, `six_sheet`
+with `--no_presplit`) and adaptive cube atlases.
 
-## Bottom line
+## What is implemented
 
-The loss consumes a connected triangle mesh. NISR optimizes a neural atlas from
-unstructured per-patch UV samples, so the arrays only line up after the atlas
-has been sampled into an indexed mesh. The existing exporter
-`utils.sample_multi_patch_grid` produces compatible vertex/face shapes, but it
-is export-only: it copies every patch to CPU and calls `.numpy()`
-(`utils/utils.py:660-661`), which detaches the graph. It also keeps duplicate
-vertices at patch seams and returns no normals. Cameras and reference maps do
-not exist in the repository yet.
+- `utils/render_mesh.py` samples the atlas into a live-autograd indexed mesh
+  (`vertices`, `faces`, area-weighted `vertex_normals`). No CPU copy.
+- `utils/render_targets.py` builds NGF-convention orbit cameras and a
+  z-buffered point-splat reference of `[normal, position, alpha]` from the
+  input cloud in NISR's own normalized frame.
+- `model/ngf_rendering_loss.py` rasterizes the mesh with nvdiffrast and returns
+  NGF's **unweighted** L1 over all pixels and the six normal/position
+  channels. Alpha is ignored. An optional uniform Laplacian is added.
+- `main.py` exposes `--lambda_render`, `--render_views`, `--render_batch`,
+  `--render_resolution`, `--render_mesh_res`, `--render_laplacian_weight`,
+  `--render_min_coverage`, `--render_start_epoch`, `--render_warmup_epochs`
+  and `--render_preview`.
 
-## Interface expected by the loss
+The renderer is single-layer. NGF's original mesh loss peels three layers; a
+single front layer supervises only the visible surface. For closed shells the
+back side gets no render gradient (regularizers still apply).
 
-| Argument | Shape / type | Notes |
+## Fixed-grid behaviour
+
+The render term is **added** to whatever surface term is configured:
+
+- `--lambda_chamfer 0 --lambda_render 1` is pure NGF (used for the six-sheet
+  `g06b` run).
+- With both positive, Chamfer and render are optimized together.
+
+Validated on bunny six-sheet (`g06b_box_ngf_120v`, 120 views, batch 10, 256²,
+Laplacian 1.0, 2000-epoch box pretrain, 1000 render epochs): render L1
+0.392 → 0.053 at 100 epochs → **0.023 at 1000 epochs**.
+
+## Adaptive behaviour
+
+With `--adaptive --lambda_render > 0` the render term **replaces Chamfer** as
+the surface-fitting term. Every other term of the previous adaptive design is
+kept: μ Dirichlet tangent, λ_svd, γ normal, extension-area, subdivision and
+GHPR staging. The flow is the original one:
+
+1. `pretrain_adaptive_box` fits the 24-leaf atlas to the reference box
+   (default 500 epochs; box loss reached 2e-6 on Lucy).
+2. Render targets are built from the **full** cloud (not a GHPR visible
+   subset). `--surface_loss_type chamfer` remains the stored value but CD is
+   computed only for logging.
+3. The render mesh is resampled from the live atlas every step and rebuilt
+   after every subdivision. Under `--render_mesh_res 0` the per-patch grid is
+   automatically reduced to stay near 30k vertices.
+
+Because the reference set is the full cloud, GHPR visible-only stages no
+longer affect the surface fit; they only change the (optional) normal pool and
+the logged CD. Full-cloud AABB initialization (`--box_init aabb`, no
+`--ghpr_init`) is the recommended start for render-loss runs.
+
+### The delayed-μ requirement
+
+A plain Dirichlet tangent energy `0.5(|t_u|² + |t_v|²)` is minimized at **zero
+scale**. With Chamfer present it is balanced; with render-only supervision and
+μ active from the first post-pretrain epoch it wins before the render loss
+leaves the box basin. Controlled evidence on bunny:
+
+| run | μ schedule | outcome |
 |---|---|---|
-| `vertices` | `(V, 3)` torch float32, CUDA | normalized frame |
-| `normals` | `(V, 3)` torch float32, CUDA | unit length, same indexing as vertices |
-| `faces` | `(F, 3)` torch int32, CUDA | triangle indices into the shared vertex array |
-| `views` | `(B, 4, 4)` torch float32 | world-to-camera, columns `[right, up, look, eye]` |
-| `reference` | `(B, H, W, 6)` or `(B, H, W, 7)` | `[normal, world position]`; a 7th alpha channel is ignored |
+| `smoke2` | 0.08 from epoch 1 | collapsed: R→trivial, CD→1.03, mesh span→0.001 |
+| `smoke3` | μ=0 | fitted: R 0.266→0.050, CD 0.60→0.15 |
+| `smoke5` | 0.08 resumed from fitted `smoke3` | stable: R 0.050→0.038, CD 0.135→0.103 |
+| `smoke6` | 0.08 delayed 500, ramp 500 | fitted + 3 subdivisions: R 0.2705→0.0283, CD 0.0266 |
 
-The renderer is single-layer and returns `(B, H, W, 6)`. Images use
-nvdiffrast's bottom-up order and NGF's x-negating projection. Reference and
-prediction must be in the same normalized frame and use the same cameras.
+`train_adaptive` now prints a warning when μ would be nonzero at the first
+render epoch. Recommended: `--mu_warmup_delay 500 --mu_warmup_epochs 500` at
+minimum; the Lucy/dancing runs use `1000/1000`.
 
-## What NISR provides today
+### Learning-rate stability (sparse silhouettes)
 
-| Data | Shape / form | Source |
-|---|---|---|
-| Surface samples | `(M, 3)` from `F(patch_id, uv)`, `uv` is `(M, 2)` | training loop |
-| Analytic tangents | `t_u, t_v` per sample; `n = t_u × t_v` | `model/losses.py:344`, `model/losses.py:472` |
-| Export mesh | `(P·R², 3)` NumPy float32, `(P·2·(R−1)², 3)` NumPy int32 | `utils/utils.py:615` |
-| Mesh normals | not returned by the exporter | — |
-| Cameras / reference maps | none in the training pipeline | — |
-| Adaptive mesh | no triangle mesh in the training loop; quadtree leaves with hanging vertices | `model/model.py:1037`, `model/model.py:1301` |
+The empty-frame basin is also reachable by taking too-large optimizer steps.
+Controlled Lucy runs from the same 500-epoch box pretrain (24 leaves, 400
+epochs, no regularizers, Laplacian 1.0):
 
-## Blockers
+| lr | render L1 | Chamfer | coverage |
+|---|---|---|---|
+| 1e-3 | 0.0393 (floor) | 0.465 | 0.004 |
+| 5e-4 | 0.0419 (floor) | 0.562 | 0.000 |
+| 2e-4 | 0.0230 | 0.053 | 0.230 |
+| 1e-4 | 0.0250 | 0.070 | 0.170 |
 
-### 1. The existing mesh is detached
+With subdivision, 1e-4 for 2500 epochs reached coverage 0.706, Chamfer 0.030,
+render L1 0.019 (24→165 leaves, μ delayed 1000, SVD delayed 1500). NGF itself
+starts from a decimated version of the object, not a bounding box; the low LR
+plays the role of a gentle initialization for the box. `train_adaptive` warns
+when `--lr >= 5e-4` is used with a render-only adaptive objective. The full
+Lucy/dancing runs use **2e-4**.
 
-`sample_multi_patch_grid` evaluates each patch in a loop and appends
-`F(...).cpu()`, then converts the concatenation with `.numpy()`
-(`utils/utils.py:660-661`). It is used only for export and visualization
-(e.g., `main.py:2677`). A rendering loss needs a GPU sampler that keeps the
-graph alive; otherwise the render loss cannot reach the decoder or vertex
-features.
-A differentiable sampler also needs to be cheap enough for every optimization
-step, using a much lower resolution than `--mesh_res 100`.
+### Full box-initialized runs (10,000 epochs)
 
-### 2. No vertex normals in the exported mesh
+Two full runs replace Chamfer with render L1 on the adaptive atlas. Both use
+the original 500-epoch box pretrain, 24 root patches, 120 views at 256°, batch
+10, Laplacian 1.0, the old μ/SVD/γ/extension schedules, and `lr 2e-4` with
+μ delayed 1000/ramped 1000 (the only schedule change). Chamfer is logged only.
 
-The exporter returns only `verts, faces`. NISR does have the right normal
-convention: `n = cross(t_u, t_v)` (`model/losses.py:472`,
-`main.py:1035`), and the exporter's triangle winding is consistent with it
-(`[00, 10, 11]` and `[00, 11, 01]`). Normals must still be produced per mesh
-vertex, either by evaluating analytic tangents on the UV grid or by computing
-area-weighted face normals and accumulating them. The former is cleaner at
-seams and avoids an extra normalization pass.
+| run | leaves | render L1 ep1 → final | logged CD | render-check full L1 | held-out CD | coverage | rendered normal med/p95 | visible-layer normal med/p95 | checker p95 |
+|---|---|---|---|---|---|---|---|---|---|
+| Lucy render | 249 | 0.1449 → 0.0154 | 0.0200 | 0.0170 | 0.0160 | 0.927 | 10.64 / 55.19° | 8.64 / 56.22° | 0.033 |
+| Lucy old Chamfer | 150 | n/a | 0.0147 | 0.0180 | 0.0080* | 0.999 | 8.93 / 64.02° | 5.08 / 41.42° | 0.039 |
+| dancing render | 369 | 0.2411 → 0.0261 | 0.0308 | 0.0228 | 0.0209 | 0.931 | 5.09 / 41.95° | 3.25 / 23.43° | 0.045 |
+| dancing old Chamfer | 726 | n/a | 0.0155 | 0.0270 | 0.0080* | 1.000 | 4.72 / 59.52° | 2.22 / 12.50° | 0.047 |
 
-### 3. No orbit cameras or reference renderer
+`*` The old runs optimized Chamfer, so their CD is a fit diagnostic, not a
+held-out score. The render runs never optimize it, so 0.0160 / 0.0209 are
+genuine held-out values. Image L1 is also not held out for the render runs:
+the 12/16 deterministic gallery views are a subset of the 120 training views.
+The pictures show a smooth, complete approximation; the old Chamfer runs are
+closer in CD and coverage, while the render runs are slightly cleaner on the
+training views. At 256² Lucy covers only ~11% of each frame, so an L1-only
+objective leaves thin limbs under-resolved even when the image loss is low.
 
-There is no camera/view-matrix utility in the training pipeline; the pyrender
-and Open3D scripts are offline visualizers. NISR needs:
+- Lucy check: `logs/render_phase4/check/lucy_render_vs_CD/inspection.md`
+- dancing check: `logs/render_phase4/check/dancing_render_vs_CD/inspection.md`
 
-1. NGF-convention `(B, 4, 4)` orbit views;
-2. a point-cloud splatter that produces `(B, H, W, 6)` targets;
-3. cached targets, batched like the NGF trainer (120 views, 10 per step).
+### Adaptive smoke result (bunny, 1500 epochs total)
 
-The point-cloud splatter is **not** on this branch. It lives in
-`ngf_yl/source/pointcloud_render.py`; only the loss and the NGF-compatible
-renderer were ported here.
+500 box-pretrain epochs followed by 1000 render epochs, 120→94 views above
+min coverage, batch 10, 256², Laplacian 1.0, μ 0.08 delayed 500, λ_svd 0.08
+delayed 500, subdivision 24→96→165→192 leaves (auto mesh 32²→17²→13²→12²).
 
-## Semantic mismatches
+- render L1 0.2705 → 0.0343 at epoch 500 → **0.0283** at 1500
+- Chamfer (held out) 0.0215; cloud coverage 0.910; rendered-normal median
+  4.71°, p95 31.41°; visible-layer normal median 2.72°
+- checker edge p95 0.041, UV aspect p95 3.95
+- render check: `logs/render_phase4/check/smoke6_bunny_full/inspection.md`
+- gallery predictions are smooth and complete but visibly puffier than the
+  target at this budget (1500 epochs).
 
-### 4. Normalization frames differ
+## Caveats
 
-NISR uses `center = mean(points)` and `scale = max |p − center|`
-(`utils/utils.py:221-233`). NGF uses the **bbox center** and half the maximum
-bbox extent. The loss itself is frame-agnostic, but reusing target maps
-rendered in NGF's frame will misalign them with NISR's mesh. Generate the
-targets from NISR's normalized cloud (or apply NISR's `meta['center']` /
-`meta['scale']` explicitly).
+1. **No alpha mask.** Per the requested original objective, the L1 covers the
+   whole frame. Sparse targets therefore penalize geometry where the target is
+   empty. Keep cloud coverage high, or use a dense scan.
+2. **Render-trivial basin.** Hiding the mesh lowers the render L1 toward the
+   empty-frame floor (roughly the mean |target| over all pixels). A low L1 is
+   not sufficient evidence; always inspect coverage and the gallery.
+3. **One layer only.** The back of a closed shell receives no render gradient.
+4. **Seams are duplicated.** Each patch/leaf is sampled as its own grid; seam
+   vertices are not welded and neighboring adaptive leaves of different depth
+   meet in T-junctions. At 256² the cracks are subpixel in the smoke run, and
+   the seam positions themselves stay continuous (`max gap 1.4e-7`), but the
+   Laplacian never smooths across a seam.
+5. **Laplacian differs from NGF.** NGF smooths a quad patch graph; this port
+   applies a uniform triangle-edge Laplacian to every mesh vertex.
+6. **Camera/image layout.** nvdiffrast images are bottom-up and the projection
+   flips x. Targets are generated by the matching code path, so no external
+   flip is needed.
+7. **Normalization.** Targets and model use NISR's `center = mean(points)`,
+   `scale = max |p − center|`; NGF's bbox-frame maps would misalign.
 
-### 5. Duplicate seam vertices
+## Reproduction: adaptive render loss
 
-`sample_multi_patch_grid` deliberately keeps per-patch copies of boundary
-vertices; its docstring says they can be merged in post-processing
-(`utils/utils.py:624`). The positions coincide, so rasterization is
-geometrically seamless, but:
+```bash
+PATH=/home/lyangiw/anaconda3/envs/seawall/bin:$PATH \
+python main.py --adaptive \
+  --file normalized_shapes/bunny_points.ply \
+  --result_dir logs/render_phase4/smoke6_bunny_full \
+  --N 30000 --M_per_patch 128 --epochs 1500 --pretrain_epochs 500 \
+  --lambda_render 1.0 --render_views 120 --render_batch 10 \
+  --render_resolution 256 --render_min_coverage 0.05 \
+  --render_laplacian_weight 1.0 --render_preview 2 \
+  --mu 0.08 --mu_warmup_delay 500 --mu_warmup_epochs 500 \
+  --lam_svd 0.08 --svd_mode conformal \
+  --svd_warmup_delay 500 --svd_warmup_epochs 500 \
+  --gamma 0 --subdiv_threshold 0.1 --subdiv_every 500 \
+  --subdiv_start 500 --subdiv_max_depth 4 --mesh_res 16 --box_init aabb
+```
 
-- `UniformLaplacian` sees truncated one-rings at each patch boundary and never
-  smooths across a seam;
-- seam copies receive independent gradients and can drift apart;
-- normals computed from one-sided faces can differ across the seam.
-
-The render term can be evaluated as-is, but antialiasing and per-vertex normals
-at a duplicated seam should be checked visually; the Laplacian definitely
-needs welding or cross-seam accumulation.
-
-### 6. The Laplacian is not exactly NGF's
-
-NGF smooths a **quad patch graph** over uniformly sampled patch vertices. Here,
-`UniformLaplacian` smooths triangle edges, which adds the grid diagonals, and
-it is applied to every mesh vertex rather than to NGF's uniform samples. Expect
-different magnitude and behavior. For a faithful port, build the 4-neighbor
-quad adjacency on the UV grid and apply it to the same sampled vertices.
-
-### 7. Adaptive atlases need a different mesh builder
-
-`sample_multi_patch_grid` assumes a uniform `n_rows × n_cols` grid. Adaptive
-leaves have different dyadic sizes and hanging vertices, so sampling each leaf
-on its own grid creates T-junctions and cracks. A dedicated triangulation (or a
-weld plus constrained triangulation) is needed. Fixed-grid single-sheet is the
-right first target.
-
-### 8. One layer cannot supervise multiple sheets
-
-The loss rasterizes only the front layer. For `two_sheet` / `six_sheet`, the
-back sheet receives no render gradient. NGF's original mesh loss peels three
-layers for exactly this reason. Either restrict the render term to the
-single-sheet atlas, or extend the renderer to depth peeling and render a
-matching multi-layer reference. The Laplacian still applies to the hidden
-sheet.
-
-### 9. No alpha mask
-
-Per the requested original objective, the render term is an unweighted L1 over
-all pixels and channels. Sparse or holey point-cloud targets will penalize the
-mesh where the target is empty. Use dense targets, or add a foreground mask as
-a later, explicitly opt-in change.
-
-### 10. Image and camera layout
-
-nvdiffrast writes bottom-up images and the projection flips x. References made
-with pyrender/OpenGL (typically top-down, different view convention) must be
-flipped and converted before use. A syntactically valid but differently
-oriented target will produce a finite loss that cannot go to zero.
-
-## What is already compatible
-
-- For fixed-grid patches, triangle winding matches NISR's
-  `n = t_u × t_v` normal convention.
-- Once converted to torch and moved to CUDA, the exporter's `(V, 3)` /
-  `(F, 3)` arrays fit the loss signature directly.
-- 7-channel NGF point-cloud targets are accepted; alpha is ignored, so the
-  target layout itself is reusable if the frame is fixed.
-- The renderer was checked against NGF's front-layer renderer on BIMBA
-  (4 views, 256²): maximum output difference `0.0`.
-- The actual `sample_multi_patch_grid` output was fed through the loss
-  (2×2 atlas, `R=16`: 1024 vertices, 1800 triangles, 63 duplicated seam
-  copies). The reference was non-empty, the self-render term was `0.0`, a
-  0.01 perturbation gave a render term of `0.0099`, and gradients were finite.
-- Laplacian smoothing matches a naive one-ring mean, and the loss backpropagates
-  finite gradients.
-
-## Installation record
-
-Installed into the `seawall` environment (the interpreter used by
-`run_seawall.sh`):
-
-- `ninja 1.13.2`
-- `nvdiffrast 0.3.3`, editable from `/home/lyangiw/codes/nvdiffrast`
-  (commit `729261d`)
-
-CUDA JIT compilation and a 64² render were verified. `nvdiffrast` compiles its
-rasterizer on first use and requires the `ninja` executable on `PATH`.
-`run_seawall.sh` invokes the environment's Python directly rather than
-activating conda, so either activate the environment first or prepend its bin
-directory to `PATH` before using the renderer. Neither package is listed in
-`environment.yaml` yet.
-
-## Suggested first integration
-
-1. Add a differentiable `sample_patch_mesh(model, resolution, patch_ids)`
-   returning `V, F, N` as CUDA tensors, with a modest per-patch resolution
-   (start around 24–32) and optional vertex welding.
-2. Build `UniformLaplacian` once per topology, not per step.
-3. Port the orbit-view and point-cloud splatter utilities, generating targets
-   from the input cloud in NISR's own normalization frame.
-4. Start with the fixed-grid single-sheet atlas, 8–16 views, and the render
-   term as an auxiliary loss; verify that a reference rendered from the current
-   mesh gives a render term of zero **and is non-empty** (a clipped camera also
-   yields zero).
+The renderer JIT-compiles on first use and needs `ninja` on `PATH`; the
+seawall environment provides it.
