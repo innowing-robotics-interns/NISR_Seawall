@@ -86,6 +86,38 @@ distortion during training:
     --M_per_patch 128 --L 0 --save_vertex_pos_every 10
 ```
 
+### NGF render loss on the adaptive atlas
+
+Instead of Chamfer, the atlas can be supervised by NGF's render loss: each epoch
+rasterizes the six-channel `[normal, position]` field from 120 Fibonacci orbit
+views at 256² and compares it with z-buffered point-splat targets using an
+unweighted L1. `--render_laplacian_weight` adds a Laplacian smoothness term on
+the rendered maps. The atlas starts from the input AABB and subdivides every 500
+epochs after epoch 1000.
+
+[scripts/run_render4_noextarea.sh](scripts/run_render4_noextarea.sh) runs the
+four-shape comparison batch (botijo, teapot, gargoyle, rocker arm) with two
+trainings at a time, and runs the render check after each one finishes:
+
+```bash
+scripts/run_render4_noextarea.sh
+OUT_ROOT=logs/my_comparison scripts/run_render4_noextarea.sh
+```
+
+[scripts/run_render4_conformal.sh](scripts/run_render4_conformal.sh) is the same
+batch with the extension area penalty enabled (`--lambda_ext_area 1.0`); the
+no-extarea script sets it to `0.0` and keeps everything else — extension mask,
+`--ext_mode no_fit`, and the conformal SVD term — identical, so the two roots
+form a controlled ablation. Both enable `--svd_mode conformal`, which ramps in the
+`(s1 - s2)²` penalty from epoch 3000.
+
+On some runs (in particular gargoyle) the sheet can leave the camera frame in
+the first ~200 epochs, before the SVD term is active, and never recover. The
+retry launchers wait for the batch's rocker run to finish and then repeat
+gargoyle with the same settings:
+[scripts/run_gargoyle_conformal_retry.sh](scripts/run_gargoyle_conformal_retry.sh)
+and [scripts/run_gargoyle_noextarea_retry.sh](scripts/run_gargoyle_noextarea_retry.sh).
+
 ### Batch over many models
 
 [run_all_3d_models.sh](run_all_3d_models.sh) trains on every `.ply` in
@@ -158,6 +190,24 @@ python utils/patch_vis.py \
 - Outputs go to `--out_dir` (`checkerboard_export/` by default): `.obj` + `.mtl` +
   texture images, plus a vertex-colored `.ply` (disable with `--no_ply`).
 
+### Export the latest checkpoint (skill)
+
+[.qoder/skills/visualization-skill/scripts/visualize_latest.py](.qoder/skills/visualization-skill/scripts/visualize_latest.py)
+picks the newest checkpoint in a run and wraps the export above; it also writes
+the SVD diagnostic PLY:
+
+```bash
+python .qoder/skills/visualization-skill/scripts/visualize_latest.py \
+    logs/render_phase4_noextarea/botijo_adaptive_render \
+    --out-dir logs/render_phase4_noextarea/mesh/botijo \
+    --device cpu        # use cpu while a training run occupies the GPU
+```
+
+Files land in `<out-dir>/<checkpoint-stem>/`. The combined PLY is double-sided
+and in original (unnormalized) coordinates; `<checkpoint-stem>_svd.ply` colours
+each sample by the SVD loss. Dense adaptive runs produce multi-hundred-MB files,
+so run this in the background or lower `--resolution`.
+
 ### Viewing results
 
 - Meshes: open `learned_sheet.ply` or the `patch_vis.py` exports in
@@ -167,9 +217,37 @@ python utils/patch_vis.py \
 - Correspondence and GHPR utilities live in [utils/correspondence_vis.py](utils/correspondence_vis.py)
   and [utils/ghpr.py](utils/ghpr.py).
 
+## Render checks
+
+[.qoder/skills/render-check/scripts/render_check.py](.qoder/skills/render-check/scripts/render_check.py)
+evaluates a finished run over 16 deterministic orbit views: it rasterizes the
+atlas, compares it with the point-cloud target, and writes a report, a
+target-vs-prediction gallery, per-patch checkerboard renders, and geometry
+metrics (Chamfer, coverage, normals, UV stretch).
+
+```bash
+python .qoder/skills/render-check/scripts/render_check.py \
+    --checkpoint logs/render_phase4_noextarea/botijo_adaptive_render \
+    --out logs/render_phase4_noextarea/check/botijo_adaptive_render \
+    --resolution 256 --rows 4 --checker-views 4
+```
+
+`--checkpoint` accepts a run folder or a specific `.pt` file. Outputs in `--out`:
+
+- `inspection.md` — metrics tables and image links
+- `comparison.png` and `<run>/gallery/target_vs_pred_16.png` — target vs prediction
+- `<run>/checkerboard/checkerboard_all_views.png` — UV checkerboard on the patches
+- `<run>/metrics/metrics.json`, `check_summary.json` — machine-readable numbers
+
+The batch launchers call this automatically after each training, so normally you
+only run it by hand for an older checkpoint or a different view set.
+
 ## Repo layout
 
 - [main.py](main.py) — training entry point (atlas construction, losses, pretrain, subdivision)
 - [model/](model/) — `model.py` (forward/inverse maps), `losses.py`, `correspondence.py`, `subdivision.py`
 - [utils/](utils/) — visualization and helper scripts (`patch_vis.py`, `adaptive_vis.py`, `ghpr.py`, ...)
+- [scripts/](scripts/) — four-shape render-loss launchers (`run_render4_*.sh`), atlas/checkpoint helpers, render metrics
+- [.qoder/skills/](.qoder/skills/) — render-check, train-shape, and checkpoint-mesh export workflows
+- [model/render_loss_followups.md](model/render_loss_followups.md) — open render-loss issues (teapot handle, rocker UV distortion)
 - [run.sh](run.sh) / [adaptive.sh](adaptive.sh) — annotated example configs
