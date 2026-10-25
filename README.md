@@ -103,7 +103,13 @@ because NISR already has tangent, SVD, extension-area, and boundary
 regularizers, and a triangle-mesh Laplacian over duplicated seams is not NGF's
 quad-grid operator. For that objective use
 [scripts/run_render4_noextarea_nolap.sh](scripts/run_render4_noextarea_nolap.sh),
-which is otherwise identical (conformal SVD, extension mask, area loss 0.0).
+which keeps the same conformal SVD, extension mask, and area loss 0.0 and runs
+6000 epochs by default (`EPOCHS=10000` overrides).
+
+Runtime on this machine: 10,000 epochs took 1h44m–1h50m per shape; 6,000 epochs
+took about 50 minutes in the same logs. With two queues, a four-shape batch is
+roughly 3.5 h at 10k and 1.75 h at 6k. The 6k setting is a screening cutoff — in
+the completed 10k runs, Chamfer was still 9–20% lower at 10k than at 6k.
 
 The per-epoch line reports each term and its effective weight:
 

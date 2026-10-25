@@ -11,21 +11,25 @@
 # extension mask with --ext_mode no_fit, and --lambda_ext_area 0.0.  Outputs go
 # to a separate root so the completed Lap-on batch is preserved.
 #
+# Runs 6000 epochs by default (about 50 minutes per shape on this machine,
+# versus ~1h45m for 10000).  Override with EPOCHS=10000.
+#
 # Usage:
 #   scripts/run_render4_noextarea_nolap.sh
-#   OUT_ROOT=logs/my_comparison bash scripts/run_render4_noextarea_nolap.sh
+#   EPOCHS=10000 OUT_ROOT=logs/my_comparison bash scripts/run_render4_noextarea_nolap.sh
 set -u
 cd /home/lyangiw/codes/qoderhome/NISR_Seawall || exit 1
 export PATH=/home/lyangiw/anaconda3/envs/seawall/bin:$PATH
 export PYTHONUNBUFFERED=1
 
 OUT_ROOT="${OUT_ROOT:-logs/render_phase4_noextarea_nolap}"
+EPOCHS="${EPOCHS:-6000}"
 PY=/home/lyangiw/anaconda3/envs/seawall/bin/python
 CHECK=.qoder/skills/render-check/scripts/render_check.py
 mkdir -p "$OUT_ROOT"
 
 COMMON=(
-  --adaptive --N 100000 --M_per_patch 64 --epochs 10000 --pretrain_epochs 500
+  --adaptive --N 100000 --M_per_patch 64 --epochs "$EPOCHS" --pretrain_epochs 500
   --lambda_render 1.0 --render_views 120 --render_batch 10
   --render_resolution 256 --render_min_coverage 0.05
   --render_laplacian_weight 0.0
