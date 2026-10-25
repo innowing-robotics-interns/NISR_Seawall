@@ -91,9 +91,30 @@ distortion during training:
 Instead of Chamfer, the atlas can be supervised by NGF's render loss: each epoch
 rasterizes the six-channel `[normal, position]` field from 120 Fibonacci orbit
 views at 256² and compares it with z-buffered point-splat targets using an
-unweighted L1. `--render_laplacian_weight` adds a Laplacian smoothness term on
-the rendered maps. The atlas starts from the input AABB and subdivides every 500
-epochs after epoch 1000.
+unweighted L1. `--render_laplacian_weight` optionally adds a uniform Laplacian
+on the sampled patch mesh (default 0.0, off); it is included in the optimized
+loss at that weight, not just logged. The atlas starts from the input AABB and
+subdivides every 500 epochs after epoch 1000.
+
+The earlier four-shape launchers set `--render_laplacian_weight 1.0` (carried
+over from the smoke-test command). The
+[integration plan](model/ngf_rendering_loss_integration_plan.md) specifies 0.0,
+because NISR already has tangent, SVD, extension-area, and boundary
+regularizers, and a triangle-mesh Laplacian over duplicated seams is not NGF's
+quad-grid operator. For that objective use
+[scripts/run_render4_noextarea_nolap.sh](scripts/run_render4_noextarea_nolap.sh),
+which is otherwise identical (conformal SVD, extension mask, area loss 0.0).
+
+The per-epoch line reports each term and its effective weight:
+
+| Field | Term | Effective weight |
+|---|---|---|
+| `R` | six-channel `[normal, position]` L1 | `lambda_render` × schedule |
+| `Lap` | uniform Laplacian on the patch mesh | `--render_laplacian_weight` |
+| `CD` | Chamfer; parentheses mean monitoring only (render replaces it) | `lambda_chamfer` |
+| `Tangent` | Dirichlet/ARAP seam distortion | `mu_eff` |
+| `SVD` | conformal `(s1 - s2)²` | `svd_eff` |
+| `Total` | sum of the weighted terms above | — |
 
 [scripts/run_render4_noextarea.sh](scripts/run_render4_noextarea.sh) runs the
 four-shape comparison batch (botijo, teapot, gargoyle, rocker arm) with two
