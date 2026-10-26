@@ -177,3 +177,30 @@ python main.py --adaptive \
 
 The renderer JIT-compiles on first use and needs `ninja` on `PATH`; the
 seawall environment provides it.
+
+## Depth-peeled far-layer supervision (opt-in, phase 12)
+
+`--render_layers 2` peels both sides of the supervision:
+
+- The point-cloud reference is splatted in layers: layer 0 keeps the original
+  front-surface target; layer 1 is z-buffered only from points the front layer
+  did not consume (`utils/render_targets.py`, `_splat_view`).
+- The model mesh is peeled per view (`NGFRenderer.render_layers`): after a pass,
+  the triangles that won that view's z-test are removed and the remaining faces
+  are rasterized again. Peeling per view matters: a batch-wide removal deletes
+  triangles that are front-facing in one view but a legitimate back surface in
+  another, which halves the usable far-layer coverage.
+- Layer 0 keeps NGF's full-frame six-channel L1 and weight 1.0. Deeper layers
+  are compared only where the target has a surface (alpha > 0.05) and the model
+  rendered one, and the error sum is divided by `B*H*W`, so the term has the
+  same units as the front term. Pixels the model leaves empty are not rewarded;
+  a full-frame far-layer L1 would instead push triangles to grow into peeling
+  holes.
+- The term is opt-in (`--render_far_weight`, default 0.5) and every layer is
+  logged as `render_layer_N`, with the matched-pixel fraction as
+  `render_layer_N_match`. The single-layer phase-10 path is unchanged.
+
+Armadillo baseline (phase 10) at 8 views: target far layer covers 16.1% of the
+frame, 59% of its normals oppose the front normal; the peeled mesh reaches
+18.6% coverage on layer 2, 15.4% matched. Far-layer pixels on the worst fold
+patches (26.5% of layer 2) carry 0.098 error against a 0.089 matched average.

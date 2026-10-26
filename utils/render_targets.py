@@ -85,6 +85,9 @@ class PointCloudRender:
     depth: torch.Tensor                   # (V, H, W, 1), view-space z
     color: Optional[torch.Tensor] = None  # (V, H, W, 3)
     views: Optional[torch.Tensor] = None  # (V, 4, 4)
+    # (V, H, W, 7 * L) when more than one depth layer was peeled; each layer
+    # contributes [normal, position, alpha].  None for the single-layer path.
+    layer_geometry: Optional[torch.Tensor] = None
 
     def geometry(self, alpha: bool = True) -> torch.Tensor:
         """Concatenate ``[normal, position]``; alpha appends splat coverage."""
@@ -117,6 +120,28 @@ class RenderTargetSet:
     fov: float
     resolution: Tuple[int, int]           # (height, width)
     pointcloud: Optional[PointCloud] = None
+    # (V, H, W, 7 * L): peeled layers [normal, position, alpha] per depth
+    # surface.  None when only the front layer was built.
+    layer_geometry: Optional[torch.Tensor] = None
+
+    @property
+    def layers(self) -> int:
+        if self.layer_geometry is None:
+            return 1
+        return int(self.layer_geometry.shape[-1] // 7)
+
+    def reference(self) -> torch.Tensor:
+        """Reference maps for the loss.
+
+        Single layer: ``(V, H, W, 7)`` front ``[normal, position, alpha]``.
+        Multiple layers: ``(V, H, W, 7 * layers)``, one ``[normal, position,
+        alpha]`` block per peeled surface.  The loss uses the alpha channel to
+        restrict far-layer supervision to pixels where the target actually has
+        a surface.
+        """
+        if self.layer_geometry is None:
+            return self.geometry
+        return self.layer_geometry
 
     def __len__(self) -> int:
         return int(self.views.shape[0])
@@ -125,14 +150,16 @@ class RenderTargetSet:
         """Split views and references into matching batches.
 
         Returns a list of ``(views, reference)`` pairs.  References stay on CPU;
-        the training loop moves each batch to the render device.
+        the training loop moves each batch to the render device.  With multiple
+        layers the reference is ``(B, H, W, 7 * layers)``.
         """
         if batch_size <= 0:
             raise ValueError(f'batch_size must be positive, got {batch_size}')
+        reference = self.reference()
         pairs = []
         for start in range(0, len(self), batch_size):
             stop = min(start + batch_size, len(self))
-            pairs.append((self.views[start:stop], self.geometry[start:stop]))
+            pairs.append((self.views[start:stop], reference[start:stop]))
         return pairs
 
     def summary(self) -> Dict[str, object]:
@@ -144,6 +171,7 @@ class RenderTargetSet:
             'coverage_mean': float(self.coverage.mean()),
             'coverage_min': float(self.coverage.min()),
             'coverage_max': float(self.coverage.max()),
+            'layers': self.layers,
             'center': self.center.tolist(),
         }
 
@@ -385,7 +413,15 @@ def _splat_view(pcd: PointCloud,
                 depth_tol: float,
                 depth_pad: float,
                 max_footprint: int,
-                softness: float) -> Tuple[torch.Tensor, ...]:
+                softness: float,
+                num_layers: int = 1) -> List[Tuple[torch.Tensor, ...]]:
+    """Splat one view, peeling ``num_layers`` depth surfaces.
+
+    Layer 0 is the front surface.  Each later layer is z-buffered only from the
+    points that no earlier layer used, so the tolerance test can never merge
+    two surfaces into the same layer.  This mirrors per-layer point removal in
+    a depth-peeling rasterizer.
+    """
     device = pcd.points.device
     points, normals = pcd.points, pcd.normals
     spacing = pcd.spacing
@@ -409,9 +445,10 @@ def _splat_view(pcd: PointCloud,
     idx = torch.nonzero(valid, as_tuple=False).squeeze(1)
 
     if idx.numel() == 0:
-        zeros = torch.zeros(height, width, 3, device=device)
-        return (zeros, zeros.clone(), torch.zeros(height, width, 1, device=device),
-                torch.zeros(height, width, 1, device=device), None)
+        zeros3 = torch.zeros(height, width, 3, device=device)
+        zeros1 = torch.zeros(height, width, 1, device=device)
+        return [(zeros3.clone(), zeros3.clone(), zeros1.clone(),
+                 zeros1.clone()) for _ in range(num_layers)]
 
     point, normal, wv = points[idx], normals[idx], w[idx]
     pxv, pyv = px[idx], py[idx]
@@ -435,55 +472,70 @@ def _splat_view(pcd: PointCloud,
     radius_eff = radius_px * 1.15 + 0.5
 
     hw = height * width
-    depth_buffer = torch.full((hw,), float('inf'), device=device)
-
-    for dx, dy in zip(ox.tolist(), oy.tolist()):
-        x = center_x + int(dx)
-        y = center_y + int(dy)
-        ok = (x >= 0) & (x < width) & (y >= 0) & (y < height)
-        if not bool(ok.any()):
-            continue
-        pixels = y[ok] * width + x[ok]
-        depth_buffer.scatter_reduce_(0, pixels, wv[ok], reduce='amin',
-                                     include_self=True)
-
-    weight_buffer = torch.zeros(hw, device=device)
-    normal_buffer = torch.zeros(hw, 3, device=device)
-    position_buffer = torch.zeros(hw, 3, device=device)
-
-    for dx, dy in zip(ox.tolist(), oy.tolist()):
-        x = center_x + int(dx)
-        y = center_y + int(dy)
-        ok = (x >= 0) & (x < width) & (y >= 0) & (y < height)
-        if not bool(ok.any()):
-            continue
-        pixels = (y * width + x).clamp(0, hw - 1)
-
-        distance = torch.sqrt((dx + frac_x).square() + (dy + frac_y).square())
-        weight = ((radius_eff - distance) / softness).clamp(0.0, 1.0)
-        z_min = depth_buffer[pixels]
-        keep = ok & (wv <= z_min + depth_tol * z_min + depth_pad * spacing_v)
-        weight = weight * keep
-
-        weight_buffer.index_add_(0, pixels, weight)
-        normal_buffer.index_add_(0, pixels, normal * weight[:, None])
-        position_buffer.index_add_(0, pixels, point * weight[:, None])
-
-    covered = weight_buffer > 1e-8
-    normal_buffer[covered] /= weight_buffer[covered, None]
-    length = normal_buffer[covered].norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    normal_buffer[covered] /= length
-    position_buffer[covered] /= weight_buffer[covered, None]
-
-    alpha = weight_buffer.clamp(0.0, 1.0)
-    depth = depth_buffer
-    depth[~torch.isfinite(depth)] = 0.0
 
     def reshape(t):
         return t.reshape(height, width, -1)
 
-    return reshape(normal_buffer), reshape(position_buffer), reshape(alpha), \
-        reshape(depth), None
+    active = torch.ones(point.shape[0], dtype=torch.bool, device=device)
+    layers = []
+    for _ in range(num_layers):
+        depth_buffer = torch.full((hw,), float('inf'), device=device)
+        if bool(active.any()):
+            for dx, dy in zip(ox.tolist(), oy.tolist()):
+                x = center_x + int(dx)
+                y = center_y + int(dy)
+                ok = (x >= 0) & (x < width) & (y >= 0) & (y < height) & active
+                if not bool(ok.any()):
+                    continue
+                pixels = y[ok] * width + x[ok]
+                depth_buffer.scatter_reduce_(0, pixels, wv[ok], reduce='amin',
+                                             include_self=True)
+
+        weight_buffer = torch.zeros(hw, device=device)
+        normal_buffer = torch.zeros(hw, 3, device=device)
+        position_buffer = torch.zeros(hw, 3, device=device)
+        used = torch.zeros_like(active)
+
+        if bool(active.any()):
+            for dx, dy in zip(ox.tolist(), oy.tolist()):
+                x = center_x + int(dx)
+                y = center_y + int(dy)
+                ok = (x >= 0) & (x < width) & (y >= 0) & (y < height) & active
+                if not bool(ok.any()):
+                    continue
+                pixels = (y * width + x).clamp(0, hw - 1)
+
+                distance = torch.sqrt((dx + frac_x).square()
+                                      + (dy + frac_y).square())
+                weight = ((radius_eff - distance) / softness).clamp(0.0, 1.0)
+                z_min = depth_buffer[pixels]
+                keep = ok & (wv <= z_min + depth_tol * z_min
+                             + depth_pad * spacing_v)
+                weight = weight * keep
+
+                weight_buffer.index_add_(0, pixels, weight)
+                normal_buffer.index_add_(0, pixels, normal * weight[:, None])
+                position_buffer.index_add_(0, pixels, point * weight[:, None])
+                used = used | keep
+
+        covered = weight_buffer > 1e-8
+        normal_buffer[covered] /= weight_buffer[covered, None]
+        length = normal_buffer[covered].norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        normal_buffer[covered] /= length
+        position_buffer[covered] /= weight_buffer[covered, None]
+
+        alpha = weight_buffer.clamp(0.0, 1.0)
+        depth = depth_buffer
+        depth[~torch.isfinite(depth)] = 0.0
+
+        layers.append((reshape(normal_buffer), reshape(position_buffer),
+                       reshape(alpha), reshape(depth)))
+        # Points already consumed by this surface cannot appear in a deeper
+        # layer.  Their splat footprint can still overlap, which is the same
+        # approximation a triangle-removal peel makes at silhouettes.
+        active = active & ~used
+
+    return layers
 
 
 @torch.no_grad()
@@ -496,27 +548,43 @@ def render_pointcloud(pcd: PointCloud,
                       depth_tol: float = 0.008,
                       depth_pad: float = 4.0,
                       max_footprint: int = 6,
-                      softness: float = 0.8) -> PointCloudRender:
-    """Splat the point cloud from every camera; maps are bottom-up."""
+                      softness: float = 0.8,
+                      num_layers: int = 1) -> PointCloudRender:
+    """Splat the point cloud from every camera; maps are bottom-up.
+
+    With ``num_layers > 1`` the returned ``normal``/``position``/``alpha``
+    describe layer 0 (unchanged single-layer behaviour) and
+    ``layer_geometry`` holds ``[normal, position, alpha]`` for every layer.
+    """
+    if num_layers < 1:
+        raise ValueError(f'num_layers must be >= 1, got {num_layers}')
     pcd = pcd.to(views.device)
-    normal, position, alpha, depth = [], [], [], []
+    per_layer = [[] for _ in range(num_layers)]
 
     for view in views:
-        n, p, a, d, _ = _splat_view(
+        maps = _splat_view(
             pcd, view, width, height, fov,
             radius_scale, depth_tol, depth_pad, max_footprint, softness,
+            num_layers=num_layers,
         )
-        normal.append(n)
-        position.append(p)
-        alpha.append(a)
-        depth.append(d)
+        for layer, values in enumerate(maps):
+            per_layer[layer].append(values)
+
+    stacked = [tuple(torch.stack(items, dim=0) for items in zip(*layers))
+               for layers in per_layer]
+    normal, position, alpha, depth = stacked[0]
+    layer_geometry = None
+    if num_layers > 1:
+        layer_geometry = torch.cat(
+            [torch.cat([n, p, a], dim=-1) for n, p, a, _ in stacked], dim=-1)
 
     return PointCloudRender(
-        normal=torch.stack(normal),
-        position=torch.stack(position),
-        alpha=torch.stack(alpha),
-        depth=torch.stack(depth),
+        normal=normal,
+        position=position,
+        alpha=alpha,
+        depth=depth,
         views=views,
+        layer_geometry=layer_geometry,
     )
 
 
@@ -542,17 +610,22 @@ def build_render_targets(points,
                          softness: float = 0.8,
                          preview_dir: Optional[str] = None,
                          preview_count: int = 4,
+                         num_layers: int = 1,
                          verbose: bool = True) -> RenderTargetSet:
     """Render and cache NGF-compatible reference views.
 
     The target cloud is expected in the model's normalized frame.  Views with
     mean alpha below ``min_coverage`` are dropped; if none survive this raises
-    instead of returning an unusable cache.
+    instead of returning an unusable cache.  ``num_layers > 1`` peels the
+    splat into that many depth surfaces and stores all of them; the layer-0
+    coverage still drives view filtering.
     """
     if resolution < 16:
         raise ValueError(f'resolution must be >= 16, got {resolution}')
     if num_views < 1:
         raise ValueError(f'num_views must be positive, got {num_views}')
+    if not 1 <= num_layers <= 4:
+        raise ValueError(f'num_layers must be in [1, 4], got {num_layers}')
 
     pcd = prepare_point_cloud(
         points,
@@ -577,6 +650,7 @@ def build_render_targets(points,
     render = render_pointcloud(
         pcd, views, resolution, resolution, fov,
         radius_scale, depth_tol, depth_pad, max_footprint, softness,
+        num_layers=num_layers,
     )
     coverage = render.coverage()
     visible = (render.alpha > 0.5).float().mean(dim=(1, 2, 3))
@@ -585,6 +659,13 @@ def build_render_targets(points,
         print(f'  [targets] coverage mean {coverage.mean():.3f} '
               f'(min {coverage.min():.3f}, max {coverage.max():.3f}); '
               f'pixels >0.5 mean {visible.mean():.3f}')
+        if num_layers > 1:
+            layer_alpha = render.layer_geometry[..., [6 + 7 * layer
+                                                      for layer in range(num_layers)]]
+            stats = ', '.join(
+                f'L{layer + 1} {(layer_alpha[..., layer] > 0.05).float().mean():.3f}'
+                for layer in range(num_layers))
+            print(f'  [targets] peeled {num_layers} layers; covered pixels {stats}')
 
     if preview_dir is not None and preview_count > 0:
         save_preview(render, preview_dir, count=preview_count)
@@ -609,6 +690,9 @@ def build_render_targets(points,
     eyes_cpu = eyes.detach().cpu().float()
     coverage_cpu = coverage.detach().cpu().float()
     keep_cpu = keep.detach().cpu()
+    layer_geometry = None
+    if render.layer_geometry is not None:
+        layer_geometry = render.layer_geometry.detach().cpu().float()[keep_cpu]
 
     return RenderTargetSet(
         views=views_cpu[keep_cpu],
@@ -620,6 +704,7 @@ def build_render_targets(points,
         fov=float(fov),
         resolution=(int(resolution), int(resolution)),
         pointcloud=pcd,
+        layer_geometry=layer_geometry,
     )
 
 

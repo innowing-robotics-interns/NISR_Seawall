@@ -2023,6 +2023,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    render_views=120, render_batch=2, render_resolution=256,
                    render_mesh_res=0, render_laplacian_weight=1.0,
                    render_min_coverage=0.1, render_preview=4,
+                   render_view_clip=0.0, render_pixel_clip=0.0,
+                   render_layers=1, render_far_weight=0.5,
                    tb_writer=None):
     if ext_mask_epoch < 0 or ext_mask_every < 0:
         raise ValueError("--ext_mask_epoch/--ext_mask_every must be >= 0")
@@ -2036,6 +2038,17 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         raise ValueError(
             "--lambda_ext_area requires --ext_mask_epoch > 0: the area penalty is "
             "evaluated only on samples inside a detected extension mask.")
+    if not 1 <= render_layers <= 4:
+        raise ValueError(f"render_layers must be in [1, 4], got {render_layers}")
+    if render_far_weight < 0:
+        raise ValueError(
+            f"render_far_weight must be >= 0, got {render_far_weight}")
+    if render_layers > 1 and lambda_render == 0:
+        raise ValueError("render_layers > 1 requires lambda_render > 0")
+    if render_layers > 1 and (render_view_clip > 0 or render_pixel_clip > 0):
+        raise ValueError(
+            "render_view_clip/render_pixel_clip are only implemented for "
+            "--render_layers 1")
     # In 'no_fit' mode the extension samples are not in the Chamfer at all.
     use_ext_cd_weight = ext_cd_weight != 1.0 and ext_mode == 'no_reg'
     pts_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
@@ -2109,6 +2122,12 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             raise ValueError(
                 f"render_min_coverage must be in [0, 1], got "
                 f"{render_min_coverage}")
+        if render_view_clip < 0:
+            raise ValueError(
+                f"render_view_clip must be >= 0, got {render_view_clip}")
+        if render_pixel_clip < 0:
+            raise ValueError(
+                f"render_pixel_clip must be >= 0, got {render_pixel_clip}")
     if lambda_render > 0:
         # The render term stands in for Chamfer as THE surface fit.  Keeping a
         # DDF/CD mixture as well would silently reintroduce the term this mode
@@ -2184,6 +2203,11 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                # first epoch of every GHPR stage / the full-cloud phase
                'phase_starts': ([i * visible_epochs + 1 for i in range(len(stages))]
                                 + [n_stage_epochs + 1]) if stages else []}
+    if render_layers > 1:
+        for layer_index in range(render_layers):
+            history[f'render_layer_{layer_index + 1}'] = []
+            if layer_index > 0:
+                history[f'render_layer_{layer_index + 1}_match'] = []
     events = []
     ext_mask = None
     zero = torch.tensor(0.0, device=device)
@@ -2231,6 +2255,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             min_coverage=render_min_coverage,
             preview_dir=preview_dir,
             preview_count=render_preview,
+            num_layers=render_layers,
         )
         render_batch_size = min(int(render_batch), len(render_targets))
         if render_batch_size != int(render_batch):
@@ -2256,9 +2281,15 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 warm_vertices, warm_faces = sample_patch_mesh(
                     model, render_mesh_resolution)
                 warm_normals = vertex_normals(warm_vertices, warm_faces)
-                renderer.render(
-                    warm_vertices, warm_normals, warm_faces,
-                    render_targets.views[:1].to(device))
+                if render_layers > 1:
+                    renderer.render_layers(
+                        warm_vertices, warm_normals, warm_faces,
+                        render_targets.views[:1].to(device),
+                        layers=render_layers)
+                else:
+                    renderer.render(
+                        warm_vertices, warm_normals, warm_faces,
+                        render_targets.views[:1].to(device))
         except Exception as exc:
             raise RuntimeError(
                 "the NGF render-loss warmup failed; check the nvdiffrast "
@@ -2274,7 +2305,9 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         print(f"  [render] {len(render_targets)}/{render_views} views cached "
               f"at {render_resolution}²; coverage "
               f"{float(render_targets.coverage.mean()):.3f} "
-              f"(min {float(render_targets.coverage.min()):.3f})")
+              f"(min {float(render_targets.coverage.min()):.3f})"
+              + (f"; {render_layers} depth layers, far weight "
+                 f"{render_far_weight:g}" if render_layers > 1 else ""))
         print(f"  [render] Surface fit = NGF render loss (Chamfer removed); "
               f"mesh {render_mesh_resolution}²/patch × {model.n_patches} "
               f"leaves, auto-follows subdivision; "
@@ -2605,6 +2638,12 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                     renderer=renderer,
                     laplacian=render_laplacian,
                     laplacian_weight=render_laplacian_weight,
+                    view_clip=render_view_clip,
+                    pixel_clip=render_pixel_clip,
+                    layers=render_layers,
+                    layer_weights=([1.0] + [render_far_weight]
+                                   * (render_layers - 1)
+                                   if render_layers > 1 else None),
                     return_parts=True)
             surface_loss = render_eff * render_loss
         elif not use_ddf:
@@ -2615,8 +2654,26 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             surface_loss = lambda_ddf * ddf_loss
         render_loss_log = (render_parts['render'].detach()
                            if render_parts is not None else zero)
+        render_raw_log = (render_parts['render_raw'].detach()
+                          if render_parts is not None else zero)
+        render_clip_frac_log = (render_parts['render_clip_frac'].detach()
+                                if render_parts is not None else zero)
+        render_pixel_clip_frac_log = (
+            render_parts['render_pixel_clip_frac'].detach()
+            if render_parts is not None else zero)
         render_lap_log = (render_parts['laplacian'].detach()
                           if render_parts is not None else zero)
+        render_layer_logs = {}
+        if render_layers > 1:
+            for layer_index in range(render_layers):
+                for suffix in ('', '_match'):
+                    if suffix and layer_index == 0:
+                        continue
+                    key = f'render_layer_{layer_index + 1}{suffix}'
+                    render_layer_logs[key] = (
+                        float(render_parts[key])
+                        if render_parts is not None and key in render_parts
+                        else 0.0)
 
         mu_eff = mu_warmup_schedule(epoch, mu_warmup_epochs, mu,
                                     schedule=schedule,
@@ -2731,6 +2788,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             history['render'].append(float(render_loss_log))
             history['render_lap'].append(float(render_lap_log))
             history['render_eff'].append(float(render_eff))
+            for key, value in render_layer_logs.items():
+                history[key].append(value)
             history['surface'].append(float(surface_loss))
             history['total'].append(float(loss))
             history['n_leaves'].append(model.n_patches)
@@ -2753,6 +2812,10 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 'normal_bwd': normal_bwd,
                 'ext_area': ext_area_loss,
                 'render': render_loss_log,
+                'render_raw': render_raw_log,
+                'render_clip_frac': render_clip_frac_log,
+                'render_pixel_clip_frac': render_pixel_clip_frac_log,
+                **render_layer_logs,
                 'render_lap': render_lap_log,
                 'render_eff': render_eff,
                 'surface': surface_loss,
@@ -2784,8 +2847,19 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             if render_active:
                 cd_str = (f"R={float(render_loss_log):.5f}"
                           f"(w={float(render_eff):.3f})"
+                          + (f" raw={float(render_raw_log):.5f}"
+                             f" vclip={100.0 * float(render_clip_frac_log):.0f}%"
+                             if render_view_clip > 0 else "")
+                          + (f" pclip={100.0 * float(render_pixel_clip_frac_log):.0f}%"
+                             if render_pixel_clip > 0 else "")
                           + (f" Lap={float(render_lap_log):.4f}"
                              if render_laplacian_weight > 0 else "")
+                          + ''.join(f" L{index + 1}={value:.5f}"
+                                    for index, value
+                                    in enumerate(render_layer_logs.values())
+                                    if render_layers > 1
+                                    and not list(render_layer_logs)[index]
+                                    .endswith('_match'))
                           + f"  CD=({float(cd_loss):.5f})")
             else:
                 cd_str = (f"CD={float(cd_loss):.5f}" if cd_in_loss
@@ -3177,6 +3251,10 @@ def run_adaptive(args):
         render_laplacian_weight=args.render_laplacian_weight,
         render_min_coverage=args.render_min_coverage,
         render_preview=args.render_preview,
+        render_view_clip=args.render_view_clip,
+        render_pixel_clip=args.render_pixel_clip,
+        render_layers=args.render_layers,
+        render_far_weight=args.render_far_weight,
         ext_kwargs={'resolution': args.ext_resolution, 'nn_scale': args.ext_nn_scale,
                     'max_area_frac': args.ext_max_area_frac,
                     'min_opening_vertices': args.ext_min_opening_vertices,
@@ -3484,6 +3562,22 @@ def main():
     render_group.add_argument('--render_preview', type=int, default=4,
                               help='Save this many reference-target previews to '
                                    '<result>/render_targets (0 disables)')
+    render_group.add_argument('--render_view_clip', type=float, default=0.0,
+                              help='Robust per-view render loss: cap each view mean at '
+                                   'this factor times the batch median view error '
+                                   '(0 = original unclipped NGF loss)')
+    render_group.add_argument('--render_pixel_clip', type=float, default=0.0,
+                              help='Robust per-pixel render loss: cap each covered pixel '
+                                   'error at this factor times the median covered-pixel '
+                                   'error (0 = original unclipped NGF loss)')
+    render_group.add_argument('--render_layers', type=int, default=1,
+                              help='Depth-peeled surfaces supervised: 1 = NGF front layer '
+                                   'only; 2..4 peel the point-cloud target and remove '
+                                   'hit triangles in the model render, supervising the '
+                                   'surfaces behind the visible shell (adaptive only)')
+    render_group.add_argument('--render_far_weight', type=float, default=0.5,
+                              help='Loss weight of every layer behind the front one '
+                                   '(layer 1 keeps weight 1.0)')
 
     # Adaptive quadtree cube atlas (only used with --adaptive)
     adaptive_group = parser.add_argument_group('adaptive cube atlas (--adaptive)')
@@ -3747,6 +3841,23 @@ def main():
             parser.error("--render_mesh_res must be 0 (auto) or between 2 and 64.")
         if not (0.0 <= args.render_min_coverage <= 1.0):
             parser.error("--render_min_coverage must be in [0, 1].")
+        if args.render_view_clip < 0:
+            parser.error("--render_view_clip must be >= 0.")
+        if args.render_view_clip > 0 and not args.adaptive:
+            parser.error(
+                "--render_view_clip is currently implemented for --adaptive only.")
+        if args.render_pixel_clip < 0:
+            parser.error("--render_pixel_clip must be >= 0.")
+        if args.render_pixel_clip > 0 and not args.adaptive:
+            parser.error(
+                "--render_pixel_clip is currently implemented for --adaptive only.")
+        if not 1 <= args.render_layers <= 4:
+            parser.error("--render_layers must be in [1, 4].")
+        if args.render_layers > 1 and not args.adaptive:
+            parser.error(
+                "--render_layers > 1 is currently implemented for --adaptive only.")
+        if args.render_far_weight < 0:
+            parser.error("--render_far_weight must be >= 0.")
 
     if args.adaptive:
         return run_adaptive(args)
