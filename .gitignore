@@ -8,6 +8,8 @@ run_oneSeq.sh
 run_sequence.sh
 utils/intersect.sh
 3d_input_models/*
+3d_genus_models/*
+3dModelsTemp/*
 **/__pycache__/
 inputmodels/*
 demo/*

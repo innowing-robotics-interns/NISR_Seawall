@@ -5,6 +5,7 @@ import math
 import os
 import sys
 import argparse
+import shlex
 import time
 import numpy as np
 import torch
@@ -2164,6 +2165,190 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     return history, events
 
 
+def build_run_config(args):
+    """Configuration actually used by this run, grouped for metadata.json.
+
+    A switched-off feature keeps only the flag that switches it off; the
+    options that depend on it are left out (e.g. no --ghpr_init means no
+    other ghpr_* entry). Checkpoints still store the full vars(args).
+    """
+    a = args
+    pick = lambda *names: {n: getattr(a, n) for n in names}
+    adaptive = a.adaptive
+    cfg = {'command': ' '.join(shlex.quote(s) for s in sys.argv),
+           'pipeline': 'adaptive' if adaptive else 'multi_patch'}
+
+    cfg['io'] = {**({'file': a.file} if a.file else {'shape': a.shape}),
+                 **pick('result_dir', 'N', 'mesh_res', 'device', 'log_every',
+                        'checkpoint_every')}
+    cfg['model'] = pick('d_features', 'W', 'D', 'L', 'beta')
+    cfg['training'] = pick('epochs', 'lr', 'M_per_patch', 'schedule')
+
+    # ── initialization ──────────────────────────────────────────────────
+    init = {}
+    if adaptive:
+        if a.load_ckpt:
+            init['load_ckpt'] = a.load_ckpt
+        else:
+            init['base_subdivisions'] = a.base_subdivisions
+            if a.skip_pretrain:
+                init['skip_pretrain'] = True
+            else:
+                init.update(pick('pretrain_epochs', 'pretrain_loss'))
+                if a.pretrain_only:
+                    init['pretrain_only'] = True
+            if a.ghpr_init:
+                ghpr = {'ghpr_init': True, 'ghpr_k': a.ghpr_k,
+                        'visible_epochs': a.visible_epochs}
+                if a.ghpr_gammas:
+                    ghpr['ghpr_gammas'] = a.ghpr_gammas
+                else:
+                    ghpr.update(pick('ghpr_gamma', 'ghpr_stages'))
+                if a.ghpr_keep_largest:
+                    ghpr.update(ghpr_keep_largest=True,
+                                ghpr_connect_radius=a.ghpr_connect_radius)
+                if a.ghpr_subdiv_max_depth is not None:
+                    ghpr['ghpr_subdiv_max_depth'] = a.ghpr_subdiv_max_depth
+                init['ghpr'] = ghpr
+            else:
+                init['box_init'] = a.box_init
+                if a.box_init == 'aabb':
+                    init.update(pick('box_margin', 'box_min_frac'))
+            if a.box_center is not None:
+                init['box_center'] = a.box_center
+            if a.box_radius > 0:
+                init['box_radius'] = a.box_radius
+    else:
+        if a.init_ckpt:
+            init['init_ckpt'] = a.init_ckpt
+            if a.init_ckpt_reuse_normalization:
+                init['init_ckpt_reuse_normalization'] = True
+        elif a.pretrain_init or a.pretrain_then_train:
+            init.update({k: True for k in ('pretrain_init', 'pretrain_then_train')
+                         if getattr(a, k)})
+            mode = a.pretrain_mode
+            if mode == 'auto':
+                mode = 'closed_shape' if a.atlas_mode == 'two_sheet' else 'flat'
+            init.update(pretrain_mode=a.pretrain_mode, pretrain_epochs=a.pretrain_epochs)
+            if mode == 'closed_shape':
+                init.update(pick('pretrain_shape', 'pretrain_shape_samples'))
+                if a.no_presplit_pretrain:
+                    init['no_presplit_pretrain'] = True
+                if a.atlas_mode == 'six_sheet' and a.face_aware_box_supervision:
+                    init['face_aware_box_supervision'] = True
+            else:
+                init['pretrain_loss'] = a.pretrain_loss
+        else:
+            init['pretrain'] = False
+    cfg['init'] = init
+
+    # ── atlas ───────────────────────────────────────────────────────────
+    if not adaptive:
+        atlas = {'atlas_mode': a.atlas_mode}
+        if a.atlas_mode == 'single_sheet':
+            atlas['n_patches'] = a.n_patches
+        elif a.atlas_mode == 'two_sheet':
+            atlas.update(pick('two_sheet_side_rows', 'two_sheet_side_cols',
+                              'two_sheet_split_axis', 'two_sheet_side_axes'))
+        else:
+            atlas.update(pick('six_sheet_face_rows', 'six_sheet_face_cols'))
+        if a.no_presplit:
+            atlas['no_presplit'] = True
+        cfg['atlas'] = atlas
+
+    # ── losses ──────────────────────────────────────────────────────────
+    surf = {'surface_loss_type': a.surface_loss_type}
+    if a.surface_loss_type in ('ddf', 'cd_ddf'):
+        if a.surface_loss_type == 'cd_ddf':
+            surf['lambda_chamfer'] = a.lambda_chamfer
+        surf.update(pick('lambda_ddf', 'ddf_start_epoch', 'chamfer_resume_epoch',
+                         'ddf_mu_decay', 'ddf_n_reference_points', 'ddf_k_neighbors',
+                         'ddf_sigma', 'ddf_beta', 'ddf_resample_every',
+                         'ddf_chunk_size', 'save_ddf_reference_every'))
+    cfg['surface_loss'] = surf
+
+    tangent = {'mu': a.mu}
+    if a.mu > 0:
+        tangent.update(pick('mu_warmup_epochs', 'mu_warmup_delay'))
+        if adaptive:
+            tangent['tangent_mode'] = a.tangent_mode
+            if a.sym_dirichlet_epoch > 0:
+                tangent['sym_dirichlet_epoch'] = a.sym_dirichlet_epoch
+    cfg['tangent'] = tangent
+
+    svd = {'lam_svd': a.lam_svd}
+    if a.lam_svd > 0:
+        svd['svd_mode'] = a.svd_mode
+        if a.svd_mode in ('arap', 'one_sided_arap'):
+            svd['svd_target'] = a.svd_target
+        svd.update(pick('svd_eps', 'svd_warmup_epochs', 'svd_warmup_delay'))
+    cfg['svd'] = svd
+
+    normal = {'gamma': a.gamma}
+    if a.gamma > 0:
+        normal.update(pick('gamma_warmup_epochs', 'gamma_warmup_delay', 'normal_hinge_tau'))
+        if adaptive:
+            normal.update(pick('normal_unsigned', 'normal_nn', 'normal_w_fwd', 'normal_w_bwd'))
+            if a.ghpr_init and not a.load_ckpt:
+                normal['normal_off_frac'] = a.normal_off_frac
+    cfg['normal'] = normal
+
+    if not adaptive:
+        cycle = pick('lam', 'lam2')
+        if a.lam > 0 or a.lam2 > 0:
+            cycle['L_inv'] = a.L_inv
+        cfg['cycle'] = cycle
+        outer = {'lambda_outer_boundary': a.lambda_outer_boundary}
+        if a.lambda_outer_boundary > 0:
+            outer.update(pick('outer_boundary_samples', 'outer_boundary_loss_type'))
+        cfg['outer_boundary'] = outer
+        if a.lambda_bcd > 0:
+            cfg['training']['lambda_bcd'] = a.lambda_bcd
+        cfg['training']['reg_every'] = a.reg_every
+
+        if a.corr_from_init or a.corr_switch_epoch > 0:
+            corr = ({'corr_from_init': True} if a.corr_from_init
+                    else {'corr_switch_epoch': a.corr_switch_epoch})
+            corr.update(pick('corr_search_resolution', 'corr_refine_steps', 'corr_refine_lr'))
+            cfg['correspondence'] = corr
+
+        debug = {'save_patch_vis': a.save_patch_vis,
+                 'save_boundary_debug_every': a.save_boundary_debug_every,
+                 'save_correspondence_every': a.save_correspondence_every}
+        if a.save_correspondence_every > 0:
+            debug.update(pick('correspondence_max_lines', 'correspondence_line_segment'))
+        cfg['debug'] = debug
+    else:
+        sub = {'subdiv_threshold': a.subdiv_threshold}
+        if a.subdiv_threshold > 0 and a.subdiv_every > 0:
+            sub.update(pick('subdiv_max_depth', 'subdiv_every', 'subdiv_start',
+                            'subdiv_stop', 'distortion_mode', 'distortion_samples',
+                            'max_splits_per_round'))
+        cfg['subdivision'] = sub
+
+        ext = {'ext_mask_epoch': a.ext_mask_epoch}
+        if a.ext_mask_epoch > 0:
+            ext['ext_mode'] = a.ext_mode
+            if a.ext_mode == 'no_reg':
+                ext['ext_cd_weight'] = a.ext_cd_weight
+            ext.update(pick('ext_mask_every', 'ext_max_area_frac', 'ext_resolution',
+                            'ext_nn_scale', 'ext_min_opening_vertices', 'ext_weld_tol',
+                            'ext_face_res'))
+        cfg['extension_mask'] = ext
+        cfg['debug'] = {'save_vertex_pos_every': a.save_vertex_pos_every}
+    return cfg
+
+
+def write_run_config(result_dir, config):
+    """Write metadata.json with the config before training starts, so a long
+    run can be inspected while it is still going. The final metadata
+    rewrites the file with the config kept at the top."""
+    path = os.path.join(result_dir, 'metadata.json')
+    with open(path, 'w') as f:
+        json.dump({'config': config}, f, indent=2)
+    print(f"  Run config → {path}")
+
+
 def _resolve_ghpr_gammas(args):
     """GHPR gamma per stage, validated before any training time is spent.
 
@@ -2218,8 +2403,10 @@ def run_adaptive(args):
     result_dir = utils._get_unique_folder(args.result_dir)
     os.makedirs(result_dir, exist_ok=True)
     print(f"  Output directory: {result_dir}")
+    run_config = build_run_config(args)
+    write_run_config(result_dir, run_config)
 
-    # point cloud loader 
+    # point cloud loader
     downsample_n = None if args.N is not None and args.N < 0 else args.N
     if args.file:
         pts3n, meta = utils.load_point_cloud(args.file, downsample_n=downsample_n)
@@ -2519,7 +2706,7 @@ def run_adaptive(args):
     _adaptive_save_ckpt(model, os.path.join(result_dir, 'checkpoint.pt'), extra)
 
     with open(os.path.join(result_dir, 'metadata.json'), 'w') as f:
-        json.dump({'args': vars(args), 'subdivision_events': events,
+        json.dump({'config': run_config, 'subdivision_events': events,
                    'final_stats': model.complex.stats(),
                    'seam_check': seam}, f, indent=2)
     print(f"  Run complete → {result_dir}")
@@ -2899,7 +3086,7 @@ def main():
     ext_group.add_argument('--ext_mask_every', type=int, default=0,
                            help='[Adaptive] Re-detect every N epochs after --ext_mask_epoch '
                                 '(0 = detect once and keep that mask)')
-    ext_group.add_argument('--ext_max_area_frac', type=float, default=0.05,
+    ext_group.add_argument('--ext_max_area_frac', type=float, default=1,
                            help='[Adaptive] An unpaired opening is masked only when its 3D '
                                 'area is at most this fraction of the whole surface area')
     ext_group.add_argument('--ext_resolution', type=int, default=64,
@@ -3033,6 +3220,8 @@ def main():
     pretrain_ckpt_path = os.path.join(result_dir, 'pretrain_checkpoint.pt')
 
     print(f"  Output directory: {result_dir}")
+    run_config = build_run_config(args)
+    write_run_config(result_dir, run_config)
 
     # Training
     print(f"\n{'='*60}")
@@ -3232,7 +3421,8 @@ def main():
 
         print(f"\n  Saving results to: {result_dir}")
         utils._save_run_metadata(result_log, args, input_file_name, result_dir,
-                                 result_png, history, n_points=pts3n.shape[0], meta=meta)
+                                 result_png, history, n_points=pts3n.shape[0], meta=meta,
+                                 config=run_config)
 
         verts, faces = utils.visualise_multi_patch(
             F_model, pts3n, assignments, history, out_path=result_png,

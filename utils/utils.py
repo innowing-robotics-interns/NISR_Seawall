@@ -1584,8 +1584,13 @@ def _get_unique_folder(base_dir: str) -> str:
 
 
 def _save_run_metadata(log_path: str, args, input_file: str, result_dir: str,
-                       result_png: str, history: dict, n_points: int, meta: dict):
-    """Save comprehensive run metadata including hyperparameters and loss history."""
+                       result_png: str, history: dict, n_points: int, meta: dict,
+                       config: dict = None):
+    """Save comprehensive run metadata including hyperparameters and loss history.
+
+    When `config` (main.build_run_config) is given it is stored as 'config'
+    in place of the fixed 'hyperparameters' summary.
+    """
 
     def _safe_getattr(obj, name, default=None):
         try:
@@ -1646,6 +1651,8 @@ def _save_run_metadata(log_path: str, args, input_file: str, result_dir: str,
         loss_hist['parameter_distribution_loss'] = _safe_getitem(history, 'param', None)
     if _safe_getitem(history, 'tangent', None) is not None:
         loss_hist['tangent_loss'] = _safe_getitem(history, 'tangent', None)
+    if history.get('svd'):
+        loss_hist['svd_loss'] = history['svd']
     if _safe_getitem(history, 'normal', None) is not None:
         loss_hist['normal_loss'] = _safe_getitem(history, 'normal', None)
 
@@ -1660,7 +1667,10 @@ def _save_run_metadata(log_path: str, args, input_file: str, result_dir: str,
 
     scale = _safe_getitem(meta, 'scale', None)
 
-    payload = {
+    payload = {}
+    if config is not None:
+        payload['config'] = config
+    payload.update({
         'metadata': {
             'result_dir': result_dir,
             'result_png': result_png,
@@ -1675,9 +1685,9 @@ def _save_run_metadata(log_path: str, args, input_file: str, result_dir: str,
             'center': center_list,
             'scale': float(scale) if scale is not None else None,
         },
-        'hyperparameters': hyperparams,
+        **({} if config is not None else {'hyperparameters': hyperparams}),
         'loss_history': loss_hist,
-    }
+    })
     with open(log_path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2, sort_keys=False)
     print(f"    Metadata → {log_path}")
