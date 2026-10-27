@@ -462,7 +462,7 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
                                  epoch='10k', name=None,
                                  texture_pattern="Slide{}.jpg", n_images=4,
                                  unnormalize=True, debug_uv_png=True,
-                                 export_ply=True, double_sided=True,
+                                 export_obj=True, export_ply=True, double_sided=True,
                                  active_patch_ids=None,
                                  patch_points_by_id=None,
                                  subdivision_depth=1,
@@ -501,6 +501,7 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
     meshes = []          # textured (OBJ) versions
     colored_meshes = []  # vertex-colored (PLY) versions
     svd_parts = []       # (patch_id, verts, faces, sigma, loss), single-sided
+    n_exported = 0
 
     use_legacy_sampling = subdivision_depth <= 0 or patch_points_by_id is None
 
@@ -546,7 +547,6 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
         mesh = trimesh.Trimesh(vertices=verts_out, faces=faces,
                                visual=uv_visuals, process=False,
                                maintain_order=True)
-        meshes.append(mesh)
 
         if leaf_patches is not None:
             leaf = leaf_patches[cid]
@@ -556,9 +556,12 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
             tag = f"patch_{cid}_{epoch}"
             label = f"Patch {cid:02d}"
 
-        obj_path = os.path.join(save_dir, tag + ".obj")
-        mesh.export(obj_path)
-        print(f"    {label} textured OBJ → {obj_path}")
+        if export_obj:
+            meshes.append(mesh)
+            obj_path = os.path.join(save_dir, tag + ".obj")
+            mesh.export(obj_path)
+            print(f"    {label} textured OBJ → {obj_path}")
+            n_exported += 1
 
         if export_ply:
             colored_mesh = _bake_vertex_colors(mesh)
@@ -566,20 +569,22 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
             ply_path = os.path.join(save_dir, tag + ".ply")
             colored_mesh.export(ply_path)
             print(f"    {label} vertex-colored PLY → {ply_path}")
+            n_exported += 1
 
         if debug_uv_png:
             _save_debug_uv_png(uv, tex_img, save_dir, cid)
 
-    # Combined OBJ scene with per-patch materials.
-    if len(meshes) == 0:
+    if n_exported == 0:
         print("  No meshes remained after occupancy filtering; skipping combined export.")
         return []
 
-    scene = trimesh.Scene(meshes)
-    obj_scene_name = f"{name}_checkerboard_{epoch}.obj" if name else f"checkerboard_{epoch}.obj"
-    obj_scene_path = os.path.join(save_dir, obj_scene_name)
-    scene.export(obj_scene_path)
-    print(f"    Combined checkerboard scene (OBJ) → {obj_scene_path}")
+    # Combined OBJ scene with per-patch materials.
+    if export_obj:
+        scene = trimesh.Scene(meshes)
+        obj_scene_name = f"{name}_checkerboard_{epoch}.obj" if name else f"checkerboard_{epoch}.obj"
+        obj_scene_path = os.path.join(save_dir, obj_scene_name)
+        scene.export(obj_scene_path)
+        print(f"    Combined checkerboard scene (OBJ) → {obj_scene_path}")
 
     # Combined PLY as one merged vertex-colored mesh.
     if export_ply:
@@ -846,6 +851,8 @@ def main():
     parser.add_argument('--no_unnormalize', action='store_true',
                         help='Keep vertices in normalized [-1,1]^3 space '
                              '(default: export in original coordinates)')
+    parser.add_argument('--no_obj', action='store_true',
+                        help='Skip textured .obj export (PLY only)')
     parser.add_argument('--no_ply', action='store_true',
                         help='Skip vertex-colored .ply export (OBJ only)')
     parser.add_argument('--single_sided', action='store_true',
@@ -966,6 +973,7 @@ def main():
             n_images=args.n_images,
             unnormalize=not args.no_unnormalize,
             debug_uv_png=not is_adaptive,
+            export_obj=not args.no_obj,
             export_ply=not args.no_ply,
             double_sided=not args.single_sided,
             active_patch_ids=active_patch_ids,

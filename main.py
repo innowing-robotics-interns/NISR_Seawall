@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import random
 import sys
 import argparse
 import shlex
@@ -33,7 +34,8 @@ from model.losses import (chamfer_distance, chamfer_distance_chunked, directiona
 from model.model import (MultiPatchForwardMap, MultiPatchInverseMap, TwoSheetForwardMap, SixSheetForwardMap,
                          AdaptiveCubeForwardMap)
 from model.correspondence import build_hard_correspondence
-from model.subdivision import subdivide_by_distortion, check_seam_continuity
+from model.subdivision import (subdivide_by_distortion, subdivide_by_cd,
+                               check_seam_continuity)
 from utils.adaptive_vis import visualize_patch_configuration, plot_history
 from utils.ghpr import (ghpr_from_points, ghpr_visible, keep_connected,
                         median_nn_spacing, write_classified_ply)
@@ -43,6 +45,78 @@ try:
     import open3d as o3d
 except ImportError:
     o3d = None
+
+
+def _write_json_atomic(path, payload):
+    tmp_path = f'{path}.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _timestamp():
+    return time.strftime('%Y-%m-%dT%H:%M:%S%z')
+
+
+# TensorBoard logging is optional: every helper is a no-op when the writer is
+# None, so training works unchanged without the `tensorboard` package.
+def _create_tb_writer(result_dir, enabled, args=None):
+    if not enabled:
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        print("  [warn] --tensorboard requested but the 'tensorboard' package is "
+              "not installed (pip install tensorboard); continuing without it.")
+        return None
+    tb_dir = os.path.join(result_dir, 'tensorboard')
+    os.makedirs(tb_dir, exist_ok=True)
+    writer = SummaryWriter(tb_dir)
+    if args is not None:
+        writer.add_text('config/args',
+                        '```\n' + json.dumps(vars(args), indent=2) + '\n```', 0)
+    print(f"  TensorBoard → {tb_dir}   (tensorboard --logdir {tb_dir})")
+    return writer
+
+
+def _tb_log_scalars(writer, prefix, values, step):
+    if writer is None:
+        return
+    for name, value in values.items():
+        if value is not None:
+            writer.add_scalar(f'{prefix}/{name}', float(value), step)
+    writer.flush()
+
+
+def _tb_log_image(writer, tag, image_path, step=0):
+    if writer is None or not os.path.exists(image_path):
+        return
+    try:
+        from PIL import Image
+        image = np.asarray(Image.open(image_path).convert('RGB'))
+        writer.add_image(tag, image, step, dataformats='HWC')
+        writer.flush()
+    except Exception as exc:
+        print(f"  [warn] TensorBoard image logging failed for {image_path}: {exc}")
+
+
+def _tb_log_mesh(writer, tag, verts, faces, step=0):
+    if writer is None:
+        return
+    try:
+        writer.add_mesh(tag,
+                        vertices=torch.as_tensor(verts, dtype=torch.float32)[None],
+                        faces=torch.as_tensor(faces, dtype=torch.int32)[None],
+                        global_step=step)
+        writer.flush()
+    except Exception as exc:
+        print(f"  [warn] TensorBoard mesh logging failed for {tag}: {exc}")
+
+
+def _tb_close(writer):
+    if writer is not None:
+        writer.close()
+
 
 # Multi-patch training with a single or two-sheet atlas.
 def _build_forward_model(atlas_mode: str,
@@ -206,7 +280,19 @@ def train_multi_patch(pts3n: np.ndarray,
                       ddf_beta: float = 20.0,
                       ddf_resample_every: int = 500,
                       ddf_chunk_size: int = 2048,
-                      save_ddf_reference_every: int = 0):
+                      save_ddf_reference_every: int = 0,
+                      tb_writer=None,
+                      lambda_render: float = 0.0,
+                      render_start_epoch: int = 500,
+                      render_warmup_epochs: int = 500,
+                      render_every: int = 1,
+                      render_views: int = 16,
+                      render_batch: int = 2,
+                      render_resolution: int = 256,
+                      render_mesh_res: int = 0,
+                      render_min_coverage: float = 0.1,
+                      render_preview: int = 4,
+                      render_laplacian_weight: float = 0.0):
     """
     Train the multi-patch model and inverse map.
 
@@ -244,7 +330,68 @@ def train_multi_patch(pts3n: np.ndarray,
     When `surface_loss_type == 'cd_ddf'`, both Chamfer and DDF are evaluated
     together during the DDF-active phase and combined as
     `lambda_chamfer * CD + lambda_ddf * DDF`.
+
+    If `lambda_render > 0`, NGF's unweighted front-layer render loss is added
+    after a delay.  The atlas is sampled into a triangle mesh each active
+    epoch, rendered from cached point-cloud reference views, and compared on
+    the six `[normal, position]` channels.  `render_laplacian_weight` adds
+    NGF's uniform-Laplacian regularizer on those mesh vertices; NGF's own
+    trainer uses 1.0 with no Chamfer term.  Supported atlases: fixed-grid
+    `single_sheet`, and the box-initialized `six_sheet` atlas (which must use
+    `no_presplit=True`).  There is no alpha mask.  The reference targets are
+    built once from `pts3n`/`normals` before training.
     """
+    if lambda_render < 0:
+        raise ValueError(f"lambda_render must be >= 0, got {lambda_render}")
+    if render_laplacian_weight < 0:
+        raise ValueError(
+            "render_laplacian_weight must be >= 0, got "
+            f"{render_laplacian_weight}")
+    if render_laplacian_weight > 0 and lambda_render == 0:
+        raise ValueError(
+            "render_laplacian_weight > 0 requires lambda_render > 0")
+    if render_every < 1:
+        raise ValueError(f"render_every must be >= 1, got {render_every}")
+    if render_views < 1:
+        raise ValueError(f"render_views must be >= 1, got {render_views}")
+    if render_batch < 1:
+        raise ValueError(f"render_batch must be >= 1, got {render_batch}")
+    if render_resolution < 16:
+        raise ValueError(
+            f"render_resolution must be >= 16, got {render_resolution}")
+    if render_start_epoch < 0:
+        raise ValueError(
+            f"render_start_epoch must be >= 0, got {render_start_epoch}")
+    if render_warmup_epochs < 0:
+        raise ValueError(
+            f"render_warmup_epochs must be >= 0, got {render_warmup_epochs}")
+    if not (0.0 <= render_min_coverage <= 1.0):
+        raise ValueError(
+            "render_min_coverage must be in [0, 1], got "
+            f"{render_min_coverage}")
+    if render_preview < 0:
+        raise ValueError(
+            f"render_preview must be >= 0, got {render_preview}")
+    if render_mesh_res < 0:
+        raise ValueError(f"render_mesh_res must be >= 0, got {render_mesh_res}")
+    if render_mesh_res != 0 and not (2 <= render_mesh_res <= 64):
+        raise ValueError(
+            f"render_mesh_res must be 0 (auto) or between 2 and 64, "
+            f"got {render_mesh_res}")
+    if lambda_render > 0 and atlas_mode not in ('single_sheet', 'six_sheet'):
+        raise ValueError(
+            "the NGF render loss currently supports atlas_mode='single_sheet' "
+            "and the box-initialized atlas_mode='six_sheet', got "
+            f"{atlas_mode!r}")
+    if lambda_render > 0 and atlas_mode == 'six_sheet' and not no_presplit:
+        raise ValueError(
+            "the NGF render loss on atlas_mode='six_sheet' requires "
+            "--no_presplit: the six-sheet atlas is the box initialization and "
+            "is fitted to the full point cloud, not a per-patch subset")
+    if lambda_render > 0 and normals is None:
+        raise ValueError(
+            "the NGF render loss needs per-point normals for its reference "
+            "maps; the input cloud has none")
     F, atlas_info = _build_forward_model(
         atlas_mode=atlas_mode,
         n_patches=n_patches,
@@ -365,9 +512,11 @@ def train_multi_patch(pts3n: np.ndarray,
 
     if no_presplit:
         assignments = np.arange(pts3n.shape[0], dtype=np.int32) % actual_n_patches
+        per_side = np.arange(atlas_info['patches_per_side'],
+                             dtype=np.int32).reshape(n_rows, n_cols)
         grid_topology = np.stack([
-            np.arange(atlas_info['patches_per_side'], dtype=np.int32).reshape(n_rows, n_cols),
-            (np.arange(atlas_info['patches_per_side'], dtype=np.int32) + atlas_info['patches_per_side']).reshape(n_rows, n_cols),
+            per_side + side * atlas_info['patches_per_side']
+            for side in range(atlas_info['n_sides'])
         ], axis=0)
         patch_params = np.zeros((pts3n.shape[0], 2), dtype=np.float32)
         side_assignments = np.full(pts3n.shape[0], -1, dtype=np.int32)
@@ -413,7 +562,7 @@ def train_multi_patch(pts3n: np.ndarray,
                     pts_vis, asg_vis, grid_topology, n_rows, n_cols,
                     save_path=os.path.join(vis_dir, 'patch_assignments_3d.png')
                 )
-            else:
+            elif atlas_mode == 'two_sheet':
                 side_vis = side_assignments[vsub] if pts3n.shape[0] > vis_cap else side_assignments
                 utils._visualize_two_sheet_patch_assignments(
                     pts_vis, asg_vis, side_vis, grid_topology, pp_vis,
@@ -424,6 +573,10 @@ def train_multi_patch(pts3n: np.ndarray,
                     pts_vis, asg_vis, side_vis, n_rows, n_cols,
                     save_path=os.path.join(vis_dir, 'patch_assignments_two_sheet_3d.png')
                 )
+            else:
+                print(f"  [vis] patch-assignment map is not implemented for "
+                      f"atlas_mode={atlas_mode!r}; skipping (the box atlas has "
+                      "no per-point presegmentation).")
         except Exception as e:
             print(f"  [warn] patch visualization skipped ({type(e).__name__}: {e})")
 
@@ -508,7 +661,7 @@ def train_multi_patch(pts3n: np.ndarray,
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
 
     history = {'cd': [], 'cycle': [], 'param': [], 'tangent': [], 'svd': [], 'normal': [],
-               'outer_boundary': [],
+               'outer_boundary': [], 'render': [], 'render_lap': [], 'render_eff': [],
                'mu_eff': [], 'total': [], 'epoch': [], 'phase': []}
     
 
@@ -553,6 +706,23 @@ def train_multi_patch(pts3n: np.ndarray,
               + f"  eps={svd_eps}"
               + (f"  delay={svd_warmup_delay} warmup={svd_warmup_epochs}"
                  if (svd_warmup_delay > 0 or svd_warmup_epochs > 0) else ""))
+    if lambda_render > 0:
+        print(f"  NGF render loss: λ={lambda_render}  start={render_start_epoch}  "
+              f"warmup={render_warmup_epochs}  every={render_every}")
+        print(f"    views={render_views}  batch={render_batch}  "
+              f"res={render_resolution}  mesh_res={render_mesh_res or 'auto'}  "
+              f"min_coverage={render_min_coverage}  "
+              f"laplacian={render_laplacian_weight}")
+        if gamma <= 0:
+            print("  [note] no normal-consistency term (--gamma 0): mesh normals "
+                  "follow the UV winding, so the pretrained sheet orientation is kept.")
+        if render_start_epoch >= epochs:
+            print(f"  [warn] render_start_epoch={render_start_epoch} >= epochs={epochs}; "
+                  "the render term will never activate")
+    else:
+        print("  NGF render loss: OFF (--lambda_render 0)")
+    if lambda_chamfer == 0 and surface_loss_type != 'ddf':
+        print("  Surface loss: Chamfer OFF (--lambda_chamfer 0)")
     print(f"  Epochs={epochs}  lr={lr}  device={device}")
     print(f"{'─'*60}")
     t0 = time.time()
@@ -572,6 +742,97 @@ def train_multi_patch(pts3n: np.ndarray,
     ddf_debug_dir = os.path.join(checkpoint_dir, 'ddf_debug')
     if save_ddf_reference_every > 0:
         os.makedirs(ddf_debug_dir, exist_ok=True)
+
+    # NGF render supervision (Phase 3).  Everything is built once, before the
+    # loop: reference maps are cached on CPU, the rasterizer context is reused,
+    # and the mesh topology is cached by utils.render_mesh.
+    render_active = lambda_render > 0
+    renderer = None
+    render_targets = None
+    render_batches = []
+    render_batch_index = 0
+    render_mesh_resolution = 0
+    if render_active:
+        if torch.device(device).type != 'cuda':
+            raise ValueError(
+                "the NGF render loss requires a CUDA device; nvdiffrast's "
+                f"RasterizeCudaContext cannot run on {device!r}")
+
+        from model.ngf_rendering_loss import (NGFRenderer, UniformLaplacian,
+                                              ngf_rendering_loss)
+        from utils.render_mesh import (auto_mesh_resolution, sample_patch_mesh,
+                                       vertex_normals)
+        from utils.render_targets import build_render_targets
+
+        render_mesh_resolution = (
+            render_mesh_res if render_mesh_res > 0
+            else auto_mesh_resolution(len(active_ids), max_vertices=30000))
+
+        preview_dir = (os.path.join(checkpoint_dir, 'render_targets')
+                       if render_preview > 0 else None)
+        print("  [render] building point-cloud reference targets ...")
+        render_targets = build_render_targets(
+            pts3n, normals,
+            num_views=render_views,
+            resolution=render_resolution,
+            device=device,
+            min_coverage=render_min_coverage,
+            preview_dir=preview_dir,
+            preview_count=render_preview,
+        )
+        render_batch_size = min(int(render_batch), len(render_targets))
+        if render_batch_size != int(render_batch):
+            print(f"  [render] render_batch reduced from {render_batch} to "
+                  f"{render_batch_size} after coverage filtering")
+        render_batches = render_targets.view_batches(render_batch_size)
+
+        try:
+            renderer = NGFRenderer(
+                width=render_resolution, height=render_resolution,
+                fov=render_targets.fov, device=str(device))
+        except Exception as exc:
+            raise RuntimeError(
+                "failed to create the NGF renderer. nvdiffrast must be "
+                "installed and its JIT needs `ninja` on PATH; run with the "
+                "environment's bin directory prepended to PATH."
+            ) from exc
+
+        print("  [render] warming up the nvdiffrast rasterizer "
+              "(JIT compile, first run only) ...")
+        render_laplacian = None
+        try:
+            with torch.no_grad():
+                warm_vertices, warm_faces = sample_patch_mesh(
+                    F, render_mesh_resolution, patch_ids=active_ids)
+                warm_normals = vertex_normals(warm_vertices, warm_faces)
+                renderer.render(
+                    warm_vertices, warm_normals, warm_faces,
+                    render_targets.views[:1].to(device))
+        except Exception as exc:
+            raise RuntimeError(
+                "the NGF render-loss warmup failed; check the nvdiffrast "
+                "install and the `ninja` executable on PATH."
+            ) from exc
+        if render_laplacian_weight > 0:
+            # The layout is cached and deterministic, so one graph serves
+            # every step.  Vertices change; topology (and degree) do not.
+            render_laplacian = UniformLaplacian(
+                warm_faces, warm_vertices.shape[0], device=device)
+
+        print(f"  [render] {len(render_targets)}/{render_views} views cached "
+              f"at {render_resolution}²; coverage "
+              f"{float(render_targets.coverage.mean()):.3f} "
+              f"(min {float(render_targets.coverage.min()):.3f})")
+        print(f"  [render] mesh {render_mesh_resolution}²/patch × "
+              f"{len(active_ids)} patches; {render_batch_size} view(s)/step; "
+              f"laplacian weight {render_laplacian_weight}; "
+              f"term starts after epoch {render_start_epoch}")
+
+    # Scalar diagnostics for the human-readable metadata.json (and checkpoint
+    # history). 0 when rendering is off.
+    history['render_mesh_resolution'] = render_mesh_resolution
+    history['render_target_views'] = (len(render_targets)
+                                      if render_targets is not None else 0)
 
     def _save_epoch_checkpoint(epoch: int):
         if checkpoint_every <= 0 or epoch % checkpoint_every != 0:
@@ -629,6 +890,20 @@ def train_multi_patch(pts3n: np.ndarray,
                 'corr_search_resolution': corr_search_resolution,
                 'corr_refine_steps': corr_refine_steps,
                 'corr_refine_lr': corr_refine_lr,
+                'lambda_render': lambda_render,
+                'render_start_epoch': render_start_epoch,
+                'render_warmup_epochs': render_warmup_epochs,
+                'render_every': render_every,
+                'render_views': render_views,
+                'render_batch': render_batch,
+                'render_resolution': render_resolution,
+                'render_mesh_res': render_mesh_res,
+                'render_mesh_res_effective': render_mesh_resolution,
+                'render_min_coverage': render_min_coverage,
+                'render_preview': render_preview,
+                'render_laplacian_weight': render_laplacian_weight,
+                'render_target_views': (len(render_targets)
+                                        if render_targets is not None else 0),
             }),
             'grid_dims': (n_rows, n_cols),
             'atlas_info': atlas_info,
@@ -896,11 +1171,18 @@ def train_multi_patch(pts3n: np.ndarray,
                     else:
                         cd_loss = lambda_ddf * ddf_loss
                 else:
-                    cd_loss = chamfer_distance_chunked(Q_flat, tgt_flat, chunk_size=min(2048, K * M_per_patch))
+                    cd_loss = lambda_chamfer * chamfer_distance_chunked(
+                        Q_flat, tgt_flat, chunk_size=min(2048, K * M_per_patch))
                 D = None
-            else:
+            elif lambda_chamfer > 0 or gamma > 0:
                 D = torch.cdist(tgt, Q)
-                cd_loss = D.min(dim=2).values.mean() + D.min(dim=1).values.mean()
+                cd_loss = lambda_chamfer * (D.min(dim=2).values.mean()
+                                            + D.min(dim=1).values.mean())
+            else:
+                # No Chamfer and no normal-consistency term: the atlas is
+                # driven by the render loss (and any active regularizers).
+                D = None
+                cd_loss = zero
         # cd_loss = D.min(dim=2).values.mean() # Map only xyz ->  uv
 
 
@@ -989,6 +1271,37 @@ def train_multi_patch(pts3n: np.ndarray,
         else:
             outer_boundary_loss = zero
 
+        # Loss 7: NGF's front-layer rendering loss on the sampled patch mesh.
+        # Scheduled separately from the other regularizers: the term is off
+        # before render_start_epoch, ramps over render_warmup_epochs, and is
+        # evaluated every render_every epochs.
+        render_eff = 0.0
+        render_loss = zero
+        render_parts = None
+        if render_active and epoch > render_start_epoch and epoch % render_every == 0:
+            render_eff = mu_warmup_schedule(
+                epoch, render_warmup_epochs, lambda_render,
+                schedule=schedule, delay_epochs=render_start_epoch)
+        if render_eff > 0:
+            render_vertices, render_faces = sample_patch_mesh(
+                F, render_mesh_resolution, patch_ids=active_ids)
+            render_normals = vertex_normals(render_vertices, render_faces)
+            render_views_batch, render_ref_batch = \
+                render_batches[render_batch_index]
+            render_batch_index = (render_batch_index + 1) % len(render_batches)
+            render_loss, render_parts = ngf_rendering_loss(
+                render_vertices, render_normals, render_faces,
+                render_views_batch.to(device),
+                render_ref_batch.to(device),
+                renderer=renderer,
+                laplacian=render_laplacian,
+                laplacian_weight=render_laplacian_weight,
+                return_parts=True)
+        render_loss_log = (render_parts['render'].detach()
+                           if render_parts is not None else zero)
+        render_lap_log = (render_parts['laplacian'].detach()
+                          if render_parts is not None else zero)
+
         # Total loss.
         loss = (cd_loss
                 + lam * cycle_loss
@@ -996,7 +1309,8 @@ def train_multi_patch(pts3n: np.ndarray,
                 + mu_eff * tangent_loss
                 + svd_eff * svd_loss
                 + gamma_eff * normal_loss
-                + lambda_outer_boundary * outer_boundary_loss)
+                + lambda_outer_boundary * outer_boundary_loss
+                + render_eff * render_loss)
         loss.backward()
 
         nn.utils.clip_grad_norm_(opt_params, 1.0)
@@ -1012,6 +1326,9 @@ def train_multi_patch(pts3n: np.ndarray,
             history['svd'].append(float(svd_loss))
             history['normal'].append(float(normal_loss))
             history['outer_boundary'].append(float(outer_boundary_loss))
+            history['render'].append(float(render_loss_log))
+            history['render_lap'].append(float(render_lap_log))
+            history['render_eff'].append(float(render_eff))
             # history['mu_eff'].append(float(mu_eff))
             history['total'].append(float(loss))
             if correspondence is not None:
@@ -1024,9 +1341,30 @@ def train_multi_patch(pts3n: np.ndarray,
                 phase = 'chamfer'
             history['phase'].append(phase)
 
+            _tb_log_scalars(tb_writer, 'train', {
+                'total': loss,
+                'cd': cd_loss,
+                'cycle': cycle_loss,
+                'param': param_loss,
+                'tangent': tangent_loss,
+                'svd': svd_loss,
+                'normal': normal_loss,
+                'outer_boundary': outer_boundary_loss,
+                'render': render_loss_log,
+                'render_lap': render_lap_log,
+                'render_eff': render_eff,
+                'mu_eff': mu_eff,
+                'svd_eff': svd_eff,
+                'gamma_eff': gamma_eff,
+                'lr': opt.param_groups[0]['lr'],
+            }, epoch)
+
             elapsed = time.time() - t0
             # mu_str = f"  μ_eff={float(mu_eff):.4f}" if (mu_warmup_epochs > 0 and mu > 0) else ""
             recon_label = {'mse': 'MSE', 'ddf': 'DDF', 'chamfer': 'CD ', 'cd_ddf': 'CD & DDF'}[phase]
+            render_str = (f"Render={float(render_loss_log):.5f}  "
+                          f"λR_eff={render_eff:.4f}  "
+                          if render_active else "")
             print(f"  Epoch {epoch:5d}/{epochs}  |  "
                   f"{recon_label}={float(cd_loss):.5f}  "
                   f"Cycle={float(cycle_loss):.5f}  "
@@ -1035,6 +1373,7 @@ def train_multi_patch(pts3n: np.ndarray,
                   f"SVD={float(svd_loss):.5f}  "
                   f"Normal={float(normal_loss):.5f}  "
                   f"Outer={float(outer_boundary_loss):.5f}  "
+                  f"{render_str}"
                   f"Total={float(loss):.5f}  "
                   f"μ_eff={float(mu_eff):.4f}  "
                   f"λsvd_eff={float(svd_eff):.4f}  "
@@ -1076,7 +1415,8 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
                                     loss_type: str = 'mse',
                                     atlas_mode: str = 'single_sheet',
                                     two_sheet_side_rows: int = 2,
-                                    two_sheet_side_cols: int = 2):
+                                    two_sheet_side_cols: int = 2,
+                                    tb_writer=None):
     """
     Pretrain only the multi-patch forward map F. 
 
@@ -1181,6 +1521,8 @@ def pretrain_multi_patch_flat_sheet(n_patches: int = 4,
             history['epoch'].append(epoch)
             history['plane'].append(float(plane_loss))
             history['total'].append(float(plane_loss))
+            _tb_log_scalars(tb_writer, 'pretrain_flat',
+                            {'plane': plane_loss, 'lr': opt.param_groups[0]['lr']}, epoch)
 
             elapsed = time.time() - t0
             print(f"  Epoch {epoch:5d}/{epochs}  |  "
@@ -1216,7 +1558,8 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
                                       no_presplit: bool = False,
                                       six_sheet_face_rows: int = 2,
                                       six_sheet_face_cols: int = 2,
-                                      face_aware_box_supervision: bool = False):
+                                      face_aware_box_supervision: bool = False,
+                                      tb_writer=None):
     """
     Pretrain the multi-patch forward map on a synthetic closed shape.
 
@@ -1389,6 +1732,13 @@ def pretrain_multi_patch_closed_shape(shape: str = 'sphere',
             history['tangent'].append(float(tangent_loss))
             history['mu_eff'].append(float(mu_eff))
             history['total'].append(float(loss))
+            _tb_log_scalars(tb_writer, 'pretrain_closed', {
+                'total': loss,
+                'cd': cd_loss,
+                'tangent': tangent_loss,
+                'mu_eff': mu_eff,
+                'lr': opt.param_groups[0]['lr'],
+            }, epoch)
 
             elapsed = time.time() - t0
             print(f"  Epoch {epoch:5d}/{epochs}  |  "
@@ -1573,7 +1923,8 @@ def aabb_box(points, margin=0.05, min_frac=0.1):
 
 
 def pretrain_adaptive_box(model, epochs, M_per_patch, lr, device, log_every,
-                          loss_type='mse', box_center=None, box_radius=1.0):
+                          loss_type='mse', box_center=None, box_radius=1.0,
+                          tb_writer=None):
     """Fit every leaf patch to its own piece of the reference cube.
 
     `box_center`/`box_radius` place and size that cube. `box_radius` is either
@@ -1621,6 +1972,8 @@ def pretrain_adaptive_box(model, epochs, M_per_patch, lr, device, log_every,
         if epoch % log_every == 0 or epoch == 1:
             history['epoch'].append(epoch)
             history['loss'].append(float(loss))
+            _tb_log_scalars(tb_writer, 'pretrain_box',
+                            {'box': loss, 'lr': opt.param_groups[0]['lr']}, epoch)
             print(f"  Epoch {epoch:5d}/{epochs}  |  Box={float(loss):.6f}  "
                   f"[{time.time() - t0:.1f}s]")
 
@@ -1640,11 +1993,17 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    distortion_samples, max_splits_per_round,
                    device, log_every, vis_dir, checkpoint_every,
                    checkpoint_extra=None,
+                   subdiv_metric: str = 'distortion',
+                   subdiv_cd_threshold: float = 0.0,
+                   subdiv_cd_grid_res: int = 8,
+                   subdiv_cd_min_valid_frac: float = 0.25,
                    tangent_mode='symmetric_dirichlet', sym_dirichlet_epoch=0,
+                   reg_every: int = 1,
                     save_vertex_pos_every: int = 0,
                    vertex_pos_json_path: str = None,
                    surface_loss_type: str = 'chamfer',
                    lambda_chamfer: float = 1.0,
+                   cd_sampling: str = 'random', cd_grid_res: int = 0,
                    lambda_ddf: float = 1.0,
                    ddf_mu_decay: float = 1.0,
                    ddf_start_epoch: int = 0,
@@ -1665,13 +2024,39 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    ghpr_stages=None, visible_epochs=0, normal_off_frac=0.5,
                    ghpr_subdiv_max_depth=None,
                    ext_mask_epoch=0, ext_mask_every=0, ext_kwargs=None,
-                   ext_mode='no_reg', ext_cd_weight=1.0):
+                   ext_mode='no_reg', ext_cd_weight=1.0,
+                   lambda_ext_area=0.0,
+                   lambda_render=0.0, render_start_epoch=0,
+                   render_warmup_epochs=0, render_every=1,
+                   render_views=120, render_batch=2, render_resolution=256,
+                   render_mesh_res=0, render_laplacian_weight=1.0,
+                   render_min_coverage=0.1, render_preview=4,
+                   render_view_clip=0.0, render_pixel_clip=0.0,
+                   render_layers=1, render_far_weight=0.5,
+                   tb_writer=None):
     if ext_mask_epoch < 0 or ext_mask_every < 0:
         raise ValueError("--ext_mask_epoch/--ext_mask_every must be >= 0")
     if ext_mode not in ('no_reg', 'no_fit'):
         raise ValueError(f"ext_mode must be 'no_reg' or 'no_fit', got {ext_mode!r}")
     if ext_cd_weight <= 0:
         raise ValueError(f"--ext_cd_weight must be > 0, got {ext_cd_weight}")
+    if lambda_ext_area < 0:
+        raise ValueError(f"--lambda_ext_area must be >= 0, got {lambda_ext_area}")
+    if lambda_ext_area > 0 and ext_mask_epoch <= 0:
+        raise ValueError(
+            "--lambda_ext_area requires --ext_mask_epoch > 0: the area penalty is "
+            "evaluated only on samples inside a detected extension mask.")
+    if not 1 <= render_layers <= 4:
+        raise ValueError(f"render_layers must be in [1, 4], got {render_layers}")
+    if render_far_weight < 0:
+        raise ValueError(
+            f"render_far_weight must be >= 0, got {render_far_weight}")
+    if render_layers > 1 and lambda_render == 0:
+        raise ValueError("render_layers > 1 requires lambda_render > 0")
+    if render_layers > 1 and (render_view_clip > 0 or render_pixel_clip > 0):
+        raise ValueError(
+            "render_view_clip/render_pixel_clip are only implemented for "
+            "--render_layers 1")
     # In 'no_fit' mode the extension samples are not in the Chamfer at all.
     use_ext_cd_weight = ext_cd_weight != 1.0 and ext_mode == 'no_reg'
     pts_dev = torch.tensor(pts3n, dtype=torch.float32, device=device)
@@ -1723,6 +2108,80 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     if surface_loss_type not in ('chamfer', 'ddf', 'cd_ddf'):
         raise ValueError(f"Unknown surface_loss_type: {surface_loss_type}. "
                          f"Use 'chamfer', 'ddf', or 'cd_ddf'.")
+    if cd_sampling not in ('random', 'grid'):
+        raise ValueError(
+            f"cd_sampling must be 'random' or 'grid', got {cd_sampling!r}")
+    if cd_sampling == 'grid':
+        # Default to the same sample count as the random path.
+        if cd_grid_res == 0:
+            cd_grid_res = int(round(math.sqrt(M_per_patch)))
+        if not 2 <= cd_grid_res <= 64:
+            raise ValueError(
+                f"cd_grid_res must be 0 (auto) or in [2, 64], got "
+                f"{cd_grid_res}")
+    if subdiv_metric not in ('distortion', 'cd'):
+        raise ValueError(
+            f"subdiv_metric must be 'distortion' or 'cd', got "
+            f"{subdiv_metric!r}")
+    if subdiv_metric == 'cd':
+        if subdiv_cd_threshold < 0:
+            raise ValueError(
+                f"subdiv_cd_threshold must be >= 0 (0 disables splitting), "
+                f"got {subdiv_cd_threshold}")
+        if not 2 <= subdiv_cd_grid_res <= 64:
+            raise ValueError(
+                f"subdiv_cd_grid_res must be in [2, 64], got "
+                f"{subdiv_cd_grid_res}")
+        if not 0.0 <= subdiv_cd_min_valid_frac <= 1.0:
+            raise ValueError(
+                f"subdiv_cd_min_valid_frac must be in [0, 1], got "
+                f"{subdiv_cd_min_valid_frac}")
+    if lambda_render < 0:
+        raise ValueError(f"lambda_render must be >= 0, got {lambda_render}")
+    if render_start_epoch < 0 or render_warmup_epochs < 0:
+        raise ValueError(
+            "render_start_epoch/render_warmup_epochs must be >= 0, got "
+            f"{render_start_epoch}/{render_warmup_epochs}")
+    if lambda_render > 0:
+        if render_views < 1 or render_batch < 1:
+            raise ValueError(
+                f"render_views/render_batch must be >= 1, got "
+                f"{render_views}/{render_batch}")
+        if render_resolution < 16:
+            raise ValueError(
+                f"render_resolution must be >= 16, got {render_resolution}")
+        if render_mesh_res != 0 and not (2 <= render_mesh_res <= 64):
+            raise ValueError(
+                f"render_mesh_res must be 0 (auto) or in [2, 64], got "
+                f"{render_mesh_res}")
+        if not 0.0 <= render_min_coverage <= 1.0:
+            raise ValueError(
+                f"render_min_coverage must be in [0, 1], got "
+                f"{render_min_coverage}")
+        if render_view_clip < 0:
+            raise ValueError(
+                f"render_view_clip must be >= 0, got {render_view_clip}")
+        if render_pixel_clip < 0:
+            raise ValueError(
+                f"render_pixel_clip must be >= 0, got {render_pixel_clip}")
+    if lambda_render > 0:
+        # The render term stands in for Chamfer as THE surface fit.  Keeping a
+        # DDF/CD mixture as well would silently reintroduce the term this mode
+        # is meant to replace.
+        if surface_loss_type != 'chamfer':
+            raise ValueError(
+                "--lambda_render with --adaptive replaces the Chamfer surface "
+                f"term, so surface_loss_type must be 'chamfer', got "
+                f"{surface_loss_type!r}.")
+        if render_every != 1:
+            raise ValueError(
+                f"--render_every must be 1 with --adaptive (got {render_every}): "
+                "the render loss is the only surface-fitting term, so skipping "
+                "epochs would leave those steps without a fit.")
+        if normals is None:
+            raise ValueError(
+                "--lambda_render > 0 needs per-point normals to build the "
+                "[normal, position] reference maps.")
     if lambda_chamfer < 0 or lambda_ddf < 0:
         raise ValueError("--lambda_chamfer/--lambda_ddf must be >= 0, got "
                          f"{lambda_chamfer}/{lambda_ddf}")
@@ -1773,26 +2232,196 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     opt, sched = _adaptive_make_optim(model, lr, epochs)
     history = {'epoch': [], 'cd': [], 'ddf': [], 'surface': [],
                'tangent': [], 'svd': [], 'normal': [],
-               'normal_fwd': [], 'normal_bwd': [],
+               'normal_fwd': [], 'normal_bwd': [], 'ext_area': [],
+               'render': [], 'render_lap': [], 'render_eff': [],
                'total': [], 'n_leaves': [], 'tangent_mode': [],
                'surface_phase': [], 'ghpr_stage': [], 'ext_masked': [],
                # first epoch of every GHPR stage / the full-cloud phase
                'phase_starts': ([i * visible_epochs + 1 for i in range(len(stages))]
                                 + [n_stage_epochs + 1]) if stages else []}
+    if render_layers > 1:
+        for layer_index in range(render_layers):
+            history[f'render_layer_{layer_index + 1}'] = []
+            if layer_index > 0:
+                history[f'render_layer_{layer_index + 1}_match'] = []
     events = []
     ext_mask = None
     zero = torch.tensor(0.0, device=device)
-    need_jac = (mu > 0) or (lam_svd > 0) or use_normal
+    need_jac = (mu > 0) or (lam_svd > 0) or use_normal or (lambda_ext_area > 0)
+
+    # Fixed per-leaf UV grid for deterministic Chamfer sampling.
+    cd_grid_uv = None
+    if cd_sampling == 'grid':
+        from utils.render_mesh import uv_grid
+        cd_grid_uv = uv_grid(cd_grid_res, device)
+    history['cd_sampling'] = cd_sampling
+    history['cd_grid_res'] = cd_grid_res
+
+    # Fixed UV grid used to score leaves for CD-driven subdivision.  When the
+    # CD loss already uses a grid, reuse it so training and splitting measure
+    # the same quantity.
+    subdiv_cd_uv = None
+    if subdiv_metric == 'cd':
+        if cd_grid_uv is not None:
+            subdiv_cd_uv = cd_grid_uv
+        else:
+            from utils.render_mesh import uv_grid
+            subdiv_cd_uv = uv_grid(subdiv_cd_grid_res, device)
+    history['subdiv_metric'] = subdiv_metric
+    if subdiv_metric == 'cd':
+        history['subdiv_cd_threshold'] = subdiv_cd_threshold
+        history['subdiv_cd_grid_res'] = int(subdiv_cd_uv.shape[0] ** 0.5)
+
+    # ── NGF render supervision ──────────────────────────────────────────────
+    # With lambda_render > 0 the render term REPLACES Chamfer as the surface
+    # fit.  Every other term of the adaptive design (μ tangent, λ_svd, γ
+    # normal, extension area, subdivision, GHPR staging) is untouched.  The
+    # targets are built from the full cloud after box pretraining, and the mesh
+    # is resampled from the live atlas every step so gradients reach the
+    # decoder and vertex features exactly as in the fixed-grid path.
+    render_active = lambda_render > 0
+    renderer = None
+    render_targets = None
+    render_batches = []
+    render_batch_index = 0
+    render_mesh_resolution = 0
+    render_laplacian = None
+    render_topology_key = None
+    if render_active:
+        if torch.device(device).type != 'cuda':
+            raise ValueError(
+                "the NGF render loss requires a CUDA device; nvdiffrast's "
+                f"RasterizeCudaContext cannot run on {device!r}")
+
+        from model.ngf_rendering_loss import (NGFRenderer, UniformLaplacian,
+                                              ngf_rendering_loss)
+        from utils.render_mesh import (auto_mesh_resolution, sample_patch_mesh,
+                                       vertex_normals)
+        from utils.render_targets import build_render_targets
+
+        render_mesh_resolution = (
+            int(render_mesh_res) if render_mesh_res > 0
+            else auto_mesh_resolution(model.n_patches, max_vertices=30000))
+
+        preview_dir = (os.path.join(vis_dir, 'render_targets')
+                       if render_preview > 0 else None)
+        print("  [render] building point-cloud reference targets ...")
+        render_targets = build_render_targets(
+            pts3n, normals,
+            num_views=render_views,
+            resolution=render_resolution,
+            device=device,
+            min_coverage=render_min_coverage,
+            preview_dir=preview_dir,
+            preview_count=render_preview,
+            num_layers=render_layers,
+        )
+        render_batch_size = min(int(render_batch), len(render_targets))
+        if render_batch_size != int(render_batch):
+            print(f"  [render] render_batch reduced from {render_batch} to "
+                  f"{render_batch_size} after coverage filtering")
+        render_batches = render_targets.view_batches(render_batch_size)
+
+        try:
+            renderer = NGFRenderer(
+                width=render_resolution, height=render_resolution,
+                fov=render_targets.fov, device=str(device))
+        except Exception as exc:
+            raise RuntimeError(
+                "failed to create the NGF renderer. nvdiffrast must be "
+                "installed and its JIT needs `ninja` on PATH; run with the "
+                "environment's bin directory prepended to PATH."
+            ) from exc
+
+        print("  [render] warming up the nvdiffrast rasterizer "
+              "(JIT compile, first run only) ...")
+        try:
+            with torch.no_grad():
+                warm_vertices, warm_faces = sample_patch_mesh(
+                    model, render_mesh_resolution)
+                warm_normals = vertex_normals(warm_vertices, warm_faces)
+                if render_layers > 1:
+                    renderer.render_layers(
+                        warm_vertices, warm_normals, warm_faces,
+                        render_targets.views[:1].to(device),
+                        layers=render_layers)
+                else:
+                    renderer.render(
+                        warm_vertices, warm_normals, warm_faces,
+                        render_targets.views[:1].to(device))
+        except Exception as exc:
+            raise RuntimeError(
+                "the NGF render-loss warmup failed; check the nvdiffrast "
+                "install and the `ninja` executable on PATH."
+            ) from exc
+        if render_laplacian_weight > 0:
+            render_laplacian = UniformLaplacian(
+                warm_faces, warm_vertices.shape[0], device=device)
+        render_topology_key = (int(model.n_patches),
+                               int(model.complex.n_vertices),
+                               int(render_mesh_resolution))
+
+        print(f"  [render] {len(render_targets)}/{render_views} views cached "
+              f"at {render_resolution}²; coverage "
+              f"{float(render_targets.coverage.mean()):.3f} "
+              f"(min {float(render_targets.coverage.min()):.3f})"
+              + (f"; {render_layers} depth layers, far weight "
+                 f"{render_far_weight:g}" if render_layers > 1 else ""))
+        print(f"  [render] Surface fit = NGF render loss (Chamfer removed); "
+              f"mesh {render_mesh_resolution}²/patch × {model.n_patches} "
+              f"leaves, auto-follows subdivision; "
+              f"{render_batch_size} view(s)/step; "
+              f"laplacian weight {render_laplacian_weight}; "
+              f"term starts after epoch {render_start_epoch}")
+        if render_start_epoch > 0:
+            print(f"  [render] [warn] epochs 1-{render_start_epoch} have no "
+                  f"surface-fitting term at all (Chamfer is removed).")
+        # A plain Dirichlet tangent energy is minimised at zero scale, so with
+        # Chamfer gone and μ live from the first render epoch it shrinks the
+        # box before the render loss can fit the surface (observed: R→trivial,
+        # CD→1.0, mesh span→0).  μ from a fitted surface is stable.
+        first_render_epoch = render_start_epoch + 1
+        if mu > 0 and mu_warmup_schedule(
+                first_render_epoch, mu_warmup_epochs, mu,
+                schedule=schedule, delay_epochs=mu_warmup_delay) > 0:
+            print(f"  [render] [warn] μ={mu} ({tangent_mode}) is active at the "
+                  f"first render epoch ({first_render_epoch}). With Chamfer "
+                  f"removed, the zero-scale minimum of the Dirichlet energy can "
+                  f"collapse the atlas before the render loss fits. Consider "
+                  f"--mu_warmup_delay 500 --mu_warmup_epochs 500.")
+        if lr >= 5e-4:
+            print(f"  [render] [warn] lr={lr:g}. Starting from a bounding box, "
+                  f"the unweighted render L1 has an empty-frame basin: at "
+                  f"lr >= 5e-4 the atlas can shrink to nothing before it fits "
+                  f"(observed on Lucy: coverage 0.00, CD 0.52 at 1000 epochs). "
+                  f"Use --lr 1e-4 to 2e-4 for the first render-only stage.")
 
     print(f"\n{'─' * 60}")
-    print("  Phase 2 — adaptive training with distortion-driven subdivision")
+    _subdiv_label = ('CD-driven' if subdiv_metric == 'cd'
+                     else 'distortion-driven')
+    print(f"  Phase 2 — adaptive training with {_subdiv_label} subdivision")
     print(f"  leaves={model.n_patches}  target points={pts3n.shape[0]}")
-    print(f"  subdiv: threshold={subdiv_threshold}  max_depth={subdiv_max_depth}  "
-          f"every={subdiv_every}  start={subdiv_start}  mode={distortion_mode}")
+    if subdiv_metric == 'cd':
+        print(f"  subdiv: CD threshold={subdiv_cd_threshold:g}  "
+              f"grid={int(subdiv_cd_uv.shape[0] ** 0.5)}×"
+              f"{int(subdiv_cd_uv.shape[0] ** 0.5)} per leaf  "
+              f"max_depth={subdiv_max_depth}  every={subdiv_every}  "
+              f"start={subdiv_start}  (score=fwd+bwd vs full cloud, "
+              f"min_valid_frac={subdiv_cd_min_valid_frac:g}; "
+              f"--subdiv_threshold/distortion ignored)")
+    else:
+        print(f"  subdiv: threshold={subdiv_threshold}  max_depth={subdiv_max_depth}  "
+              f"every={subdiv_every}  start={subdiv_start}  mode={distortion_mode}")
     if stages and ghpr_subdiv_max_depth is not None:
         print(f"  subdiv max_depth during GHPR stages (epochs 1-{n_stage_epochs}): "
               f"{ghpr_subdiv_max_depth}")
     print(f"  epochs={epochs}  M_per_patch={M_per_patch}  lr={lr}  μ={mu}")
+    if cd_sampling == 'grid':
+        print(f"  CD sampling: fixed {cd_grid_res}×{cd_grid_res} grid per leaf "
+              f"({model.n_patches * cd_grid_res ** 2} points now; random target "
+              f"subset)")
+    else:
+        print(f"  CD sampling: {M_per_patch} random points per leaf per step")
     if use_ddf_at_all:
         window = (f"epochs {max(ddf_start_epoch, 1)}-{chamfer_resume_epoch - 1}"
                   if chamfer_resume_epoch > 0
@@ -1811,7 +2440,11 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
               f"σ={ddf_sigma}  β={ddf_beta}  resample_every={ddf_resample_every}  "
               f"μ scaling during DDF=×{ddf_mu_decay}")
     else:
-        print("  Surface loss: Chamfer distance for the whole run")
+        if render_active:
+            print("  Surface loss: NGF render loss for the whole run "
+                  "(Chamfer removed)")
+        else:
+            print("  Surface loss: Chamfer distance for the whole run")
     if mu > 0:
         if sym_dirichlet_epoch > 0 and tangent_mode != 'symmetric_dirichlet':
             print(f"  Tangent energy: {tangent_mode} for epochs 1-{sym_dirichlet_epoch - 1}, "
@@ -1860,6 +2493,10 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                  if ext_cd_weight != 1.0 and ext_mode == 'no_fit' else "")
               + ("  [warn] after the last epoch, never applied"
                  if ext_mask_epoch > epochs else ""))
+        if render_active and ext_mode == 'no_fit':
+            print("  [ext] [warn] the render loss is image-space, so extension "
+                  "samples cannot be excluded from it; only the per-sample "
+                  "tangent/normal terms honour 'no_fit'.")
 
     ### Stop subdivision after normal loss activates (Currently not used)
     # if use_normal and subdiv_threshold > 0 and subdiv_every > 0:
@@ -1886,7 +2523,9 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
 
     for epoch in range(1, epochs + 1):
         # ── subdivision check ────────────────────────────────────────────
-        do_check = (subdiv_threshold > 0 and subdiv_every > 0
+        subdiv_enabled = (subdiv_threshold > 0 if subdiv_metric == 'distortion'
+                          else subdiv_cd_threshold > 0)
+        do_check = (subdiv_enabled and subdiv_every > 0
                     and epoch >= subdiv_start
                     and (subdiv_stop <= 0 or epoch <= subdiv_stop)
                     and epoch % subdiv_every == 0)
@@ -1897,14 +2536,29 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                          if ghpr_subdiv_max_depth is not None and epoch <= n_stage_epochs
                          else subdiv_max_depth)
             old_vf = model.complex.vertex_features
-            rep = subdivide_by_distortion(
-                model, subdiv_threshold, max_depth,
-                samples_per_patch=distortion_samples, mode=distortion_mode,
-                max_splits_per_round=max_splits_per_round)
-            print(f"  [subdiv @ {epoch}] distortion max={rep['max_distortion']:.4f} "
-                  f"mean={rep['mean_distortion']:.4f}  split={rep['n_subdivided']} "
-                  f"→ leaves={rep['n_leaves']} vertices={rep['n_vertices']}  "
-                  f"max_depth={max_depth}")
+            if subdiv_metric == 'cd':
+                rep = subdivide_by_cd(
+                    model, pts_dev, subdiv_cd_uv, subdiv_cd_threshold,
+                    max_depth, max_splits_per_round=max_splits_per_round,
+                    ext_mask=ext_mask,
+                    min_valid_frac=subdiv_cd_min_valid_frac)
+                print(f"  [subdiv @ {epoch}] CD max={rep['cd_max']:.4f} "
+                      f"p90={rep['cd_p90']:.4f} mean={rep['cd_mean']:.4f}  "
+                      f"threshold={subdiv_cd_threshold:g}  "
+                      f"split={rep['n_subdivided']}/{rep['n_eligible']} "
+                      f"→ leaves={rep['n_leaves']} vertices={rep['n_vertices']}  "
+                      f"max_depth={max_depth}"
+                      + (f"  ext_skipped={rep['ext_skipped']}"
+                         if rep['ext_skipped'] else ""))
+            else:
+                rep = subdivide_by_distortion(
+                    model, subdiv_threshold, max_depth,
+                    samples_per_patch=distortion_samples, mode=distortion_mode,
+                    max_splits_per_round=max_splits_per_round)
+                print(f"  [subdiv @ {epoch}] distortion max={rep['max_distortion']:.4f} "
+                      f"mean={rep['mean_distortion']:.4f}  split={rep['n_subdivided']} "
+                      f"→ leaves={rep['n_leaves']} vertices={rep['n_vertices']}  "
+                      f"max_depth={max_depth}")
             if rep['n_subdivided'] > 0:
                 # vertex_features was replaced → rebuild optimizer/scheduler,
                 # carrying the Adam moments over so the surface isn't kicked.
@@ -1912,9 +2566,14 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 opt, sched = _adaptive_make_optim(model, cur_lr, epochs - epoch + 1,
                                                   prev_opt=opt,
                                                   prev_vertex_features=old_vf)
-                events.append({'epoch': epoch,
-                               'n_subdivided': rep['n_subdivided'],
-                               'n_leaves': rep['n_leaves']})
+                event = {'epoch': epoch,
+                         'n_subdivided': rep['n_subdivided'],
+                         'n_leaves': rep['n_leaves'],
+                         'subdiv_metric': subdiv_metric}
+                if subdiv_metric == 'cd':
+                    event['cd_max'] = rep['cd_max']
+                    event['cd_mean'] = rep['cd_mean']
+                events.append(event)
 
             visualize_patch_configuration(
                 model, os.path.join(vis_dir, f'patch_config_{epoch:05d}.png'),
@@ -1954,7 +2613,39 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             print(f"  [normal @ {epoch}] normal loss ON (γ={gamma})")
 
         # ── training step ────────────────────────────────────────────────
+        # The render mesh follows the live topology.  A fixed per-patch
+        # resolution would make the vertex count explode as leaves subdivide
+        # (726 leaves x 32² = 743k vertices), so auto mode re-picks a
+        # resolution under a ~30k-vertex budget; an explicit
+        # --render_mesh_res is honoured unchanged.
+        if render_active:
+            new_res = (int(render_mesh_res) if render_mesh_res > 0
+                       else auto_mesh_resolution(model.n_patches,
+                                                 max_vertices=30000))
+            topology_key = (int(model.n_patches),
+                            int(model.complex.n_vertices),
+                            int(new_res))
+            if topology_key != render_topology_key:
+                if new_res != render_mesh_resolution:
+                    print(f"  [render @ {epoch}] mesh resolution "
+                          f"{render_mesh_resolution}² → {new_res}²/patch "
+                          f"({model.n_patches} leaves)")
+                render_mesh_resolution = new_res
+                # Subdivision replaced vertex_features; cached edges and UV
+                # layout address the old mesh.
+                render_laplacian = None
+                render_topology_key = topology_key
+
         K = model.n_patches
+        use_ddf = (not render_active and use_ddf_at_all
+                   and epoch >= ddf_start_epoch
+                   and (chamfer_resume_epoch <= 0 or epoch < chamfer_resume_epoch))
+        cd_in_loss = ((not render_active)
+                      and ((not use_ddf) or surface_loss_type == 'cd_ddf'))
+        # With a render term the CD is a monitor only, evaluated on log epochs;
+        # otherwise it is part of every step.
+        cd_due = (not render_active) or epoch % log_every == 0 or epoch == 1
+
         pids = torch.arange(K, device=device).repeat_interleave(M_per_patch)
         uv = torch.rand(K * M_per_patch, 2, device=device,
                         requires_grad=need_jac)
@@ -1974,9 +2665,30 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         ridx = torch.randint(0, pool.shape[0], (B,), device=device)
         tgt = pool[ridx]
 
-        use_ddf = (use_ddf_at_all
-                   and epoch >= ddf_start_epoch
-                   and (chamfer_resume_epoch <= 0 or epoch < chamfer_resume_epoch))
+        # Chamfer sampling.  'random' draws fresh UVs every step (the original
+        # behaviour); 'grid' evaluates the same fixed R x R grid on every leaf,
+        # so the CD changes only because the surface did.  The grid is used for
+        # the CD alone -- the tangent/SVD/normal terms keep their random draws,
+        # and the target subset above stays stochastic.
+        Q_cd_fit, cd_w_cd = Q_fit, cd_w
+        if cd_sampling == 'grid' and cd_due:
+            n_grid = cd_grid_uv.shape[0]
+            cd_pids = torch.arange(K, device=device).repeat_interleave(n_grid)
+            cd_uv = cd_grid_uv.repeat(K, 1)
+            if cd_in_loss:
+                Q_cd = model(cd_pids, cd_uv)
+            else:
+                with torch.no_grad():
+                    Q_cd = model(cd_pids, cd_uv)
+            cd_fit = None
+            cd_w_cd = None
+            if ext_mask is not None:
+                in_ext_cd = ext_mask.excluded(model, cd_pids, cd_uv)
+                if ext_mode == 'no_fit':
+                    cd_fit = ~in_ext_cd
+                cd_w_cd = (1.0 + (ext_cd_weight - 1.0) * in_ext_cd.float()
+                           if use_ext_cd_weight else None)
+            Q_cd_fit = Q_cd if cd_fit is None else Q_cd[cd_fit]
 
         if use_ddf:
             pool_changed = ddf_ref_pool is not pool
@@ -2007,25 +2719,88 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         else:
             ddf_loss = zero
 
-        # Surface Constraint: Chamfer distance between the predicted surface and
-        # the target point cloud. Outside the DDF window it IS the surface loss;
-        # inside it, it is only part of the loss for 'cd_ddf' — otherwise it is
-        # evaluated without a graph, purely so the logged CD stays comparable
-        # across phases.
-        cd_in_loss = (not use_ddf) or surface_loss_type == 'cd_ddf'
-        if cd_in_loss:
-            cd_loss = chamfer_distance_chunked(Q_fit, tgt, chunk_size=2048, p_weights=cd_w)
+        # Surface Constraint.  When the render loss is active it REPLACES
+        # Chamfer: the live atlas mesh is rasterized from one orbit view per
+        # step and compared against the point-cloud [normal, position]
+        # reference.  CD is then only evaluated without a graph on log epochs,
+        # so the history stays comparable with the Chamfer runs.
+        render_eff = 0.0
+        render_loss = zero
+        render_parts = None
+        if render_active:
+            if cd_due:
+                with torch.no_grad():
+                    cd_loss = chamfer_distance_chunked(
+                        Q_cd_fit, tgt, chunk_size=2048, p_weights=cd_w_cd)
+            else:
+                cd_loss = zero
         else:
-            with torch.no_grad():
-                cd_loss = chamfer_distance_chunked(Q_fit, tgt, chunk_size=2048,
-                                                   p_weights=cd_w)
+            if cd_in_loss:
+                cd_loss = chamfer_distance_chunked(
+                    Q_cd_fit, tgt, chunk_size=2048, p_weights=cd_w_cd)
+            else:
+                with torch.no_grad():
+                    cd_loss = chamfer_distance_chunked(
+                        Q_cd_fit, tgt, chunk_size=2048, p_weights=cd_w_cd)
 
-        if not use_ddf:
+        if render_active:
+            if epoch > render_start_epoch and epoch % render_every == 0:
+                render_eff = mu_warmup_schedule(
+                    epoch, render_warmup_epochs, lambda_render,
+                    schedule=schedule, delay_epochs=render_start_epoch)
+            if render_eff > 0:
+                render_vertices, render_faces = sample_patch_mesh(
+                    model, render_mesh_resolution)
+                render_normals = vertex_normals(render_vertices, render_faces)
+                if render_laplacian_weight > 0 and render_laplacian is None:
+                    render_laplacian = UniformLaplacian(
+                        render_faces, render_vertices.shape[0], device=device)
+                render_views_batch, render_ref_batch = \
+                    render_batches[render_batch_index]
+                render_batch_index = (render_batch_index + 1) % len(render_batches)
+                render_loss, render_parts = ngf_rendering_loss(
+                    render_vertices, render_normals, render_faces,
+                    render_views_batch.to(device),
+                    render_ref_batch.to(device),
+                    renderer=renderer,
+                    laplacian=render_laplacian,
+                    laplacian_weight=render_laplacian_weight,
+                    view_clip=render_view_clip,
+                    pixel_clip=render_pixel_clip,
+                    layers=render_layers,
+                    layer_weights=([1.0] + [render_far_weight]
+                                   * (render_layers - 1)
+                                   if render_layers > 1 else None),
+                    return_parts=True)
+            surface_loss = render_eff * render_loss
+        elif not use_ddf:
             surface_loss = cd_loss
         elif surface_loss_type == 'cd_ddf':
             surface_loss = lambda_chamfer * cd_loss + lambda_ddf * ddf_loss
         else:
             surface_loss = lambda_ddf * ddf_loss
+        render_loss_log = (render_parts['render'].detach()
+                           if render_parts is not None else zero)
+        render_raw_log = (render_parts['render_raw'].detach()
+                          if render_parts is not None else zero)
+        render_clip_frac_log = (render_parts['render_clip_frac'].detach()
+                                if render_parts is not None else zero)
+        render_pixel_clip_frac_log = (
+            render_parts['render_pixel_clip_frac'].detach()
+            if render_parts is not None else zero)
+        render_lap_log = (render_parts['laplacian'].detach()
+                          if render_parts is not None else zero)
+        render_layer_logs = {}
+        if render_layers > 1:
+            for layer_index in range(render_layers):
+                for suffix in ('', '_match'):
+                    if suffix and layer_index == 0:
+                        continue
+                    key = f'render_layer_{layer_index + 1}{suffix}'
+                    render_layer_logs[key] = (
+                        float(render_parts[key])
+                        if render_parts is not None and key in render_parts
+                        else 0.0)
 
         mu_eff = mu_warmup_schedule(epoch, mu_warmup_epochs, mu,
                                     schedule=schedule,
@@ -2044,8 +2819,12 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         if use_ddf:
             mu_eff *= ddf_mu_decay
 
-        # One Jacobian, shared by all Jacobian-based terms.
-        if need_jac and (mu_eff > 0 or svd_eff > 0 or gamma_eff > 0):
+        # One Jacobian, shared by all Jacobian-based terms.  The cadence applies
+        # to every regularizer that depends on it, including the extension area.
+        reg_due = reg_every <= 1 or epoch % reg_every == 0
+        if (need_jac and reg_due
+                and (mu_eff > 0 or svd_eff > 0 or gamma_eff > 0
+                     or (lambda_ext_area > 0 and in_ext is not None))):
             t_u, t_v = surface_jacobian(Q, uv)
         else:
             t_u = t_v = None
@@ -2067,7 +2846,15 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                      mode=svd_mode, target=svd_target,
                      eps=svd_eps, normalize_patch_scale=False)
                 if (svd_eff > 0 and t_u is not None) else zero)
-             
+
+        # Area of the extension membrane: ||dF/du x dF/dv|| is the local 3D area
+        # element, so averaging it over extension samples shrinks the extension.
+        if (lambda_ext_area > 0 and t_u is not None and in_ext is not None
+                and bool(in_ext.any())):
+            ext_area_loss = torch.cross(t_u[in_ext], t_v[in_ext], dim=-1).norm(dim=-1).mean()
+        else:
+            ext_area_loss = zero
+
         if gamma_eff > 0 and t_u is not None:
             t_u_fit, t_v_fit = (t_u, t_v) if fit is None else (t_u[fit], t_v[fit])
             if pool_tree is not None:
@@ -2095,11 +2882,16 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         else:
             normal_loss = normal_fwd = normal_bwd = zero
 
-        loss = surface_loss + mu_eff * tangent + svd_eff * svd_loss + gamma_eff * normal_loss
+        loss = (surface_loss + mu_eff * tangent + svd_eff * svd_loss
+                + gamma_eff * normal_loss + lambda_ext_area * ext_area_loss)
         opt.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(list(model.parameters()), 1.0)
-        opt.step()
+        # A window with every term scheduled off (e.g. render_start_epoch > 0
+        # while μ/SVD are still warming up) has no graph; stepping the scheduler
+        # without a backward keeps the schedule aligned with the epoch count.
+        if loss.requires_grad:
+            loss.backward()
+            nn.utils.clip_grad_norm_(list(model.parameters()), 1.0)
+            opt.step()
         sched.step()
 
         if save_vertex_pos_every > 0 and vertex_pos_json_path and (
@@ -2122,29 +2914,91 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             history['normal'].append(float(normal_loss))
             history['normal_fwd'].append(float(normal_fwd))
             history['normal_bwd'].append(float(normal_bwd))
+            history['ext_area'].append(float(ext_area_loss))
+            history['render'].append(float(render_loss_log))
+            history['render_lap'].append(float(render_lap_log))
+            history['render_eff'].append(float(render_eff))
+            for key, value in render_layer_logs.items():
+                history[key].append(value)
             history['surface'].append(float(surface_loss))
             history['total'].append(float(loss))
             history['n_leaves'].append(model.n_patches)
             history['tangent_mode'].append(tangent_mode_eff)
             history['surface_phase'].append(
-                ('cd_ddf' if surface_loss_type == 'cd_ddf' else 'ddf') if use_ddf else 'chamfer')
+                'render' if render_active
+                else (('cd_ddf' if surface_loss_type == 'cd_ddf' else 'ddf')
+                      if use_ddf else 'chamfer'))
             history['ghpr_stage'].append(stage_idx + 1 if in_warmup else 0)   # 0 = full cloud
             masked = 0.0 if in_ext is None else float(in_ext.float().mean())
             history['ext_masked'].append(masked)
+            _tb_log_scalars(tb_writer, 'train', {
+                'total': loss,
+                'cd': cd_loss,
+                'ddf': ddf_loss,
+                'tangent': tangent,
+                'svd': svd_loss,
+                'normal': normal_loss,
+                'normal_fwd': normal_fwd,
+                'normal_bwd': normal_bwd,
+                'ext_area': ext_area_loss,
+                'render': render_loss_log,
+                'render_raw': render_raw_log,
+                'render_clip_frac': render_clip_frac_log,
+                'render_pixel_clip_frac': render_pixel_clip_frac_log,
+                **render_layer_logs,
+                'render_lap': render_lap_log,
+                'render_eff': render_eff,
+                'surface': surface_loss,
+                'mu_eff': mu_eff,
+                'svd_eff': svd_eff,
+                'gamma_eff': gamma_eff,
+                'n_leaves': model.n_patches,
+                'ext_masked_frac': masked,
+                'lr': opt.param_groups[0]['lr'],
+            }, epoch)
+            # Weighted contributions of the total loss above, one line per term,
+            # so the browser shows at a glance which term dominates `total`.
+            _tb_log_scalars(tb_writer, 'train/loss_terms', {
+                'surface': float(surface_loss),
+                'mu_tangent': float(mu_eff) * float(tangent),
+                'svd': float(svd_eff) * float(svd_loss),
+                'gamma_normal': float(gamma_eff) * float(normal_loss),
+                'ext_area': float(lambda_ext_area) * float(ext_area_loss),
+            }, epoch)
             tangent_tag = 'SymDir' if tangent_mode_eff == 'symmetric_dirichlet' else 'Tangent'
             normal_str = (f"Normal={float(normal_loss):.5f} "
                           f"(f{float(normal_fwd):.4f}/b{float(normal_bwd):.4f})  "
                           f"γ_eff={float(gamma_eff):.3f}  "
                           if use_normal else "")
+            ext_area_str = (f"ExtArea={float(ext_area_loss):.5f}  "
+                            if lambda_ext_area > 0 else "")
             # Mark which term is actually being optimized: '*' = in the loss,
             # '(·)' = evaluated for monitoring only.
-            cd_str = (f"CD={float(cd_loss):.5f}" if cd_in_loss
-                      else f"CD=({float(cd_loss):.5f})")
+            if render_active:
+                cd_str = (f"R={float(render_loss_log):.5f}"
+                          f"(w={float(render_eff):.3f})"
+                          + (f" raw={float(render_raw_log):.5f}"
+                             f" vclip={100.0 * float(render_clip_frac_log):.0f}%"
+                             if render_view_clip > 0 else "")
+                          + (f" pclip={100.0 * float(render_pixel_clip_frac_log):.0f}%"
+                             if render_pixel_clip > 0 else "")
+                          + (f" Lap={float(render_lap_log):.4f}"
+                             if render_laplacian_weight > 0 else "")
+                          + ''.join(f" L{index + 1}={value:.5f}"
+                                    for index, value
+                                    in enumerate(render_layer_logs.values())
+                                    if render_layers > 1
+                                    and not list(render_layer_logs)[index]
+                                    .endswith('_match'))
+                          + f"  CD=({float(cd_loss):.5f})")
+            else:
+                cd_str = (f"CD={float(cd_loss):.5f}" if cd_in_loss
+                          else f"CD=({float(cd_loss):.5f})")
             ddf_str = (f"DDF={float(ddf_loss):.5f}  " if use_ddf
                        else ("DDF=--  " if use_ddf_at_all else ""))
             print(f"  Epoch {epoch:5d}/{epochs}  |  {cd_str}  {ddf_str}"
                   f"{tangent_tag}={float(tangent):.5f}  SVD={float(svd_loss):.5f}  "
-                  f"{normal_str}"
+                  f"{normal_str}{ext_area_str}"
                   f"Total={float(loss):.5f}  μ_eff={float(mu_eff):.3f}  "
                   f"λsvd_eff={float(svd_eff):.3f}  leaves={model.n_patches}  "
                   + (f"stage={stage_idx + 1 if in_warmup else 'full'}  " if stages else "")
@@ -2403,8 +3257,8 @@ def run_adaptive(args):
     result_dir = utils._get_unique_folder(args.result_dir)
     os.makedirs(result_dir, exist_ok=True)
     print(f"  Output directory: {result_dir}")
+    tb_writer = _create_tb_writer(result_dir, args.tensorboard, args)
     run_config = build_run_config(args)
-    write_run_config(result_dir, run_config)
 
     # point cloud loader
     downsample_n = None if args.N is not None and args.N < 0 else args.N
@@ -2420,18 +3274,28 @@ def run_adaptive(args):
 
     # check whether or not the file contains normals
     normals = meta.get('normals') if args.file else None
+    if normals is not None and normals.shape != pts3n.shape:
+        raise RuntimeError(
+            f"Normals shape {normals.shape} != points shape {pts3n.shape}")
+    # The render loss needs normals even when gamma == 0: they are the first
+    # three reference channels.  Normal *consistency* still follows gamma.
+    need_render_normals = args.lambda_render > 0
+    if need_render_normals and normals is None:
+        raise RuntimeError(
+            f"--lambda_render > 0 needs per-point normals: {input_name} has "
+            f"none, so the [normal, position] reference maps cannot be built.")
     if args.gamma > 0:
         if normals is None:
             print(f"  Normal consistency: DISABLED — {input_name} carries no normals "
                   f"(γ={args.gamma} ignored)")
-        elif normals.shape != pts3n.shape:
-            raise RuntimeError(
-                f"Normals shape {normals.shape} != points shape {pts3n.shape}")
         else:
             print(f"  Normal consistency: ENABLED (γ={args.gamma}, "
                   f"{normals.shape[0]} normals from file, "
                   f"{'unsigned' if args.normal_unsigned else 'signed'})")
-    else:
+    if need_render_normals:
+        print(f"  Render targets: using {normals.shape[0]} file normals for the "
+              f"[normal, position] reference maps")
+    if not (args.gamma > 0 or need_render_normals):
         normals = None
 
     # GHPR warm start
@@ -2562,6 +3426,32 @@ def run_adaptive(args):
             json.dump(ghpr_info, f, indent=2)
         print(f"    GHPR debug → {ghpr_dir}")
 
+    checkpoint_extra = {
+        'args': vars(args),
+        'input_file': input_name,
+        'normalization': {
+            'center': meta['center'].tolist() if hasattr(meta['center'], 'tolist')
+                      else list(meta['center']),
+            'scale': float(meta['scale']),
+        },
+        'ghpr': ghpr_info,
+        'box_init': {'mode': 'ghpr' if args.ghpr_init else args.box_init,
+                     'center': np.asarray(box_center).tolist(),
+                     # scalar for a cube, [x, y, z] half-extents for a cuboid
+                     'radius': (float(box_radius) if np.ndim(box_radius) == 0
+                                else np.asarray(box_radius).tolist())},
+    }
+    metadata_path = os.path.join(result_dir, 'metadata.json')
+    metadata = {'config': run_config, **checkpoint_extra}
+    metadata.update({
+        'result_dir': result_dir,
+        'n_input_points': int(pts3n.shape[0]),
+        'status': 'running',
+        'started_at': _timestamp(),
+    })
+    _write_json_atomic(metadata_path, metadata)
+    print(f"  Metadata → {metadata_path} (running)")
+
     # model
     if args.load_ckpt:
         ckpt = torch.load(args.load_ckpt, map_location='cpu')
@@ -2582,41 +3472,36 @@ def run_adaptive(args):
             model, epochs=args.pretrain_epochs, M_per_patch=args.M_per_patch,
             lr=args.lr, device=args.device, log_every=args.log_every,
             loss_type=args.pretrain_loss,
-            box_center=box_center, box_radius=box_radius)
+            box_center=box_center, box_radius=box_radius,
+            tb_writer=tb_writer)
 
-        visualize_patch_configuration(
-            model, os.path.join(result_dir, 'patch_config_pretrain.png'))
+        pretrain_config_png = os.path.join(result_dir, 'patch_config_pretrain.png')
+        visualize_patch_configuration(model, pretrain_config_png)
+        _tb_log_image(tb_writer, 'figures/patch_config_pretrain',
+                      pretrain_config_png, args.pretrain_epochs)
         verts, faces = utils.sample_multi_patch_grid(
             model, resolution=args.mesh_res, device=args.device)
         utils.export_ply(verts, faces,
                          os.path.join(result_dir, 'pretrain_box.ply'))
         utils.export_ply(utils.unnormalize_vertices(verts, meta), faces,
                          os.path.join(result_dir, 'pretrain_box_original.ply'))
+        _tb_log_mesh(tb_writer, 'mesh/pretrain_box', verts, faces,
+                     step=args.pretrain_epochs)
         _adaptive_save_ckpt(model, os.path.join(result_dir, 'pretrain_checkpoint.pt'),
                             {'phase': 'pretrain', 'history': pretrain_history,
                              'args': vars(args)})
         if args.pretrain_only:
-            plot_history(pretrain_history,
-                         os.path.join(result_dir, 'pretrain_history.png'))
+            pretrain_history_png = os.path.join(result_dir, 'pretrain_history.png')
+            plot_history(pretrain_history, pretrain_history_png)
+            _tb_log_image(tb_writer, 'figures/pretrain_history',
+                          pretrain_history_png, args.pretrain_epochs)
             print("  Pretraining complete (pretrain_only). Inspect the seam "
                   "check, pretrain_box.ply and patch_config_pretrain.png.")
+            metadata.update({'status': 'pretrain_only', 'completed_at': _timestamp()})
+            _write_json_atomic(metadata_path, metadata)
+            _tb_close(tb_writer)
             return
 
-    checkpoint_extra = {
-        'args': vars(args),
-        'input_file': input_name,
-        'normalization': {
-            'center': meta['center'].tolist() if hasattr(meta['center'], 'tolist')
-                      else list(meta['center']),
-            'scale': float(meta['scale']),
-        },
-        'ghpr': ghpr_info,
-        'box_init': {'mode': 'ghpr' if args.ghpr_init else args.box_init,
-                     'center': np.asarray(box_center).tolist(),
-                     # scalar for a cube, [x, y, z] half-extents for a cuboid
-                     'radius': (float(box_radius) if np.ndim(box_radius) == 0
-                                else np.asarray(box_radius).tolist())},
-    }
     vertex_pos_json_path = os.path.join(result_dir, 'vertex_positions_normalized.json')
     vertex_pos_denorm_json_path = os.path.join(result_dir, 'vertex_positions_denormalized.json')
 
@@ -2637,15 +3522,21 @@ def run_adaptive(args):
         subdiv_stop=args.subdiv_stop, distortion_mode=args.distortion_mode,
         distortion_samples=args.distortion_samples,
         max_splits_per_round=args.max_splits_per_round,
+        subdiv_metric=args.subdiv_metric,
+        subdiv_cd_threshold=args.subdiv_cd_threshold,
+        subdiv_cd_grid_res=args.subdiv_cd_grid_res,
+        subdiv_cd_min_valid_frac=args.subdiv_cd_min_valid_frac,
         device=args.device, log_every=args.log_every, vis_dir=result_dir,
         checkpoint_every=args.checkpoint_every,
         checkpoint_extra=checkpoint_extra,
         tangent_mode=args.tangent_mode,
         sym_dirichlet_epoch=args.sym_dirichlet_epoch,
+        reg_every=args.reg_every,
         save_vertex_pos_every=args.save_vertex_pos_every,
         vertex_pos_json_path=vertex_pos_json_path,
         surface_loss_type=args.surface_loss_type,
         lambda_chamfer=args.lambda_chamfer,
+        cd_sampling=args.cd_sampling, cd_grid_res=args.cd_grid_res,
         lambda_ddf=args.lambda_ddf,
         ddf_mu_decay=args.ddf_mu_decay,
         ddf_start_epoch=args.ddf_start_epoch,
@@ -2669,10 +3560,27 @@ def run_adaptive(args):
         normal_off_frac=args.normal_off_frac,
         ext_mask_epoch=args.ext_mask_epoch, ext_mask_every=args.ext_mask_every,
         ext_mode=args.ext_mode, ext_cd_weight=args.ext_cd_weight,
+        lambda_ext_area=args.lambda_ext_area,
+        lambda_render=args.lambda_render,
+        render_start_epoch=args.render_start_epoch,
+        render_warmup_epochs=args.render_warmup_epochs,
+        render_every=args.render_every,
+        render_views=args.render_views,
+        render_batch=args.render_batch,
+        render_resolution=args.render_resolution,
+        render_mesh_res=args.render_mesh_res,
+        render_laplacian_weight=args.render_laplacian_weight,
+        render_min_coverage=args.render_min_coverage,
+        render_preview=args.render_preview,
+        render_view_clip=args.render_view_clip,
+        render_pixel_clip=args.render_pixel_clip,
+        render_layers=args.render_layers,
+        render_far_weight=args.render_far_weight,
         ext_kwargs={'resolution': args.ext_resolution, 'nn_scale': args.ext_nn_scale,
                     'max_area_frac': args.ext_max_area_frac,
                     'min_opening_vertices': args.ext_min_opening_vertices,
-                    'weld_tol': args.ext_weld_tol, 'face_res': args.ext_face_res})
+                    'weld_tol': args.ext_weld_tol, 'face_res': args.ext_face_res},
+        tb_writer=tb_writer)
 
     # ── final outputs ────────────────────────────────────────────────────
     model.eval()
@@ -2680,9 +3588,13 @@ def run_adaptive(args):
     print(f"  Final seam check: max gap={seam['max_gap']:.3e}  "
           f"mean gap={seam['mean_gap']:.3e}")
 
-    visualize_patch_configuration(
-        model, os.path.join(result_dir, 'patch_config_final.png'), pts=pts3n)
-    plot_history(history, os.path.join(result_dir, 'history.png'))
+    final_config_png = os.path.join(result_dir, 'patch_config_final.png')
+    visualize_patch_configuration(model, final_config_png, pts=pts3n)
+    _tb_log_image(tb_writer, 'figures/patch_config_final',
+                  final_config_png, args.epochs)
+    history_png = os.path.join(result_dir, 'history.png')
+    plot_history(history, history_png)
+    _tb_log_image(tb_writer, 'figures/history', history_png, args.epochs)
 
     verts, faces = utils.sample_multi_patch_grid(
         model, resolution=args.mesh_res, device=args.device)
@@ -2693,6 +3605,7 @@ def run_adaptive(args):
                      os.path.join(result_dir, 'learned_sheet.ply'))
     utils.export_obj(verts_orig, faces,
                      os.path.join(result_dir, 'learned_sheet.obj'))
+    _tb_log_mesh(tb_writer, 'mesh/learned_sheet', verts, faces, step=args.epochs)
     if args.save_vertex_pos_every > 0 and os.path.exists(vertex_pos_json_path):
         utils.write_denormalized_vertex_positions_json(
             normalized_json_path=vertex_pos_json_path,
@@ -2705,10 +3618,16 @@ def run_adaptive(args):
                   'subdivision_events': events, 'seam_check': seam})
     _adaptive_save_ckpt(model, os.path.join(result_dir, 'checkpoint.pt'), extra)
 
-    with open(os.path.join(result_dir, 'metadata.json'), 'w') as f:
-        json.dump({'config': run_config, 'subdivision_events': events,
-                   'final_stats': model.complex.stats(),
-                   'seam_check': seam}, f, indent=2)
+    metadata.update({
+        'subdivision_events': events,
+        'final_stats': model.complex.stats(),
+        'seam_check': seam,
+        'status': 'completed',
+        'completed_at': _timestamp(),
+    })
+    _write_json_atomic(metadata_path, metadata)
+    print(f"  Metadata → {metadata_path}")
+    _tb_close(tb_writer)
     print(f"  Run complete → {result_dir}")
 
 
@@ -2738,6 +3657,9 @@ def main():
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--log_every', type=int, default=200)
+    parser.add_argument('--tensorboard', action='store_true', default=False,
+                        help='Log training scalars, final figures and the learned mesh '
+                             'to <result_dir>/tensorboard for TensorBoard')
     parser.add_argument('--multi_patch', action='store_true', default=True,
                         help='Use multi-patch feature complex mode')
     parser.add_argument('--atlas_mode', type=str, default='single_sheet',
@@ -2752,6 +3674,9 @@ def main():
                              'shared options it does use.')
 
     # Shared hparam
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Seed Python/NumPy/PyTorch RNGs for reproducible runs '
+                             '(default: unseeded)')
     parser.add_argument('--epochs', type=int, default=5000)
     parser.add_argument('--M', type=int, default=4096,
                         help='[Single-patch] # UV surface samples per training step')
@@ -2894,6 +3819,16 @@ def main():
                                 'post-corr_switch_epoch MSE phase) and requires --no_presplit.')
     ddf_group.add_argument('--lambda_chamfer', type=float, default=1.0,
                            help='[CD+DDF] Weight for the Chamfer term when --surface_loss_type=cd_ddf')
+    ddf_group.add_argument('--cd_sampling', type=str, default='random',
+                           choices=['random', 'grid'],
+                           help='[Adaptive] How the Chamfer term samples each leaf. '
+                                "'random' draws fresh UVs every step (original); "
+                                "'grid' evaluates a fixed R x R UV grid per leaf, so "
+                                'the CD changes only when the surface does. The grid '
+                                'is used by CD only; the target subset stays random')
+    ddf_group.add_argument('--cd_grid_res', type=int, default=0,
+                           help='[Adaptive, --cd_sampling grid] Vertices per patch '
+                                'edge (0 = round(sqrt(M_per_patch)), e.g. 8 for 64)')
     ddf_group.add_argument('--lambda_ddf', type=float, default=1.0,
                            help='[CD+DDF] Weight for the DDF term when --surface_loss_type=ddf or cd_ddf')
     ddf_group.add_argument('--ddf_start_epoch', type=int, default=0,
@@ -2925,6 +3860,56 @@ def main():
     ddf_group.add_argument('--save_ddf_reference_every', type=int, default=1000,
                            help='[DDF] Save reference-point debug CSV/PLY/PNG every N epochs (0 disables)')
 
+    # NGF front-layer rendering loss (fixed-grid and adaptive atlases)
+    render_group = parser.add_argument_group(
+        'NGF rendering loss (fixed-grid and adaptive)')
+    render_group.add_argument('--lambda_render', type=float, default=0.0,
+                              help='Weight of NGF\'s unweighted [normal, position] render loss '
+                                   '(0 disables it; CUDA + nvdiffrast required when > 0). '
+                                   'With --adaptive it replaces Chamfer as the surface term.')
+    render_group.add_argument('--render_start_epoch', type=int, default=None,
+                              help='Epoch after which the render term turns on '
+                                   '(default: 500 fixed-grid, 0 adaptive = first post-pretrain epoch)')
+    render_group.add_argument('--render_warmup_epochs', type=int, default=None,
+                              help='Epochs over which the render weight ramps to --lambda_render '
+                                   '(default: 500 fixed-grid, 0 adaptive)')
+    render_group.add_argument('--render_every', type=int, default=1,
+                              help='Evaluate the render term every N epochs')
+    render_group.add_argument('--render_views', type=int, default=16,
+                              help='Number of orbit reference views rendered from the point cloud')
+    render_group.add_argument('--render_batch', type=int, default=2,
+                              help='Reference views rendered per optimization step (round-robin)')
+    render_group.add_argument('--render_resolution', type=int, default=256,
+                              help='Square rendering resolution for both reference and model renders')
+    render_group.add_argument('--render_mesh_res', type=int, default=0,
+                              help='UV samples per patch side used for the render mesh '
+                                   '(0 = auto, ~30k vertices total; otherwise 2..64)')
+    render_group.add_argument('--render_laplacian_weight', type=float, default=0.0,
+                              help="Weight of NGF's uniform-Laplacian term on the render mesh "
+                                   '(NGF trains with 1.0; 0 disables it)')
+    render_group.add_argument('--render_min_coverage', type=float, default=0.1,
+                              help='Drop orbit views whose point-cloud coverage falls below this '
+                                   'fraction (near-empty views carry no useful target)')
+    render_group.add_argument('--render_preview', type=int, default=4,
+                              help='Save this many reference-target previews to '
+                                   '<result>/render_targets (0 disables)')
+    render_group.add_argument('--render_view_clip', type=float, default=0.0,
+                              help='Robust per-view render loss: cap each view mean at '
+                                   'this factor times the batch median view error '
+                                   '(0 = original unclipped NGF loss)')
+    render_group.add_argument('--render_pixel_clip', type=float, default=0.0,
+                              help='Robust per-pixel render loss: cap each covered pixel '
+                                   'error at this factor times the median covered-pixel '
+                                   'error (0 = original unclipped NGF loss)')
+    render_group.add_argument('--render_layers', type=int, default=1,
+                              help='Depth-peeled surfaces supervised: 1 = NGF front layer '
+                                   'only; 2..4 peel the point-cloud target and remove '
+                                   'hit triangles in the model render, supervising the '
+                                   'surfaces behind the visible shell (adaptive only)')
+    render_group.add_argument('--render_far_weight', type=float, default=0.5,
+                              help='Loss weight of every layer behind the front one '
+                                   '(layer 1 keeps weight 1.0)')
+
     # Adaptive quadtree cube atlas (only used with --adaptive)
     adaptive_group = parser.add_argument_group('adaptive cube atlas (--adaptive)')
     adaptive_group.add_argument('--base_subdivisions', type=int, default=1,
@@ -2938,8 +3923,8 @@ def main():
                                 help='[Adaptive] Resume topology+weights from an adaptive '
                                      'checkpoint (skips pretraining)')
 
-    adaptive_group.add_argument('--save_vertex_pos_every', type=int, default=10,
-                            help='[Adaptive] Save tracked logical vertex positions every N epochs (0 disables)')
+    adaptive_group.add_argument('--save_vertex_pos_every', type=int, default=0,
+                            help='[Adaptive] Save tracked logical vertex positions every N epochs (0 disables; the JSON grows quadratically and rewrites every save)')
 
     # GHPR warm start: small box at an interior viewpoint, fitted to the
     # visible (star-shaped) subset first, then to the full cloud.
@@ -3083,6 +4068,11 @@ def main():
                                 'samples, in both directions: their own distance to the cloud, '
                                 'and that of every cloud point whose nearest sample is in the '
                                 'extension (1 = same as the rest)')
+    ext_group.add_argument('--lambda_ext_area', type=float, default=0.0,
+                           help='[Adaptive] Weight of the extension-area penalty: the mean '
+                                '||dF/du x dF/dv|| over samples inside detected extensions, '
+                                'which shrinks their 3D area (0 = off; requires '
+                                '--ext_mask_epoch > 0)')
     ext_group.add_argument('--ext_mask_every', type=int, default=0,
                            help='[Adaptive] Re-detect every N epochs after --ext_mask_epoch '
                                 '(0 = detect once and keep that mask)')
@@ -3122,6 +4112,23 @@ def main():
     subdiv_group.add_argument('--distortion_samples', type=int, default=128)
     subdiv_group.add_argument('--max_splits_per_round', type=int, default=0,
                               help='Cap leaves split per check (0 = unlimited)')
+    subdiv_group.add_argument('--subdiv_metric', type=str, default='distortion',
+                              choices=['distortion', 'cd'],
+                              help='What drives subdivision: geometric distortion '
+                                   '(original) or per-leaf Chamfer error against the '
+                                   'full cloud')
+    subdiv_group.add_argument('--subdiv_cd_threshold', type=float, default=0.0,
+                              help='[--subdiv_metric cd] Split leaves whose '
+                                   'fwd+bwd Chamfer score exceeds this (0 disables '
+                                   'subdivision)')
+    subdiv_group.add_argument('--subdiv_cd_grid_res', type=int, default=8,
+                              help='[--subdiv_metric cd] Grid resolution per leaf '
+                                   'used to score the CD; ignored when '
+                                   '--cd_sampling grid reuses its grid')
+    subdiv_group.add_argument('--subdiv_cd_min_valid_frac', type=float, default=0.25,
+                              help='[--subdiv_metric cd] Skip leaves with less than '
+                                   'this fraction of samples outside detected '
+                                   'extension openings')
 
     # Stage 2: swap in the adaptive defaults BEFORE parsing, so anything the
     # user typed explicitly still overrides them.
@@ -3129,6 +4136,86 @@ def main():
         parser.set_defaults(**ADAPTIVE_DEFAULTS)
 
     args = parser.parse_args()
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        print(f"  Seeding Python/NumPy/PyTorch RNGs with {args.seed}")
+
+    if args.lambda_ext_area > 0 and not args.adaptive:
+        parser.error(
+            "--lambda_ext_area is only supported with --adaptive: extension masks "
+            "are detected on the adaptive cube atlas.")
+
+    if args.cd_sampling == 'grid' and not args.adaptive:
+        parser.error(
+            "--cd_sampling grid is only implemented for --adaptive; the "
+            "fixed-grid pipeline keeps its random UV sampling.")
+
+    if args.subdiv_metric == 'cd' and not args.adaptive:
+        parser.error(
+            "--subdiv_metric cd is only implemented for --adaptive: the "
+            "fixed-grid pipeline has no quadtree to subdivide.")
+
+    # Adaptive runs start the render term at the first post-pretrain epoch:
+    # the box itself is the initialization, so there is no reason to spend
+    # epochs without a surface fit.  The fixed-grid default stays at 500.
+    if args.render_start_epoch is None:
+        args.render_start_epoch = 0 if args.adaptive else 500
+    if args.render_warmup_epochs is None:
+        args.render_warmup_epochs = 0 if args.adaptive else 500
+
+    if args.lambda_render > 0:
+        if args.adaptive:
+            if args.surface_loss_type != 'chamfer':
+                parser.error(
+                    "--lambda_render with --adaptive replaces the Chamfer "
+                    "surface term, so --surface_loss_type must stay 'chamfer' "
+                    f"(got {args.surface_loss_type!r}).")
+            if args.render_every != 1:
+                parser.error(
+                    "--render_every must be 1 with --adaptive: the render loss "
+                    "is the only surface-fitting term.")
+        else:
+            if not args.multi_patch:
+                parser.error("--lambda_render > 0 requires --multi_patch.")
+            if args.atlas_mode not in ('single_sheet', 'six_sheet'):
+                parser.error(
+                    "--lambda_render currently supports --atlas_mode single_sheet and "
+                    f"the box-initialized six_sheet, got {args.atlas_mode!r}.")
+            if args.atlas_mode == 'six_sheet' and not args.no_presplit:
+                parser.error(
+                    "--lambda_render with --atlas_mode six_sheet requires "
+                    "--no_presplit: the six-sheet atlas is trained against the full "
+                    "point cloud.")
+        if args.render_every < 1:
+            parser.error("--render_every must be >= 1.")
+        if args.render_resolution < 16:
+            parser.error("--render_resolution must be >= 16.")
+        if args.render_mesh_res != 0 and not (2 <= args.render_mesh_res <= 64):
+            parser.error("--render_mesh_res must be 0 (auto) or between 2 and 64.")
+        if not (0.0 <= args.render_min_coverage <= 1.0):
+            parser.error("--render_min_coverage must be in [0, 1].")
+        if args.render_view_clip < 0:
+            parser.error("--render_view_clip must be >= 0.")
+        if args.render_view_clip > 0 and not args.adaptive:
+            parser.error(
+                "--render_view_clip is currently implemented for --adaptive only.")
+        if args.render_pixel_clip < 0:
+            parser.error("--render_pixel_clip must be >= 0.")
+        if args.render_pixel_clip > 0 and not args.adaptive:
+            parser.error(
+                "--render_pixel_clip is currently implemented for --adaptive only.")
+        if not 1 <= args.render_layers <= 4:
+            parser.error("--render_layers must be in [1, 4].")
+        if args.render_layers > 1 and not args.adaptive:
+            parser.error(
+                "--render_layers > 1 is currently implemented for --adaptive only.")
+        if args.render_far_weight < 0:
+            parser.error("--render_far_weight must be >= 0.")
 
     if args.adaptive:
         return run_adaptive(args)
@@ -3178,6 +4265,16 @@ def main():
 
     # Validate normals
     normals = meta.get('normals', None)
+    if args.lambda_render > 0 and normals is None:
+        parser.error(
+            "--lambda_render > 0 needs per-point normals for the reference "
+            "render targets, but the input cloud has none. Estimate them with "
+            "estimate_normals.py or disable the render loss.")
+    if args.lambda_render > 0:
+        if normals.shape[0] != pts3n.shape[0]:
+            parser.error(
+                f"--lambda_render: normals count ({normals.shape[0]}) != points "
+                f"count ({pts3n.shape[0]}).")
 
     if args.gamma > 0:
         if normals is None:
@@ -3220,6 +4317,7 @@ def main():
     pretrain_ckpt_path = os.path.join(result_dir, 'pretrain_checkpoint.pt')
 
     print(f"  Output directory: {result_dir}")
+    tb_writer = _create_tb_writer(result_dir, args.tensorboard, args)
     run_config = build_run_config(args)
     write_run_config(result_dir, run_config)
 
@@ -3268,6 +4366,7 @@ def main():
                 six_sheet_face_rows=args.six_sheet_face_rows,
                 six_sheet_face_cols=args.six_sheet_face_cols,
                 face_aware_box_supervision=args.face_aware_box_supervision,
+                tb_writer=tb_writer,
             )
         else:
             F_model, pretrain_history = pretrain_multi_patch_flat_sheet(
@@ -3286,8 +4385,7 @@ def main():
                 atlas_mode=args.atlas_mode,
                 two_sheet_side_rows=args.two_sheet_side_rows,
                 two_sheet_side_cols=args.two_sheet_side_cols,
-                six_sheet_face_rows=args.six_sheet_face_rows,
-                six_sheet_face_cols=args.six_sheet_face_cols,
+                tb_writer=tb_writer,
             )
         F_model.eval()
         pretrained_F_state = {
@@ -3303,6 +4401,8 @@ def main():
             active_patch_ids=list(range(F_model.n_patches)),
         )
         utils.export_ply(verts, faces, init_ply_path)
+        _tb_log_mesh(tb_writer, 'mesh/initialized_sheet', verts, faces,
+                     step=args.pretrain_epochs)
 
         torch.save({
             'mode': 'multi_patch_pretrain_flat_sheet' if pretrain_mode == 'flat' else 'multi_patch_pretrain_closed_shape',
@@ -3322,6 +4422,7 @@ def main():
             print(f"    {init_ply_path}     — initialized flat-sheet mesh")
             print(f"    {pretrain_ckpt_path}         — pretrained forward-map weights")
             print(f"{'='*60}\n")
+            _tb_close(tb_writer)
             return
 
         print(f"\n{'='*60}")
@@ -3414,6 +4515,18 @@ def main():
             ddf_resample_every=args.ddf_resample_every,
             ddf_chunk_size=args.ddf_chunk_size,
             save_ddf_reference_every=args.save_ddf_reference_every,
+            tb_writer=tb_writer,
+            lambda_render=args.lambda_render,
+            render_start_epoch=args.render_start_epoch,
+            render_warmup_epochs=args.render_warmup_epochs,
+            render_every=args.render_every,
+            render_views=args.render_views,
+            render_batch=args.render_batch,
+            render_resolution=args.render_resolution,
+            render_mesh_res=args.render_mesh_res,
+            render_min_coverage=args.render_min_coverage,
+            render_preview=args.render_preview,
+            render_laplacian_weight=args.render_laplacian_weight,
         )
         F_model.eval()
         if G_model is not None:
@@ -3429,6 +4542,8 @@ def main():
             resolution=args.mesh_res, device=args.device,
             active_patch_ids=active_ids,
         )
+        _tb_log_image(tb_writer, 'figures/result', result_png, args.epochs)
+        _tb_log_mesh(tb_writer, 'mesh/learned_sheet', verts, faces, step=args.epochs)
 
         torch.save({
             'mode': 'multi_patch',
@@ -3473,6 +4588,7 @@ def main():
     print(f"    {ckpt_path}         — model weights + normalization transform")
     print(f"    {result_log}        — hyperparams + loss log")
     print(f"{'='*60}\n")
+    _tb_close(tb_writer)
 
 
 if __name__ == '__main__':

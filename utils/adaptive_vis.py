@@ -128,8 +128,9 @@ def plot_history(history, out_path):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
     ep = history['epoch']
     for key, color in (('cd', '#58a6ff'), ('ddf', '#39c5cf'),
-                       ('tangent', '#d2a8ff'),
+                       ('tangent', '#d2a8ff'), ('ext_area', '#ff9f43'),
                        ('svd', '#e3b341'), ('normal', '#f778ba'),
+                       ('render', '#79c0ff'),
                        ('total', '#f78166'), ('loss', '#3fb950')):
         if key in history and len(history[key]) == len(ep):
             # A term that is inactive for part of the run logs exact zeros (e.g.
