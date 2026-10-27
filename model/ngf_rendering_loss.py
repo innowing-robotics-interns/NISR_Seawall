@@ -16,10 +16,11 @@ splatter) can be consumed directly.
 
 A point cloud observes only the front surface, so the default path rasterizes
 one layer.  ``NGFRenderer.render_layers`` and the ``layers=`` argument of
-``ngf_rendering_loss`` add NGF's depth-peeling variant: hit triangles are
-removed after each pass, later passes supervise the surfaces behind them, and
-the reference must carry ``6 * layers`` channels (the point-cloud target
-builds them with ``build_render_targets(..., num_layers=...)``).
+``ngf_rendering_loss`` add NGF's depth-peeling variant: ``dr.DepthPeeler``
+yields the next depth layer after each pass, later passes supervise the
+surfaces behind them, and the reference must carry ``6 * layers`` channels
+(the point-cloud target builds them with
+``build_render_targets(..., num_layers=...)``).
 
 The module is wired into ``train_multi_patch`` behind ``--lambda_render``
 (fixed-grid single-sheet atlas only). ``nvdiffrast`` is imported lazily because
@@ -105,12 +106,12 @@ class NGFRenderer:
         face removal are discrete (as in NGF); gradients flow into the positions
         and normals of the triangles selected by each pass.
 
-        Peeling is done per view, not across the batch: a triangle that is the
-        front surface in view A can be a legitimate back surface in view B, so
-        a batch-wide removal would silently drop it from B's second layer.
-        Removal is still per triangle, not per pixel, which is the standard
-        peeling approximation and is why the second layer must be validated
-        against the point-cloud target before it is trusted.
+        ``dr.DepthPeeler`` peels each view independently within one batched
+        call: a triangle that is the front surface in view A remains available
+        as a back surface in view B.  Removal is per triangle, not per pixel,
+        which is the standard peeling approximation and is why the second
+        layer must be validated against the point-cloud target before it is
+        trusted.
         """
         if views.ndim != 3 or views.shape[-2:] != (4, 4):
             raise ValueError(f'views must be (B, 4, 4), got {tuple(views.shape)}')
@@ -142,38 +143,19 @@ class NGFRenderer:
                 dr.interpolate(vertices, rast, faces)[0], rast, v_ndc, faces)
             return [torch.cat([rendered_normals, rendered_positions], dim=-1)]
 
-        per_view = [[] for _ in range(layers)]
-        for batch_index in range(views.shape[0]):
-            view_ndc = v_ndc[batch_index:batch_index + 1]
-            remaining = faces
-            for layer in range(layers):
-                if remaining.shape[0] == 0:
-                    per_view[layer].append(torch.zeros(
-                        (1, *self.res, 6), device=device,
-                        dtype=vertices.dtype))
-                    continue
-                rast = dr.rasterize(self.ctx, view_ndc, remaining,
-                                    self.res)[0]
+        channels = []
+        with dr.DepthPeeler(self.ctx, v_ndc, faces, self.res) as peeler:
+            for _ in range(layers):
+                rast, _ = peeler.rasterize_next_layer()
                 rendered_normals = dr.antialias(
-                    dr.interpolate(normals, rast, remaining)[0],
-                    rast, view_ndc, remaining)
+                    dr.interpolate(normals, rast, faces)[0],
+                    rast, v_ndc, faces)
                 rendered_positions = dr.antialias(
-                    dr.interpolate(vertices, rast, remaining)[0],
-                    rast, view_ndc, remaining)
-                per_view[layer].append(torch.cat(
+                    dr.interpolate(vertices, rast, faces)[0],
+                    rast, v_ndc, faces)
+                channels.append(torch.cat(
                     [rendered_normals, rendered_positions], dim=-1))
-
-                ids = rast[..., 3].long()
-                hit = torch.unique(ids[ids > 0]) - 1
-                if hit.numel() == 0:
-                    remaining = remaining[:0]
-                    continue
-                keep_face = torch.ones(remaining.shape[0], dtype=torch.bool,
-                                       device=device)
-                keep_face[hit] = False
-                remaining = remaining[keep_face]
-
-        return [torch.cat(view_maps, dim=0) for view_maps in per_view]
+        return channels
 
 
 class UniformLaplacian:

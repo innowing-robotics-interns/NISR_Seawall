@@ -33,7 +33,8 @@ from model.losses import (chamfer_distance, chamfer_distance_chunked, directiona
 from model.model import (MultiPatchForwardMap, MultiPatchInverseMap, TwoSheetForwardMap, SixSheetForwardMap,
                          AdaptiveCubeForwardMap)
 from model.correspondence import build_hard_correspondence
-from model.subdivision import subdivide_by_distortion, check_seam_continuity
+from model.subdivision import (subdivide_by_distortion, subdivide_by_cd,
+                               check_seam_continuity)
 from utils.adaptive_vis import visualize_patch_configuration, plot_history
 from utils.ghpr import (ghpr_from_points, ghpr_visible, keep_connected,
                         median_nn_spacing, write_classified_ply)
@@ -1991,11 +1992,17 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    distortion_samples, max_splits_per_round,
                    device, log_every, vis_dir, checkpoint_every,
                    checkpoint_extra=None,
+                   subdiv_metric: str = 'distortion',
+                   subdiv_cd_threshold: float = 0.0,
+                   subdiv_cd_grid_res: int = 8,
+                   subdiv_cd_min_valid_frac: float = 0.25,
                    tangent_mode='symmetric_dirichlet', sym_dirichlet_epoch=0,
+                   reg_every: int = 1,
                     save_vertex_pos_every: int = 0,
                    vertex_pos_json_path: str = None,
                    surface_loss_type: str = 'chamfer',
                    lambda_chamfer: float = 1.0,
+                   cd_sampling: str = 'random', cd_grid_res: int = 0,
                    lambda_ddf: float = 1.0,
                    ddf_mu_decay: float = 1.0,
                    ddf_start_epoch: int = 0,
@@ -2100,6 +2107,34 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     if surface_loss_type not in ('chamfer', 'ddf', 'cd_ddf'):
         raise ValueError(f"Unknown surface_loss_type: {surface_loss_type}. "
                          f"Use 'chamfer', 'ddf', or 'cd_ddf'.")
+    if cd_sampling not in ('random', 'grid'):
+        raise ValueError(
+            f"cd_sampling must be 'random' or 'grid', got {cd_sampling!r}")
+    if cd_sampling == 'grid':
+        # Default to the same sample count as the random path.
+        if cd_grid_res == 0:
+            cd_grid_res = int(round(math.sqrt(M_per_patch)))
+        if not 2 <= cd_grid_res <= 64:
+            raise ValueError(
+                f"cd_grid_res must be 0 (auto) or in [2, 64], got "
+                f"{cd_grid_res}")
+    if subdiv_metric not in ('distortion', 'cd'):
+        raise ValueError(
+            f"subdiv_metric must be 'distortion' or 'cd', got "
+            f"{subdiv_metric!r}")
+    if subdiv_metric == 'cd':
+        if subdiv_cd_threshold < 0:
+            raise ValueError(
+                f"subdiv_cd_threshold must be >= 0 (0 disables splitting), "
+                f"got {subdiv_cd_threshold}")
+        if not 2 <= subdiv_cd_grid_res <= 64:
+            raise ValueError(
+                f"subdiv_cd_grid_res must be in [2, 64], got "
+                f"{subdiv_cd_grid_res}")
+        if not 0.0 <= subdiv_cd_min_valid_frac <= 1.0:
+            raise ValueError(
+                f"subdiv_cd_min_valid_frac must be in [0, 1], got "
+                f"{subdiv_cd_min_valid_frac}")
     if lambda_render < 0:
         raise ValueError(f"lambda_render must be >= 0, got {lambda_render}")
     if render_start_epoch < 0 or render_warmup_epochs < 0:
@@ -2212,6 +2247,29 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     ext_mask = None
     zero = torch.tensor(0.0, device=device)
     need_jac = (mu > 0) or (lam_svd > 0) or use_normal or (lambda_ext_area > 0)
+
+    # Fixed per-leaf UV grid for deterministic Chamfer sampling.
+    cd_grid_uv = None
+    if cd_sampling == 'grid':
+        from utils.render_mesh import uv_grid
+        cd_grid_uv = uv_grid(cd_grid_res, device)
+    history['cd_sampling'] = cd_sampling
+    history['cd_grid_res'] = cd_grid_res
+
+    # Fixed UV grid used to score leaves for CD-driven subdivision.  When the
+    # CD loss already uses a grid, reuse it so training and splitting measure
+    # the same quantity.
+    subdiv_cd_uv = None
+    if subdiv_metric == 'cd':
+        if cd_grid_uv is not None:
+            subdiv_cd_uv = cd_grid_uv
+        else:
+            from utils.render_mesh import uv_grid
+            subdiv_cd_uv = uv_grid(subdiv_cd_grid_res, device)
+    history['subdiv_metric'] = subdiv_metric
+    if subdiv_metric == 'cd':
+        history['subdiv_cd_threshold'] = subdiv_cd_threshold
+        history['subdiv_cd_grid_res'] = int(subdiv_cd_uv.shape[0] ** 0.5)
 
     # ── NGF render supervision ──────────────────────────────────────────────
     # With lambda_render > 0 the render term REPLACES Chamfer as the surface
@@ -2338,14 +2396,31 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                   f"Use --lr 1e-4 to 2e-4 for the first render-only stage.")
 
     print(f"\n{'─' * 60}")
-    print("  Phase 2 — adaptive training with distortion-driven subdivision")
+    _subdiv_label = ('CD-driven' if subdiv_metric == 'cd'
+                     else 'distortion-driven')
+    print(f"  Phase 2 — adaptive training with {_subdiv_label} subdivision")
     print(f"  leaves={model.n_patches}  target points={pts3n.shape[0]}")
-    print(f"  subdiv: threshold={subdiv_threshold}  max_depth={subdiv_max_depth}  "
-          f"every={subdiv_every}  start={subdiv_start}  mode={distortion_mode}")
+    if subdiv_metric == 'cd':
+        print(f"  subdiv: CD threshold={subdiv_cd_threshold:g}  "
+              f"grid={int(subdiv_cd_uv.shape[0] ** 0.5)}×"
+              f"{int(subdiv_cd_uv.shape[0] ** 0.5)} per leaf  "
+              f"max_depth={subdiv_max_depth}  every={subdiv_every}  "
+              f"start={subdiv_start}  (score=fwd+bwd vs full cloud, "
+              f"min_valid_frac={subdiv_cd_min_valid_frac:g}; "
+              f"--subdiv_threshold/distortion ignored)")
+    else:
+        print(f"  subdiv: threshold={subdiv_threshold}  max_depth={subdiv_max_depth}  "
+              f"every={subdiv_every}  start={subdiv_start}  mode={distortion_mode}")
     if stages and ghpr_subdiv_max_depth is not None:
         print(f"  subdiv max_depth during GHPR stages (epochs 1-{n_stage_epochs}): "
               f"{ghpr_subdiv_max_depth}")
     print(f"  epochs={epochs}  M_per_patch={M_per_patch}  lr={lr}  μ={mu}")
+    if cd_sampling == 'grid':
+        print(f"  CD sampling: fixed {cd_grid_res}×{cd_grid_res} grid per leaf "
+              f"({model.n_patches * cd_grid_res ** 2} points now; random target "
+              f"subset)")
+    else:
+        print(f"  CD sampling: {M_per_patch} random points per leaf per step")
     if use_ddf_at_all:
         window = (f"epochs {max(ddf_start_epoch, 1)}-{chamfer_resume_epoch - 1}"
                   if chamfer_resume_epoch > 0
@@ -2447,7 +2522,9 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
 
     for epoch in range(1, epochs + 1):
         # ── subdivision check ────────────────────────────────────────────
-        do_check = (subdiv_threshold > 0 and subdiv_every > 0
+        subdiv_enabled = (subdiv_threshold > 0 if subdiv_metric == 'distortion'
+                          else subdiv_cd_threshold > 0)
+        do_check = (subdiv_enabled and subdiv_every > 0
                     and epoch >= subdiv_start
                     and (subdiv_stop <= 0 or epoch <= subdiv_stop)
                     and epoch % subdiv_every == 0)
@@ -2458,14 +2535,29 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                          if ghpr_subdiv_max_depth is not None and epoch <= n_stage_epochs
                          else subdiv_max_depth)
             old_vf = model.complex.vertex_features
-            rep = subdivide_by_distortion(
-                model, subdiv_threshold, max_depth,
-                samples_per_patch=distortion_samples, mode=distortion_mode,
-                max_splits_per_round=max_splits_per_round)
-            print(f"  [subdiv @ {epoch}] distortion max={rep['max_distortion']:.4f} "
-                  f"mean={rep['mean_distortion']:.4f}  split={rep['n_subdivided']} "
-                  f"→ leaves={rep['n_leaves']} vertices={rep['n_vertices']}  "
-                  f"max_depth={max_depth}")
+            if subdiv_metric == 'cd':
+                rep = subdivide_by_cd(
+                    model, pts_dev, subdiv_cd_uv, subdiv_cd_threshold,
+                    max_depth, max_splits_per_round=max_splits_per_round,
+                    ext_mask=ext_mask,
+                    min_valid_frac=subdiv_cd_min_valid_frac)
+                print(f"  [subdiv @ {epoch}] CD max={rep['cd_max']:.4f} "
+                      f"p90={rep['cd_p90']:.4f} mean={rep['cd_mean']:.4f}  "
+                      f"threshold={subdiv_cd_threshold:g}  "
+                      f"split={rep['n_subdivided']}/{rep['n_eligible']} "
+                      f"→ leaves={rep['n_leaves']} vertices={rep['n_vertices']}  "
+                      f"max_depth={max_depth}"
+                      + (f"  ext_skipped={rep['ext_skipped']}"
+                         if rep['ext_skipped'] else ""))
+            else:
+                rep = subdivide_by_distortion(
+                    model, subdiv_threshold, max_depth,
+                    samples_per_patch=distortion_samples, mode=distortion_mode,
+                    max_splits_per_round=max_splits_per_round)
+                print(f"  [subdiv @ {epoch}] distortion max={rep['max_distortion']:.4f} "
+                      f"mean={rep['mean_distortion']:.4f}  split={rep['n_subdivided']} "
+                      f"→ leaves={rep['n_leaves']} vertices={rep['n_vertices']}  "
+                      f"max_depth={max_depth}")
             if rep['n_subdivided'] > 0:
                 # vertex_features was replaced → rebuild optimizer/scheduler,
                 # carrying the Adam moments over so the surface isn't kicked.
@@ -2473,9 +2565,14 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 opt, sched = _adaptive_make_optim(model, cur_lr, epochs - epoch + 1,
                                                   prev_opt=opt,
                                                   prev_vertex_features=old_vf)
-                events.append({'epoch': epoch,
-                               'n_subdivided': rep['n_subdivided'],
-                               'n_leaves': rep['n_leaves']})
+                event = {'epoch': epoch,
+                         'n_subdivided': rep['n_subdivided'],
+                         'n_leaves': rep['n_leaves'],
+                         'subdiv_metric': subdiv_metric}
+                if subdiv_metric == 'cd':
+                    event['cd_max'] = rep['cd_max']
+                    event['cd_mean'] = rep['cd_mean']
+                events.append(event)
 
             visualize_patch_configuration(
                 model, os.path.join(vis_dir, f'patch_config_{epoch:05d}.png'),
@@ -2539,6 +2636,15 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 render_topology_key = topology_key
 
         K = model.n_patches
+        use_ddf = (not render_active and use_ddf_at_all
+                   and epoch >= ddf_start_epoch
+                   and (chamfer_resume_epoch <= 0 or epoch < chamfer_resume_epoch))
+        cd_in_loss = ((not render_active)
+                      and ((not use_ddf) or surface_loss_type == 'cd_ddf'))
+        # With a render term the CD is a monitor only, evaluated on log epochs;
+        # otherwise it is part of every step.
+        cd_due = (not render_active) or epoch % log_every == 0 or epoch == 1
+
         pids = torch.arange(K, device=device).repeat_interleave(M_per_patch)
         uv = torch.rand(K * M_per_patch, 2, device=device,
                         requires_grad=need_jac)
@@ -2558,9 +2664,30 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         ridx = torch.randint(0, pool.shape[0], (B,), device=device)
         tgt = pool[ridx]
 
-        use_ddf = (not render_active and use_ddf_at_all
-                   and epoch >= ddf_start_epoch
-                   and (chamfer_resume_epoch <= 0 or epoch < chamfer_resume_epoch))
+        # Chamfer sampling.  'random' draws fresh UVs every step (the original
+        # behaviour); 'grid' evaluates the same fixed R x R grid on every leaf,
+        # so the CD changes only because the surface did.  The grid is used for
+        # the CD alone -- the tangent/SVD/normal terms keep their random draws,
+        # and the target subset above stays stochastic.
+        Q_cd_fit, cd_w_cd = Q_fit, cd_w
+        if cd_sampling == 'grid' and cd_due:
+            n_grid = cd_grid_uv.shape[0]
+            cd_pids = torch.arange(K, device=device).repeat_interleave(n_grid)
+            cd_uv = cd_grid_uv.repeat(K, 1)
+            if cd_in_loss:
+                Q_cd = model(cd_pids, cd_uv)
+            else:
+                with torch.no_grad():
+                    Q_cd = model(cd_pids, cd_uv)
+            cd_fit = None
+            cd_w_cd = None
+            if ext_mask is not None:
+                in_ext_cd = ext_mask.excluded(model, cd_pids, cd_uv)
+                if ext_mode == 'no_fit':
+                    cd_fit = ~in_ext_cd
+                cd_w_cd = (1.0 + (ext_cd_weight - 1.0) * in_ext_cd.float()
+                           if use_ext_cd_weight else None)
+            Q_cd_fit = Q_cd if cd_fit is None else Q_cd[cd_fit]
 
         if use_ddf:
             pool_changed = ddf_ref_pool is not pool
@@ -2600,21 +2727,20 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         render_loss = zero
         render_parts = None
         if render_active:
-            cd_in_loss = False
-            if epoch % log_every == 0 or epoch == 1:
+            if cd_due:
                 with torch.no_grad():
                     cd_loss = chamfer_distance_chunked(
-                        Q_fit, tgt, chunk_size=2048, p_weights=cd_w)
+                        Q_cd_fit, tgt, chunk_size=2048, p_weights=cd_w_cd)
             else:
                 cd_loss = zero
         else:
-            cd_in_loss = (not use_ddf) or surface_loss_type == 'cd_ddf'
             if cd_in_loss:
-                cd_loss = chamfer_distance_chunked(Q_fit, tgt, chunk_size=2048, p_weights=cd_w)
+                cd_loss = chamfer_distance_chunked(
+                    Q_cd_fit, tgt, chunk_size=2048, p_weights=cd_w_cd)
             else:
                 with torch.no_grad():
-                    cd_loss = chamfer_distance_chunked(Q_fit, tgt, chunk_size=2048,
-                                                       p_weights=cd_w)
+                    cd_loss = chamfer_distance_chunked(
+                        Q_cd_fit, tgt, chunk_size=2048, p_weights=cd_w_cd)
 
         if render_active:
             if epoch > render_start_epoch and epoch % render_every == 0:
@@ -2692,9 +2818,12 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         if use_ddf:
             mu_eff *= ddf_mu_decay
 
-        # One Jacobian, shared by all Jacobian-based terms.
-        if need_jac and (mu_eff > 0 or svd_eff > 0 or gamma_eff > 0
-                         or (lambda_ext_area > 0 and in_ext is not None)):
+        # One Jacobian, shared by all Jacobian-based terms.  The cadence applies
+        # to every regularizer that depends on it, including the extension area.
+        reg_due = reg_every <= 1 or epoch % reg_every == 0
+        if (need_jac and reg_due
+                and (mu_eff > 0 or svd_eff > 0 or gamma_eff > 0
+                     or (lambda_ext_area > 0 and in_ext is not None))):
             t_u, t_v = surface_jacobian(Q, uv)
         else:
             t_u = t_v = None
@@ -3207,15 +3336,21 @@ def run_adaptive(args):
         subdiv_stop=args.subdiv_stop, distortion_mode=args.distortion_mode,
         distortion_samples=args.distortion_samples,
         max_splits_per_round=args.max_splits_per_round,
+        subdiv_metric=args.subdiv_metric,
+        subdiv_cd_threshold=args.subdiv_cd_threshold,
+        subdiv_cd_grid_res=args.subdiv_cd_grid_res,
+        subdiv_cd_min_valid_frac=args.subdiv_cd_min_valid_frac,
         device=args.device, log_every=args.log_every, vis_dir=result_dir,
         checkpoint_every=args.checkpoint_every,
         checkpoint_extra=checkpoint_extra,
         tangent_mode=args.tangent_mode,
         sym_dirichlet_epoch=args.sym_dirichlet_epoch,
+        reg_every=args.reg_every,
         save_vertex_pos_every=args.save_vertex_pos_every,
         vertex_pos_json_path=vertex_pos_json_path,
         surface_loss_type=args.surface_loss_type,
         lambda_chamfer=args.lambda_chamfer,
+        cd_sampling=args.cd_sampling, cd_grid_res=args.cd_grid_res,
         lambda_ddf=args.lambda_ddf,
         ddf_mu_decay=args.ddf_mu_decay,
         ddf_start_epoch=args.ddf_start_epoch,
@@ -3498,6 +3633,16 @@ def main():
                                 'post-corr_switch_epoch MSE phase) and requires --no_presplit.')
     ddf_group.add_argument('--lambda_chamfer', type=float, default=1.0,
                            help='[CD+DDF] Weight for the Chamfer term when --surface_loss_type=cd_ddf')
+    ddf_group.add_argument('--cd_sampling', type=str, default='random',
+                           choices=['random', 'grid'],
+                           help='[Adaptive] How the Chamfer term samples each leaf. '
+                                "'random' draws fresh UVs every step (original); "
+                                "'grid' evaluates a fixed R x R UV grid per leaf, so "
+                                'the CD changes only when the surface does. The grid '
+                                'is used by CD only; the target subset stays random')
+    ddf_group.add_argument('--cd_grid_res', type=int, default=0,
+                           help='[Adaptive, --cd_sampling grid] Vertices per patch '
+                                'edge (0 = round(sqrt(M_per_patch)), e.g. 8 for 64)')
     ddf_group.add_argument('--lambda_ddf', type=float, default=1.0,
                            help='[CD+DDF] Weight for the DDF term when --surface_loss_type=ddf or cd_ddf')
     ddf_group.add_argument('--ddf_start_epoch', type=int, default=0,
@@ -3592,8 +3737,8 @@ def main():
                                 help='[Adaptive] Resume topology+weights from an adaptive '
                                      'checkpoint (skips pretraining)')
 
-    adaptive_group.add_argument('--save_vertex_pos_every', type=int, default=10,
-                            help='[Adaptive] Save tracked logical vertex positions every N epochs (0 disables)')
+    adaptive_group.add_argument('--save_vertex_pos_every', type=int, default=0,
+                            help='[Adaptive] Save tracked logical vertex positions every N epochs (0 disables; the JSON grows quadratically and rewrites every save)')
 
     # GHPR warm start: small box at an interior viewpoint, fitted to the
     # visible (star-shaped) subset first, then to the full cloud.
@@ -3781,6 +3926,23 @@ def main():
     subdiv_group.add_argument('--distortion_samples', type=int, default=128)
     subdiv_group.add_argument('--max_splits_per_round', type=int, default=0,
                               help='Cap leaves split per check (0 = unlimited)')
+    subdiv_group.add_argument('--subdiv_metric', type=str, default='distortion',
+                              choices=['distortion', 'cd'],
+                              help='What drives subdivision: geometric distortion '
+                                   '(original) or per-leaf Chamfer error against the '
+                                   'full cloud')
+    subdiv_group.add_argument('--subdiv_cd_threshold', type=float, default=0.0,
+                              help='[--subdiv_metric cd] Split leaves whose '
+                                   'fwd+bwd Chamfer score exceeds this (0 disables '
+                                   'subdivision)')
+    subdiv_group.add_argument('--subdiv_cd_grid_res', type=int, default=8,
+                              help='[--subdiv_metric cd] Grid resolution per leaf '
+                                   'used to score the CD; ignored when '
+                                   '--cd_sampling grid reuses its grid')
+    subdiv_group.add_argument('--subdiv_cd_min_valid_frac', type=float, default=0.25,
+                              help='[--subdiv_metric cd] Skip leaves with less than '
+                                   'this fraction of samples outside detected '
+                                   'extension openings')
 
     # Stage 2: swap in the adaptive defaults BEFORE parsing, so anything the
     # user typed explicitly still overrides them.
@@ -3801,6 +3963,16 @@ def main():
         parser.error(
             "--lambda_ext_area is only supported with --adaptive: extension masks "
             "are detected on the adaptive cube atlas.")
+
+    if args.cd_sampling == 'grid' and not args.adaptive:
+        parser.error(
+            "--cd_sampling grid is only implemented for --adaptive; the "
+            "fixed-grid pipeline keeps its random UV sampling.")
+
+    if args.subdiv_metric == 'cd' and not args.adaptive:
+        parser.error(
+            "--subdiv_metric cd is only implemented for --adaptive: the "
+            "fixed-grid pipeline has no quadtree to subdivide.")
 
     # Adaptive runs start the render term at the first post-pretrain epoch:
     # the box itself is the initialization, so there is no reason to spend

@@ -20,3 +20,4 @@ demo/*
 *.log
 *.mtl
 run.sh
+experiments

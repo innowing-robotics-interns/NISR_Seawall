@@ -747,13 +747,23 @@ def extract_adaptive_vertex_global_positions(model):
     )
 
     vertex_positions = {}
-    for leaf_idx, patch in enumerate(complex_obj.leaf_patches):
-        xyz = model(
-            torch.full((4,), leaf_idx, dtype=torch.long, device=device),
-            corner_uv,
-        ).detach().cpu().numpy()
+    leaf_patches = complex_obj.leaf_patches
+    if not leaf_patches:
+        return vertex_positions
+
+    # Evaluate all leaf corners in one forward call; per-leaf calls serialize
+    # hundreds of tiny launches.
+    n_leaves = len(leaf_patches)
+    pids = torch.arange(n_leaves, dtype=torch.long, device=device)
+    pids = pids.repeat_interleave(corner_uv.shape[0])
+    xyz = model(pids, corner_uv.repeat(n_leaves, 1)).detach().cpu().numpy()
+
+    corners_per_leaf = corner_uv.shape[0]
+    for leaf_idx, patch in enumerate(leaf_patches):
+        base = leaf_idx * corners_per_leaf
         for corner_idx, vertex_id in enumerate(patch.corner_ids):
-            vertex_positions.setdefault(int(vertex_id), xyz[corner_idx].astype(np.float64))
+            vertex_positions.setdefault(
+                int(vertex_id), xyz[base + corner_idx].astype(np.float64))
 
     return vertex_positions
 

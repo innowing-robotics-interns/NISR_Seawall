@@ -33,6 +33,7 @@ __all__ = [
     'auto_mesh_resolution',
     'get_patch_mesh_layout',
     'sample_patch_mesh',
+    'uv_grid',
     'vertex_normals',
 ]
 
@@ -40,6 +41,9 @@ __all__ = [
 # Layouts are small (a UV grid plus faces) and reused for the whole run.
 _LAYOUT_CACHE = {}
 _LAYOUT_CACHE_LIMIT = 32
+
+# Fixed per-patch UV grids used by deterministic Chamfer sampling.
+_UV_GRID_CACHE = {}
 
 
 @dataclass(frozen=True)
@@ -139,6 +143,30 @@ def _build_layout(patch_ids: Tuple[int, ...],
     )
 
 
+def uv_grid(resolution: int, device, dtype: torch.dtype = torch.float32):
+    """Cached ``(R*R, 2)`` grid of UV coordinates over one patch square.
+
+    Ordering matches :func:`sample_patch_mesh` (u-major, both endpoints
+    included), so a caller can expand it over ``P`` patches with
+    ``grid.repeat(P, 1)`` and address patch ``p`` at ``p * R*R + i``.  The
+    tensor is read-only and shared; do not modify it in place.
+    """
+    if resolution < 2:
+        raise ValueError(f'resolution must be >= 2, got {resolution}')
+
+    device = torch.device(device)
+    key = (int(resolution), _device_cache_key(device), str(dtype))
+    grid = _UV_GRID_CACHE.get(key)
+    if grid is None:
+        u = torch.linspace(0.0, 1.0, int(resolution), device=device,
+                           dtype=dtype)
+        grid_u, grid_v = torch.meshgrid(u, u, indexing='ij')
+        grid = torch.stack([grid_u.reshape(-1), grid_v.reshape(-1)],
+                           dim=-1).contiguous()
+        _UV_GRID_CACHE[key] = grid
+    return grid
+
+
 def get_patch_mesh_layout(patch_ids: Iterable[int],
                           resolution: int,
                           device,
@@ -203,7 +231,8 @@ def sample_patch_mesh(F,
         patch_ids: patches to include.  ``None`` means all patches.  Pass the
             training loop's ``active_ids`` so inactive patches receive no
             render gradient.
-        chunk_size: UV rows per forward call.
+        chunk_size: points per forward call.  Chunks may span patch
+            boundaries; the forward map handles mixed patch indices.
 
     Returns:
         ``(vertices, faces)`` with shapes ``(P*R^2, 3)`` and
@@ -218,11 +247,17 @@ def sample_patch_mesh(F,
     ids = _normalize_patch_ids(patch_ids, F.n_patches)
     layout = get_patch_mesh_layout(ids, resolution, device, dtype)
 
+    # Evaluate every patch in as few forward calls as the point budget allows.
+    # Calling F once per leaf serializes hundreds of tiny launches and forces a
+    # GPU sync inside feature interpolation.
+    patch_index = torch.as_tensor(ids, device=device, dtype=torch.long)
+    patch_index = patch_index.repeat_interleave(layout.uv.shape[0])
+    uv = layout.uv.repeat(len(ids), 1)
+
     vertices = []
-    for patch_id in ids:
-        for start in range(0, layout.uv.shape[0], chunk_size):
-            uv_chunk = layout.uv[start:start + chunk_size]
-            vertices.append(F(patch_id, uv_chunk))
+    for start in range(0, uv.shape[0], chunk_size):
+        vertices.append(F(patch_index[start:start + chunk_size],
+                          uv[start:start + chunk_size]))
 
     if not vertices:
         raise RuntimeError('forward map produced no vertices')
