@@ -3030,11 +3030,12 @@ def build_run_config(args):
     pick = lambda *names: {n: getattr(a, n) for n in names}
     adaptive = a.adaptive
     cfg = {'command': ' '.join(shlex.quote(s) for s in sys.argv),
-           'pipeline': 'adaptive' if adaptive else 'multi_patch'}
+           'pipeline': 'adaptive' if adaptive else 'multi_patch',
+           'seed': a.seed}
 
     cfg['io'] = {**({'file': a.file} if a.file else {'shape': a.shape}),
                  **pick('result_dir', 'N', 'mesh_res', 'device', 'log_every',
-                        'checkpoint_every')}
+                        'checkpoint_every', 'tensorboard')}
     cfg['model'] = pick('d_features', 'W', 'D', 'L', 'beta')
     cfg['training'] = pick('epochs', 'lr', 'M_per_patch', 'schedule')
 
@@ -3119,7 +3120,24 @@ def build_run_config(args):
                          'ddf_mu_decay', 'ddf_n_reference_points', 'ddf_k_neighbors',
                          'ddf_sigma', 'ddf_beta', 'ddf_resample_every',
                          'ddf_chunk_size', 'save_ddf_reference_every'))
+    if adaptive:
+        surf['cd_sampling'] = a.cd_sampling
+        if a.cd_sampling == 'grid':
+            surf['cd_grid_res'] = a.cd_grid_res
     cfg['surface_loss'] = surf
+
+    render = {'lambda_render': a.lambda_render}
+    if a.lambda_render > 0:
+        render.update(pick('render_start_epoch', 'render_warmup_epochs', 'render_every',
+                           'render_views', 'render_batch', 'render_resolution',
+                           'render_mesh_res', 'render_min_coverage',
+                           'render_laplacian_weight', 'render_view_clip',
+                           'render_pixel_clip', 'render_preview'))
+        if adaptive:
+            render['render_layers'] = a.render_layers
+            if a.render_layers > 1:
+                render['render_far_weight'] = a.render_far_weight
+    cfg['render'] = render
 
     tangent = {'mu': a.mu}
     if a.mu > 0:
@@ -3173,11 +3191,24 @@ def build_run_config(args):
             debug.update(pick('correspondence_max_lines', 'correspondence_line_segment'))
         cfg['debug'] = debug
     else:
-        sub = {'subdiv_threshold': a.subdiv_threshold}
-        if a.subdiv_threshold > 0 and a.subdiv_every > 0:
+        # Same on/off rule as train_adaptive: each metric has its own threshold.
+        sub = {'subdiv_metric': a.subdiv_metric}
+        if a.subdiv_metric == 'cd':
+            sub['subdiv_cd_threshold'] = a.subdiv_cd_threshold
+            subdiv_on = a.subdiv_cd_threshold > 0
+        else:
+            sub['subdiv_threshold'] = a.subdiv_threshold
+            subdiv_on = a.subdiv_threshold > 0
+        if subdiv_on and a.subdiv_every > 0:
             sub.update(pick('subdiv_max_depth', 'subdiv_every', 'subdiv_start',
-                            'subdiv_stop', 'distortion_mode', 'distortion_samples',
-                            'max_splits_per_round'))
+                            'subdiv_stop', 'max_splits_per_round'))
+            if a.subdiv_metric == 'cd':
+                sub['subdiv_cd_min_valid_frac'] = a.subdiv_cd_min_valid_frac
+                # --cd_sampling grid reuses its own grid for scoring
+                if a.cd_sampling != 'grid':
+                    sub['subdiv_cd_grid_res'] = a.subdiv_cd_grid_res
+            else:
+                sub.update(pick('distortion_mode', 'distortion_samples'))
         cfg['subdivision'] = sub
 
         ext = {'ext_mask_epoch': a.ext_mask_epoch}
@@ -3187,7 +3218,7 @@ def build_run_config(args):
                 ext['ext_cd_weight'] = a.ext_cd_weight
             ext.update(pick('ext_mask_every', 'ext_max_area_frac', 'ext_resolution',
                             'ext_nn_scale', 'ext_min_opening_vertices', 'ext_weld_tol',
-                            'ext_face_res'))
+                            'ext_face_res', 'lambda_ext_area'))
         cfg['extension_mask'] = ext
         cfg['debug'] = {'save_vertex_pos_every': a.save_vertex_pos_every}
     return cfg

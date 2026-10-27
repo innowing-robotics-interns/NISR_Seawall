@@ -1704,6 +1704,14 @@ def _save_run_metadata(log_path: str, args, input_file: str, result_dir: str,
 
     payload = {}
     if config is not None:
+        # Values resolved during training replace 'hyperparameters', so carry
+        # them into the config's render section.
+        if 'render_mesh_resolution_effective' in hyperparams and 'render' in config:
+            config = {**config, 'render': {
+                **config['render'],
+                'render_mesh_resolution_effective':
+                    hyperparams['render_mesh_resolution_effective'],
+                'render_target_views': hyperparams['render_target_views']}}
         payload['config'] = config
     payload.update({
         'metadata': {
