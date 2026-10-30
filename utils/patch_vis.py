@@ -470,9 +470,13 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
                                  svd_cfg=None,
                                  svd_normalize=False,
                                  svd_color_by='loss',
-                                 svd_color_max=None):
+                                 svd_color_max=None,
+                                 export_per_patch=False):
     """
-    Export checkerboard-textured patch meshes and a combined scene.
+    Export a combined checkerboard-textured scene of all patches.
+
+    With `export_per_patch` set, also writes one OBJ/PLY per patch
+    (`patch_<id>_..._<epoch>`) and the per-patch UV debug PNGs.
 
     With `svd_cfg` = dict(mode, target, eps) set, also writes `<name>_svd.ply`
     (per-vertex singular values and SVD loss from `tangent_loss_from_jac`) and
@@ -531,7 +535,7 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
             sigma, loss = _patch_svd(F, cid, uv, device, svd_cfg, svd_normalize)
             svd_parts.append((cid, verts, faces, sigma, loss))
 
-        if debug_uv_png:
+        if debug_uv_png and export_per_patch:
             # Use the original UV layout before optional geometry duplication.
             _save_debug_uv_png(uv, tex_img, save_dir, cid)
 
@@ -558,21 +562,20 @@ def export_checkerboard_patches(F, meta, save_dir, texture_path,
 
         if export_obj:
             meshes.append(mesh)
-            obj_path = os.path.join(save_dir, tag + ".obj")
-            mesh.export(obj_path)
-            print(f"    {label} textured OBJ → {obj_path}")
+            if export_per_patch:
+                obj_path = os.path.join(save_dir, tag + ".obj")
+                mesh.export(obj_path)
+                print(f"    {label} textured OBJ → {obj_path}")
             n_exported += 1
 
         if export_ply:
             colored_mesh = _bake_vertex_colors(mesh)
             colored_meshes.append(colored_mesh)
-            ply_path = os.path.join(save_dir, tag + ".ply")
-            colored_mesh.export(ply_path)
-            print(f"    {label} vertex-colored PLY → {ply_path}")
+            if export_per_patch:
+                ply_path = os.path.join(save_dir, tag + ".ply")
+                colored_mesh.export(ply_path)
+                print(f"    {label} vertex-colored PLY → {ply_path}")
             n_exported += 1
-
-        if debug_uv_png:
-            _save_debug_uv_png(uv, tex_img, save_dir, cid)
 
     if n_exported == 0:
         print("  No meshes remained after occupancy filtering; skipping combined export.")
@@ -860,6 +863,9 @@ def main():
                              'are duplicated so they render from both sides). '
                              'Pass this to keep the original single-layer sheet '
                              'and rely on viewer-side backface settings instead.')
+    parser.add_argument('--per_patch', action='store_true',
+                        help='Also write one OBJ/PLY per patch (patch_<id>_..._<ckpt>) and '
+                             'per-patch UV debug PNGs (default: only the combined scene)')
     parser.add_argument('--model_path', '--main_path', dest='model_path', type=str, default=None,
                         help='Explicit path to model/model.py or the model directory (alias: --main_path). '
                             'Needed if patch_vis.py is not next to the model package and '
@@ -984,6 +990,7 @@ def main():
             svd_normalize=args.svd_units == 'face',
             svd_color_by=args.svd_color_by,
             svd_color_max=svd_color_max,
+            export_per_patch=args.per_patch,
         )
 
         if svd_cfg is not None and os.path.exists(stats_path):
