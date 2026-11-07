@@ -89,5 +89,10 @@ The `bad_loops.txt` shortlist uses the separate `--max-err` mean-error rule.
 
 ## More
 
+The four runtime files above stay at the repository root. Follow-up readings of
+a finished run — `seam_check.py`, `loop_propagation.py`, the `plot_*` scripts
+and the probes — live in [plc_utils](plc_utils/) and run as
+`python plc_utils/<script>.py` or `python -m plc_utils.<script>`.
+
 Design, measurements and the six-shape distillation table are in
 [WORKFLOW.md](WORKFLOW.md) §2.3–2.4; the open items are in [todo.md](todo.md).

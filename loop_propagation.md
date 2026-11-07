@@ -336,13 +336,13 @@ Every step writes its own table, figure and JSON under
 the earlier JSON, so each step can be inspected before the next runs.
 
 ```bash
-python loop_propagation.py --step 1     # stable-loop inventory
-python loop_propagation.py --step 2     # propagation, keep/discard
-python loop_propagation.py --step 2b    # same with a bounded deformation
-python loop_propagation.py --step 3     # alignment per track
-python loop_propagation.py --step 4     # tubes
-python loop_propagation.py --step all   # steps 1-4 (rigid path)
-python loop_propagation.py --step all --good-only   # good loops only
+python plc_utils/loop_propagation.py --step 1     # stable-loop inventory
+python plc_utils/loop_propagation.py --step 2     # propagation, keep/discard
+python plc_utils/loop_propagation.py --step 2b    # same with a bounded deformation
+python plc_utils/loop_propagation.py --step 3     # alignment per track
+python plc_utils/loop_propagation.py --step 4     # tubes
+python plc_utils/loop_propagation.py --step all   # steps 1-4 (rigid path)
+python plc_utils/loop_propagation.py --step all --good-only   # good loops only
 ```
 
 Steps 3–4 read `--tracks` (default `auto`, the newest of `step2` and `step2b`).

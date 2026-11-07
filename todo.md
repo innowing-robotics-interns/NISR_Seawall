@@ -82,6 +82,15 @@ that is a result to explain, not a correction to apply.
   the term is therefore not optional; the comparison at equal budget is part of
   the acceptance test.
 
+  Measured again on horse with the f map frozen for the first 50 epochs
+  (`--freeze-f-epochs 50`, `log/reverse_fix_horse/freeze50_full`): z holds 0
+  reversed from epoch 75 to 950, then reads 0 -> 22 clockwise as the direction
+  weight falls from 1e-4 to 0 between the run's printed lines 951 and 974, and
+  the z fit (pred -> target, per axis) rises 0.00010 -> 0.00044 across that
+  flip. The family was upright for 875 epochs under the term and turned over in
+  the 23 epochs it was released. A floor on the weight is not a cosmetic
+  change; it is what holds the orientation.
+
 - [ ] Remove the manual export flip in `rosa_main.fitted()`
 
   The function currently reverses any loop with mean cos < -0.1 before writing
@@ -90,6 +99,241 @@ that is a result to explain, not a correction to apply.
   direction as the network produced it; if a file must follow the cloud's
   normals for a consumer, that is the consumer's rendering choice, not a silent
   change to the loop.
+
+- [x] Reverse fix: start each loop at its target's scale and place, not at the
+  cube's
+
+  Cause. The warm-up is trained on the unit cube, so the loop a fit starts from
+  is a square the size of the cube's cross-section, mapped by the triplane into
+  the cloud's box. A slice's points often occupy a small part of that box and
+  sit away from its centre -- on horse y = -0.66 the points span x -0.10..0.36
+  and z -0.89..0.29, while the warm-up square spans roughly -0.55..0.59 by
+  -0.52..0.46. Reaching the points therefore takes a long translation and
+  scaling in the first updates: the loop is dragged onto them and the shared
+  field `f` is rewritten at every query, not just bent into shape.
+
+  The early snapshots show that drag and the reversal that follows it
+  (`log/axis_seam10_horse_repro`, all loops counter-clockwise through epoch 2).
+  At epoch 3, 60 of 66 z loops read clockwise (median foldover 1.39, so they are
+  retracing mid-drag); the y family follows at epochs 3-5 (14/30 clockwise at
+  epoch 4, 28/30 at epoch 5). Most z loops then turn back (9/66 by epoch 20)
+  while the y loops stay turned. Where the section is thin, the dragged curve
+  pairs to the opposite sheet of the slice, the cosine reads negative, and the
+  winding follows the pairing. The direction term is at its full weight (0.01)
+  throughout these epochs, so the flip happens despite it -- the fit, not the
+  anneal, is what moves the loop.
+
+  Fix to test: put each loop's start where its targets are -- give the warm-up
+  square the slice's own in-plane extent and centroid, either by conditioning
+  it on those two numbers or by an initial rigid scale/translation fitted to
+  the targets -- so the first updates refine shape instead of moving the whole
+  loop. Acceptance: fewer reversed loops at equal fit across the shape panel,
+  with the direction term and the exported orientation unchanged.
+
+  First test -- hold `f` fixed for 50 epochs (built). `--freeze-f-epochs N`
+  freezes the shared MLP (`Trainer.set_f_trainable`) and trains only the
+  triplane grid for the first N epochs. `plc_utils/replay_epochs.py
+  --freeze-f-epochs` reproduces such a run, `plc_utils/reverse_fix_report.py`
+  measures a saved state (per-axis winding, the direction vote, full-target
+  chamfer) and `plc_utils/plot_reverse_fix.py` draws it. Horse, the same
+  command and 1000-epoch schedule as `log/axis_seam10_horse_repro`
+  (`--normal 0.01 --distill 10`): replay `log/reverse_fix_horse/replay_freeze50`,
+  full run `log/reverse_fix_horse/freeze50_full`. The replay's first 50 epoch
+  lines are identical to the full run's.
+
+  At the end of the frozen phase (`state_e50.pt`, after 50 updates; the run's
+  printed line 49; reversed is own-centre winding < 0, against is the per-loop
+  mean direction cosine < -0.1, fit is the full-target squared chamfer averaged
+  over loops):
+
+  | arm | x rev | y rev | z rev | against | fit | line-49 fit |
+  |---|---:|---:|---:|---:|---:|---:|
+  | baseline | 1/43 | 27/30 | 9/66 | 38/139 | 0.00602 | 0.0062 |
+  | f frozen | 0/43 | 1/30 | 0/66 | 1/139 | 0.11842 | 0.1206 |
+
+  The baseline really does rewrite `f`: its MLP moves 0.498 relative L2 in the
+  first 50 epochs while the field moves 9.06x its own norm. Frozen, `f` moves
+  0.000 and the field moves 16.66x. The loops are still placed, but by the
+  field, and the reversal is gone in all three families -- at a 20x fit cost.
+
+  The cost is transient. By epoch 200 the two arms have the same overall fit
+  (0.0008 frozen, 0.0009 baseline), and y stays upright through 1000 epochs
+  (0/30 clockwise, fold 1.05, mean cos +0.81, 0 against; baseline 27/30, fold
+  1.15, cos +0.40). The end is not clean: z turns over when the direction
+  weight reaches zero (the item above), ending 26/66 reversed (own centre)
+  against the baseline's 11/66, and x ends 5/43 against 6/43. The run's own
+  final diagnostic reads 7/0/20; the gap to the own-centre 5/0/26 is the same
+  target-centroid effect. Final total 31/139 reversed against 44/139, but fit
+  0.00125 against 0.00046 and the field is 2.8x rougher (triplane tv 0.0042 vs
+  0.0015; relative field change 24.8x vs 12.8x). So the frozen start fixes the
+  drag-induced y reversal; it does not hold orientation once the direction term
+  is gone.
+
+  The run's own epoch-line diagnostic uses the target centroid and reads
+  5/2/19 at the end of the frozen phase even though the loops themselves are
+  upright (own-centre 0/1/0): a displaced curve's target centroid is not
+  inside it. Read own-centre winding at a mid-fit epoch, not that diagnostic.
+
+  Figures: `log/reverse_fix_horse/matching_y_e50_compare.png` (warm-up,
+  baseline e50, frozen e50, six y loops), `matching_z_e50_compare.png`, and
+  every loop at each state in
+  `log/axis_seam10_horse_repro/matching_{x,y,z}_{baseline,frozen}_e50.png`.
+
+  Second test -- freeze to 100 epochs (`log/reverse_fix_horse/freeze100_full`).
+  The same command with `--freeze-f-epochs 100`, 1000 epochs. The bend term is
+  gone from the fit outright (it was already at weight 0 in every triplane run
+  here, so this run's objective is unchanged); the only smoothness left is the
+  triplane tv (weight 0.01). Wall clock 3 min 35.5 s (215.51 s, max RSS
+  2.70 GB); plane extraction alone is 26.9 s, so the 1000 epochs and the export
+  take about 189 s, 0.19 s an epoch.
+
+  At the end of the freeze (`state_e100`, own-centre winding, full-target
+  squared chamfer):
+
+  | arm | x rev | y rev | z rev | against | fit |
+  |---|---:|---:|---:|---:|---:|
+  | baseline e100 | 1/43 | 27/30 | 9/66 | 33/139 | 0.00194 |
+  | f frozen 100 | 1/43 | 1/30 | 0/66 | 4/139 | 0.05658 |
+
+  (the run's own epoch line at 99 reads 5/2/12, the target-centroid effect
+  again). At the end (`e999`; own-centre winding, fit as above, bend is the
+  trainer's reading over all loops, tv the field's):
+
+  | arm | x rev | y rev | z rev | against | fit | bend | tv |
+  |---|---:|---:|---:|---:|---:|---:|---:|
+  | baseline | 6/43 | 27/30 | 11/66 | 0/139 | 0.000461 | 4189 | 0.0015 |
+  | f frozen 50 | 5/43 | 0/30 | 26/66 | 19/139 | 0.001247 | 3370 | 0.0042 |
+  | f frozen 100 | 2/43 | 0/30 | 0/66 | 0/139 | 0.000476 | 2134 | 0.00766 |
+
+  The longer freeze keeps y and z upright to the end (y winding +1.00, fold
+  1.01; z +1.00, fold 1.01): the late z flip of the 50-epoch arm never happens,
+  and the final fit is within 3% of the baseline, 0.000476 against 0.000461,
+  at 2/139 reversed against 44/139. The run's own final diagnostic reads
+  6/0/0 against the own-centre 2/0/0. The cost moves to the field: tv 0.00766,
+  5.1x the baseline's 0.0015 and 1.8x the 50-epoch arm's. The freeze is also
+  expensive mid-run, fit 0.0566 at e100 against the baseline's 0.00194, but it
+  catches up by about e200 (0.0014 against 0.0009) and ends slightly ahead.
+
+  Figures: `log/axis_seam10_horse_repro/matching_y_baseline_final.png` and
+  `matching_y_frozen100_final.png`, and the same pair for z.
+
+  The code partition confirms the freeze timing and shows what the freeze is
+  for. Sampling each loop's 48-D triplane code at the freeze-end state
+  (`code_clusters.py --state`, k = 10 on cosine similarity) gives silhouette
+  0.578 at e100 and 0.514 at e50. The e100 partition is already the final one
+  (ARI 0.907 against `final100`, mean best-match Jaccard 0.814; the x-family
+  loops are the tightest clusters, intra cos 0.96); e50 is coarser (ARI 0.650
+  against `final50`, one 62-loop front/rear body cluster). So the frozen
+  training is a **placement initialiser**: with `f` fixed, the field's only way
+  to reduce chamfer (0.0566 at e100) is to move each loop's query onto its
+  target points, and by the end of the 100-epoch freeze that move is done and
+  the code groups are already the ones the run ends with. This is why the
+  orientation survives the unfrozen stage. What follows is a **fit stage**:
+  releasing `f` lets the remaining updates spend themselves on shape variation
+  -- the per-loop curve deviation and the loop-vs-cloud residual -- not on
+  re-deciding the grouping, and fit drops 119x (0.000476) with the partition
+  nearly unchanged. The 50-epoch arm stops the initialiser early, its grouping
+  is still coarse, and it pays for that with the late z turnover. Figures and
+  sphere PLYs:
+  `freeze100_full/snapshots/horse_points_cubic_lam3_codes_e0100.{png,csv,ply}`,
+  `freeze50_full/snapshots/horse_points_cubic_lam3_codes_e0050.{png,csv,ply}`.
+
+  Next: the field roughness is now the cost (5x the baseline), so test lowering
+  it without losing the orientation -- a tv anneal, or releasing f with the
+  direction term held at a floor -- and repeat at matched fit on the shape
+  panel. A shorter freeze is no longer the direction: the 50-epoch arm brought
+  the late z flip back.
+
+  Third test -- the panel of eight shapes, `--freeze-f-epochs 100`, the same
+  1000 epochs and `--normal 0.01 --distill 10` (the distillation arm is the
+  matched control, so `--feature triplane --triplane-tv 0.01 --snapshot-every
+  0` too). Eight runs, 29 planes per axis, output `log/axis_frz100_<shape>`;
+  controls are the existing `log/axis_seam10_<shape>` runs (bend weight 0 in
+  both arms) plus a new `log/axis_seam10_dancing_children100K` made for this
+  pair. The four genus-0 shapes here are bunny, armadillo, horse and lucy.
+  Total 1239 loops. Own-centre winding < 0, `against` is the run's per-loop
+  direction vote (mean cos < -0.1), fit is the last epoch's mean squared
+  chamfer, tv is the last epoch's field term, D is the exported seam median on
+  the run's own pair graph:
+
+  | shape | loops | fit ctl -> frz | reversed ctl -> frz | against | bad | tv ctl -> frz | D med ctl -> frz |
+  |---|---:|---|---|---:|---:|---|---|
+  | bunny | 80 | 0.0010 -> 0.0012 | 5 -> 0 (3/2/0 -> 0/0/0) | 0 -> 0 | 4 -> 3 | 0.00070 -> 0.00536 | 42e-6 -> 42e-6 |
+  | armadillo | 162 | 0.0013 -> 0.0011 | 4 -> 1 (1/1/2 -> 1/0/0) | 1 -> 0 | 9 -> 1 | 0.00213 -> 0.01224 | 518e-6 -> 562e-6 |
+  | horse | 139 | 0.0005 -> 0.0005 | 41 -> 8 (4/26/11 -> 8/0/0) | 3 -> 0 | 5 -> 5 | 0.00154 -> 0.00762 | 507e-6 -> 660e-6 |
+  | lucy | 157 | 0.0007 -> 0.0007 | 33 -> 9 (5/28/0 -> 6/3/0) | 14 -> 2 | 0 -> 0 | 0.00238 -> 0.01216 | 470e-6 -> 422e-6 |
+  | laurent_hand | 149 | 0.0006 -> 0.0011 | 41 -> 16 (4/22/15 -> 2/0/14) | 0 -> 0 | 38 -> 34 | 0.00195 -> 0.00687 | 214e-6 -> 212e-6 |
+  | rocker-arm | 153 | 0.0007 -> 0.0007 | 59 -> 1 (1/37/21 -> 1/0/0) | 0 -> 0 | 3 -> 1 | 0.00149 -> 0.00446 | 136e-6 -> 163e-6 |
+  | neptune | 189 | 0.0005 -> 0.0006 | 20 -> 1 (5/1/14 -> 1/0/0) | 10 -> 6 | 0 -> 0 | 0.00255 -> 0.01046 | 1119e-6 -> 1122e-6 |
+  | dancing_children100K | 210 | 0.0009 -> 0.0009 | 4 -> 11 (0/3/1 -> 1/8/2) | 0 -> 1 | 6 -> 9 | 0.00308 -> 0.01361 | 191e-6 -> 154e-6 |
+
+  The frozen start cuts the reversed total 207 -> 47 of 1239 (4.4x). Seven of
+  the eight shapes improve; dancing children is the exception (4 -> 11, its y
+  family 3 -> 8) and laurent hand loses its y reversal (22 -> 0) but keeps the
+  z family (15 -> 14), so the two hard shapes need a seeded repeat. The fit
+  cost is transient as on horse -- frozen e99 reads 0.022-0.070 against the
+  controls' 0.002-0.0035 -- and by e999 only laurent hand (0.0011 against
+  0.0006) and bunny (0.0012 against 0.0010) differ by more than 20%. Bad loops
+  fall on five shapes (armadillo 9 -> 1, rocker 3 -> 1), rise on dancing
+  children (6 -> 9); laurent hand stays high in both arms (38/34). The field is
+  3-8x rougher in tv, and rocker arm's x family pays an extra foldover
+  (1.127 -> 1.435 against 1.006/1.007 for y/z). The bend reading falls on six
+  shapes (bunny 6000 -> 4083, horse 3983 -> 1962, laurent 9545 -> 4837) and
+  rises slightly on neptune (1415 -> 1600) and dancing children (2606 -> 2984).
+  Distill D is essentially unchanged at the median (it is the term doing that
+  job); lucy's tail improves (mean 0.0253 -> 0.0130, max 1.48 -> 0.405).
+
+  Caveat: no seed was fixed. Discrete winding counts move run to run at this
+  radius -- this horse frozen arm reads x 8/43 where `freeze100_full` read
+  2/43, while its control reads 4/43 against 6/43 -- so read the panel as
+  direction and magnitude, not as exact counts. Next: seeded repeats on
+  dancing children and laurent hand, and the direction-weight floor at the end
+  of the run, which is where the surviving late turn-overs happen.
+
+  Clustering on the 48-D triplane codes (cosine average linkage, fixed k = 10
+  so the shapes are comparable; the e100 state replays the same schedule for
+  100 epochs with `--freeze-f-epochs 100` and is kept in
+  `log/frz100_replay/<shape>/state_e100.pt`). The replay reproduces the run's
+  epoch-99 line to every printed digit on bunny, horse, lucy and dancing
+  children.
+
+  | shape | sil ctl final | sil frz final | sil frz e100 | ARI e100/final | Jaccard | ARI ctl/frz final |
+  |---|---:|---:|---:|---:|---:|---:|
+  | bunny | 0.487 | 0.590 | 0.628 | 0.703 | 0.843 | 0.464 |
+  | armadillo | 0.418 | 0.452 | 0.468 | 0.646 | 0.666 | 0.435 |
+  | horse | 0.434 | 0.561 | 0.578 | 0.897 | 0.795 | 0.626 |
+  | lucy | 0.350 | 0.459 | 0.509 | 0.931 | 0.888 | 0.441 |
+  | laurent_hand | 0.390 | 0.486 | 0.454 | 0.841 | 0.812 | 0.345 |
+  | rocker-arm | 0.410 | 0.550 | 0.597 | 0.819 | 0.752 | 0.539 |
+  | neptune | 0.380 | 0.432 | 0.505 | 0.794 | 0.785 | 0.457 |
+  | dancing_children100K | 0.207 | 0.336 | 0.381 | 0.638 | 0.620 | 0.361 |
+
+  The frozen arm separates its codes better on every shape (silhouette
+  +0.03..+0.13 at k = 10; the auto-k numbers move the same way, e.g. rocker
+  0.550 -> 0.619, dancing 0.264 -> 0.389). At e100 the partition is already
+  0.64-0.93 ARI from the run's final one, and the horse numbers reproduce the
+  earlier result (silhouette 0.578 at k = 10; ARI 0.897 against the earlier
+  0.907 at auto k). The clusters are the axis families: rocker arm's largest is
+  37 x loops, bunny's are 26 x and 21 y plus 2 x, lucy has a 21 y cluster,
+  laurent hand 47 y. The fit stage then slightly mixes some of them -- e100
+  silhouette is above the final one on seven shapes, and only laurent hand
+  rises during the fit (0.454 -> 0.486), the same shape whose placement is
+  still unfinished at e100 (fit 0.0369). The two arms end on different
+  partitions (ARI 0.35-0.63), so the frozen start is not a reparametrisation
+  of the same grouping: it is a cleaner one. Figures and per-loop labels:
+  `<run>/<stem>_code_clusters.png/.csv/.ply` in each `log/axis_*_<shape>/`.
+
+  Resolved by the frozen start above, not by target-scale initialisation:
+  `--freeze-f-epochs 100` holds the shared MLP for the first 100 epochs and
+  trains only the triplane field, so the field places each loop while `f`
+  keeps the warm-up's map and cannot be rewritten by the drag. On horse it
+  ends 2/139 reversed at full-target fit 0.000476 against the baseline's
+  44/139 at 0.000461 (z 0/66, y 0/30), direction term unchanged at
+  `--normal 0.01`. The field is 5.1x rougher (tv 0.00766 against 0.00151) and
+  the freeze costs fit while it lasts; 50 epochs is not enough, because z
+  turns over late. The command, tables and figures are in the second test
+  above; `WORKFLOW.md` §2.4 documents the flag. The cross-shape panel is still
+  open.
 
 ## Teacher-student seam distillation (`--distill`)
 
@@ -203,7 +447,7 @@ that division of labour is deliberate.
 
 Currently, we are using linear interpolated features along the axis.
 
-**Implementation:** [align_loops.py](align_loops.py) — standalone module (numpy + optional scipy only). It implements the pair residual `D_ij`, the closed-form switch `s* = λ/(λ + D)`, the seam-offset solve, `v_i`, and the loft; `python align_loops.py` runs a synthetic self-test. It is not imported by `loop_extraction.py` or `rosa_main.py` yet.
+**Implementation:** [align_loops.py](plc_utils/align_loops.py) — standalone module (numpy + optional scipy only). It implements the pair residual `D_ij`, the closed-form switch `s* = λ/(λ + D)`, the seam-offset solve, `v_i`, and the loft; `python plc_utils/align_loops.py` runs a synthetic self-test. It is not imported by `loop_extraction.py` or `rosa_main.py` yet.
 
 - [x] How to align two adjacent loops if they can be aligned, and drop those pairs that cannot be aligned
 
@@ -264,7 +508,7 @@ training" can mean two different things. They should be staged.
 1. **Gauge alignment, no change to the objective.** Give every loop a phase
    buffer $p_i$ and evaluate $z = (z + p_i) \bmod 1$ wherever the network is
    sampled. Solve $p$ against the `code_neighbour_graph` pairs with the periodic
-   closed-form residual already in [align_loops.py](align_loops.py)
+   closed-form residual already in [align_loops.py](plc_utils/align_loops.py)
    ($D_{ij}$ over circular shifts, sparse weighted least squares, switch
    $s = \lambda/(\lambda + D)$). The solve can run after or between stages,
    any number of times, on any checkpoint. Persist $p$ in `*_model.pt` and
@@ -335,7 +579,7 @@ training" can mean two different things. They should be staged.
    distillation, not this path) or a live seam term (which changes the
    objective).
 
-   **Acceptance** — [seam_check.py](seam_check.py) reads the checkpoint's own
+   **Acceptance** — [seam_check.py](plc_utils/seam_check.py) reads the checkpoint's own
    `*_feature_graph.csv`, rebuilds the curves on its `z` grid and prints the
    pair `D` at the exported seam (and at `z = 0` when the checkpoint has
    phases), plus a per-pair comparison with `--teacher`. Verified:
@@ -369,7 +613,7 @@ Probe of the propagation idea (rigid transfer, no refit): take the stable y loop
 We now have, per shape, fitted loops on 87 planes (`*_loops.ply`, and the same
 fit replayable from `*_model.pt`), each stored in its plane's local frame with
 the plane's origin and normal, plus tube chains and synchronized loops from
-[align_loops.py](align_loops.py). The question is how to turn these 1-D contours
+[align_loops.py](plc_utils/align_loops.py). The question is how to turn these 1-D contours
 into a polycube: a coarse, axis-aligned cuboid complex approximating the same
 solid.
 
@@ -387,7 +631,7 @@ plane families (x, y, z) give redundant cross-sections of the same solid.
      planes, threshold to a 3-D volume, then run a voxel-to-polycube pass
      (dominant-normal snapping plus cube merging). The three axis reconstructions
      can be intersected to remove family-specific artefacts.
-  2. **Loft and quantise** — reuse the tubes from [align_loops.py](align_loops.py):
+  2. **Loft and quantise** — reuse the tubes from [align_loops.py](plc_utils/align_loops.py):
      loft between synchronized adjacent sections, snap the lofted surface
      normals to ±x/±y/±z, and rasterise the snapped surface. This reuses the
      seam alignment and the `v` coordinate instead of re-deriving them.

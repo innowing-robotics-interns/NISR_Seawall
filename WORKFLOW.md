@@ -205,17 +205,23 @@ per loop.
 The total loss per batch is:
 
 ```text
-chamfer  +  smooth * bend  +  normal_weight(t) * normal  +  code_smooth * code  +  triplane_tv * tv  +  distill * seam_distill
+chamfer  +  normal_weight(t) * normal  +  code_smooth * code  +  triplane_tv * tv  +  distill * seam_distill
 ```
 
 | term | flag | formula | role |
 |---|---|---|---|
 | Chamfer | always | symmetric squared Chamfer between the predicted curve and the loop points | position |
-| bend | `--smooth` | mean squared second derivative over mean squared speed | keeps the curve smooth; a circle reads 39.5 |
 | normal | `--normal` | mean `1 - cos(tangent x plane_normal, target normal projected in plane)` | fixes which way round the loop runs; 0 aligned, 1 square, 2 reversed |
 | code / feature smoothness | `--code-smooth` | weighted mean squared distance between neighbouring loops' codes or sampled features | makes adjacent cross-sections vary continuously |
 | triplane TV | `--triplane-tv` | mean squared difference of neighbouring grid cells | regularises the field; on by default (`0.01`) in triplane mode |
 | seam distillation | `--distill` | weighted mean over neighbour pairs of `scale * max(D_student - D_teacher, 0)` | holds the seam distance under the cube warm-up's per-pair ceiling; can lower `D`, never raise it; off by default |
+
+There is **no bend term** in the fit: a second-derivative penalty was removed so
+a loop can form sharp corners, and nothing in the objective now opposes a
+wiggly or self-crossing curve. The `bend` number printed at the end of a run is
+a reading over the final curves (mean squared second derivative over mean
+squared speed; a circle reads 39.5), not a loss the optimiser sees. Read it next
+to the fit when judging whether a loop doubles back.
 
 `rosa_main.py --normal` is the **normal-orientation** loss. It is unrelated to
 the loop-parameter seam alignment in `loop_propagation.py` step 3.
@@ -232,7 +238,9 @@ can still flip loops while the cube shrinks onto the loop: on the horse at
 the fine-tune term at `--normal 0.3` ends with 0/139 on two seeds at the same fit
 loss (TV 0.027–0.031 against 0.019–0.021), while `--normal 1.0` also reaches zero
 but roughly doubles the fit error. The default stays 0.01; use 0.3 when zero
-reversals matter more than the last of the field's smoothness.
+reversals matter more than the last of the field's smoothness. The frozen start
+is the other route and keeps the default weight: 100 frozen epochs end at
+2/139 reversed on horse at baseline fit (§2.4).
 
 `--code-smooth` connects mutual-nearest loops on adjacent planes, gated by
 `--code-gate` (in-plane separation in plane spacings) and `--code-min-radius`
@@ -240,13 +248,13 @@ reversals matter more than the last of the field's smoothness.
 sampled features, so gradients reach the grid.
 
 **Seam phase** (`--seam-align`, off by default) is a solve, not a loss term.
-Where `z = 0` falls on a closed loop is a free gauge: Chamfer, bend and the
-normal term are all invariant to `f(z) -> f(z + p_i)`, so nothing in the fit
+Where `z = 0` falls on a closed loop is a free gauge: Chamfer and the normal
+term are both invariant to `f(z) -> f(z + p_i)`, so nothing in the fit
 can place it. With `--seam-align 1` the trainer carries one phase per loop
 (`Trainer.phase`, a parameter the fit's own optimiser never sees) and solves it
 every `--seam-every` epochs with `--seam-steps` Adam steps at 2e-2 turns. Each
 solve reads every curve once, detached, and samples it periodically at
-`z + p_i`; only the phases receive a gradient, so the printed fit, bend and
+`z + p_i`; only the phases receive a gradient, so the printed fit and
 `align` numbers are the run's own — checked against `--seam-align 0`: 30 epoch
 lines identical to four decimals, weights within the `3.7e-5` run-to-run noise
 of two identical runs, and the point set of every curve unchanged (max nearest
@@ -271,7 +279,7 @@ The printed `D median a -> b` is the solve's plateau for the curves as they
 stood at that epoch. The checkpoint is written after the last fit epoch, which
 can move the curves again without a new solve: on the 13-loop smoke run the
 last solve printed `0.0417`, while the exported checkpoint measures `0.1962`
-with [seam_check.py](seam_check.py). Quote the checkpoint number when comparing
+with [seam_check.py](plc_utils/seam_check.py). Quote the checkpoint number when comparing
 runs.
 
 ### 2.4 The cube warm-up (`--warmup`)
@@ -303,7 +311,7 @@ Measured on bunny, 5 planes, 13 loops, 2×64 net, 300 epochs, `--normal 0.01`:
 | blank network | 0.0195 | 10 / 13 | 0.0947 / 0.1311 / 0.2417 / 0.3804 |
 
 Runs: [log/fit300n_warm](log/fit300n_warm), [log/fit300n_blank](log/fit300n_blank).
-`D` is the distance the seam solve minimises; [seam_check.py](seam_check.py)
+`D` is the distance the seam solve minimises; [seam_check.py](plc_utils/seam_check.py)
 measures it on a checkpoint at `z = 0` (or at its own phases), and `--against`
 compares per pair with another run on the same plane set. The fit's own losses
 are seam-invariant, so it can still slide the seam after the warm-up; holding it
@@ -380,6 +388,73 @@ Runs:
 [log/axis_tri_tv01_bunny](log/axis_tri_tv01_bunny) vs
 [log/axis_seam10_bunny](log/axis_seam10_bunny), and the same pair of folders for
 `armadillo`, `horse`, `lucy`, `laurent_hand`, `rocker-arm`.
+
+**Frozen start** (`--freeze-f-epochs N`, default 0) holds the warm-up's map
+while the field places the loops. The warm-up square is sized on the unit cube,
+while a slice's points usually occupy a smaller, off-centre part of the cloud's
+box; the first updates therefore drag the loop onto its points, and because the
+shared MLP `f` is trainable, the drag also rewrites that map at every query. On
+horse this is what turns the y family clockwise and keeps it there. With
+`--freeze-f-epochs 100` every parameter of the shared MLP has
+`requires_grad = False` for the first 100 epochs and only the triplane grid
+trains; the epoch lines carry `[f frozen]` and the boundary prints
+`f map released`. `Trainer.set_f_trainable` does the switch without rebuilding
+the run, and the trainer's own epoch counter drives it, so a resumed stage does
+not refund frozen epochs.
+
+Measured on horse (139 loops, 1000 epochs, `--normal 0.01 --distill 10`,
+[log/reverse_fix_horse/freeze100_full](log/reverse_fix_horse/freeze100_full)),
+own-centre winding at the end:
+
+| arm | reversed x / y / z | total | against | fit | tv |
+|---|---:|---:|---:|---:|---:|
+| baseline | 6 / 27 / 11 | 44/139 | 0 | 0.000461 | 0.0015 |
+| frozen 50 | 5 / 0 / 26 | 31/139 | 19 | 0.001247 | 0.0042 |
+| frozen 100 | 2 / 0 / 0 | 2/139 | 0 | 0.000476 | 0.00766 |
+
+With a 100-epoch freeze the final fit is within 3% of the baseline, and y and z
+stay upright to the end (both winding `+1.00`, fold `1.01`). A 50-epoch freeze
+fixes y but lets z turn over when the direction weight reaches zero near epoch
+950. The cost is the field: TV `0.00766` against `0.00151`, and the freeze is
+expensive while it lasts (fit `0.0566` at epoch 100 against the baseline's
+`0.00194`), though it catches up by about epoch 200. Read **own-centre** winding
+here: the trainer's per-epoch line centres its winding on the target centroid
+and reads `6/0/0` at the end against the own-centre `2/0/0`, because a displaced
+curve's target centroid need not fall inside it. Wall clock for the horse run is
+`215.5 s` (extraction `26.9 s`, so about `0.19 s` an epoch), `2.7 GB` peak RSS.
+`plc_utils/replay_epochs.py --freeze-f-epochs N` reproduces the schedule for
+early states. The same arm was then run on the eight-shape panel (bunny,
+armadillo, horse, lucy, laurent hand, rocker arm, neptune, dancing children;
+`log/axis_frz100_<shape>`, table and caveats in [todo.md](todo.md)): reversed
+loops fall 207 -> 47 of 1239 at essentially matched fit (laurent hand 0.0011
+against 0.0006, bunny 0.0012 against 0.0010, every other shape within 20%),
+the field is 3-8x rougher in tv, and dancing children is the exception
+(4 -> 11 reversed). Clustering the codes puts the e100 partition 0.64-0.93 ARI
+from the run's final one, so the placement claim survives the panel.
+
+**The freeze is a placement initialiser.** The schedule has two jobs, and the
+code partition shows where they split. While `f` is frozen only the triplane
+trains, so the chamfer term has one route: move each loop's query onto its
+target points. That is a placement problem, and it is essentially solved by the
+end of the 100-epoch freeze -- full-target fit `0.0566` at epoch 100 against
+`0.00194` for the baseline arm, the cost of doing the move with the field
+alone. Sampling the 48-D triplane code at each loop centroid at `state_e100`
+and clustering it (k = 10, cosine average linkage) gives silhouette `0.578`
+and already the end-of-run partition: ARI `0.907` against the final codes, mean
+best-match Jaccard `0.814`, and the x-family loops are the tightest clusters
+(intra cosine `0.96`). The 50-epoch state is still coarse (ARI `0.650` against
+its final, one 62-loop front/rear body cluster), which matches that arm's later
+z turnover. So the freeze fixes both the loop positions and what the codes need
+to separate, which is why orientation survives the unfrozen stage.
+
+The stage after the release is a **fit** stage: with `f` trainable again the
+remaining updates spend themselves on shape variation -- the per-loop curve
+deviation and the loop-vs-cloud residual -- not on re-deciding which loops
+belong together. On horse the final fit improves 119x over the freeze-end value
+(`0.000476` against `0.0566`) while the partition barely moves (`ARI 0.907`).
+Treat the epoch-100 code clusters as the initialiser's output, not as a
+training objective; nothing clusters the codes during training, they are read
+off the field afterwards.
 
 ### 2.5 Schedule and refinement
 
@@ -467,8 +542,8 @@ query along its plane normal should generate something close to the loop that
 was actually fitted on the neighbouring plane.
 
 ```bash
-conda run -n seawall python loop_shift_probe.py --run log/triplane_shift_s29
-conda run -n seawall python loop_shift_probe.py \
+conda run -n seawall python plc_utils/loop_shift_probe.py --run log/triplane_shift_s29
+conda run -n seawall python plc_utils/loop_shift_probe.py \
     --run log/triplane_shift_s29 --loops 3,17,42
 ```
 
@@ -558,20 +633,20 @@ Always pass `--run` explicitly: the script default is the old hand run
 (`log/laurent_hand_normal_cubic_lam3`), not the run you just trained.
 
 ```bash
-conda run -n seawall python loop_propagation.py \
+conda run -n seawall python plc_utils/loop_propagation.py \
     --run log/triplane_shift_s29 --out log/loop_propagation_dancing_triplane --step 1
 
-conda run -n seawall python loop_propagation.py \
+conda run -n seawall python plc_utils/loop_propagation.py \
     --run log/triplane_shift_s29 --out log/loop_propagation_dancing_triplane --step 2
 
 # optional deformation-budgeted variant
-conda run -n seawall python loop_propagation.py \
+conda run -n seawall python plc_utils/loop_propagation.py \
     --run log/triplane_shift_s29 --out log/loop_propagation_dancing_triplane --step 2b
 
-conda run -n seawall python loop_propagation.py \
+conda run -n seawall python plc_utils/loop_propagation.py \
     --run log/triplane_shift_s29 --out log/loop_propagation_dancing_triplane --step 3
 
-conda run -n seawall python loop_propagation.py \
+conda run -n seawall python plc_utils/loop_propagation.py \
     --run log/triplane_shift_s29 --out log/loop_propagation_dancing_triplane --step 4
 ```
 
@@ -724,22 +799,24 @@ RUN=log/my_shape_triplane
 # 1+2. extract and fit, with checkpoint. The cube warm-up
 #      (warmup/cube_warmup.pt) is loaded by default; --no-warmup ablates it.
 #      Add --seam-align 1 --seam-every 10 --seam-steps 100 to solve the seam.
+#      Add --freeze-f-epochs 100 when a loop family reverses during the drag
+#      (WORKFLOW.md §2.4); the field places the loops while f is held.
 conda run -n seawall python rosa_main.py --train --path "$SHAPE" --out "$RUN" \
     --samples 29 --epochs 1000 \
     --feature triplane --triplane-tv 0.01 --normal 0.01
 
 # check the seam the checkpoint exports
-conda run -n seawall python seam_check.py "$RUN/${STEM}_model.pt"
+conda run -n seawall python plc_utils/seam_check.py "$RUN/${STEM}_model.pt"
 
 # 3. check replay and axial-shift behaviour
-conda run -n seawall python loop_shift_probe.py --run "$RUN"
+conda run -n seawall python plc_utils/loop_shift_probe.py --run "$RUN"
 
 # 4. propagate, align, loft
-conda run -n seawall python loop_propagation.py \
+conda run -n seawall python plc_utils/loop_propagation.py \
     --run "$RUN" --out "${RUN}_propagation" --step all
 
 # optional: use only the loops on the good side of the export split
-conda run -n seawall python loop_propagation.py \
+conda run -n seawall python plc_utils/loop_propagation.py \
     --run "$RUN" --out "${RUN}_propagation_good" --step all --good-only
 ```
 
@@ -761,6 +838,10 @@ What is verified:
   splits tracks at rejected pairs.
 - The normal-orientation loss is implemented and active when `--normal > 0`; all
   runs here used `0.01` and annealed it to zero.
+- The frozen start (`--freeze-f-epochs 100`) holds the shared MLP while the
+  triplane field places the loops: on horse the run ends 2/139 reversed at
+  full-target fit `0.000476` against the baseline's 44/139 at `0.000461`, with
+  the direction term unchanged. See §2.4.
 - The phase-only seam solve (`--seam-align`) leaves the fit untouched (identical
   epoch lines, weights at the run-to-run noise floor) and moves every
   neighbour-graph pair to its best achievable shift on the trained bunny
@@ -771,6 +852,11 @@ Known gaps:
 - **Shift generation is shape-dependent.** It is reliable on smooth, slowly
   varying cross-sections (horse) and weak on bunny and on fast-changing slices.
   The cause is the query feature, not network width.
+- **The frozen start is panel-wide, with two open shapes.** The eight-shape
+  panel (todo.md) cuts reversed loops 207 -> 47 of 1239 at essentially matched
+  fit. Dancing children is worse (4 -> 11 reversed) and laurent hand does not
+  fully catch up in fit (0.0011 against 0.0006), so both need a seeded repeat;
+  the field is 3-8x rougher in tv throughout.
 - **Topological changes are not handled.** A section that splits into detached
   digits cannot be produced by deforming one closed loop. Step 2b stops at the
   deformation budget; cutting the seed at a junction and closing each arc

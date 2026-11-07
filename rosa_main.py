@@ -113,6 +113,16 @@ def build_parser():
                         help='training epochs, one batch of every loop each, so it is '
                              'also the number of steps; a few dozen leaves the curve '
                              'folded back over itself')
+    parser.add_argument('--freeze-f-epochs', type=int, default=0, metavar='N',
+                        help='freeze the shared MLP -- the map from (sin z, cos z, '
+                             'feature, axis) to the curve -- for the first N epochs '
+                             'and train only the conditioning field. The warm-up map '
+                             'is what keeps every loop closed, consistently oriented '
+                             'and starting from one square; the first epochs then say '
+                             'where each shape loop is without rewriting that map, so '
+                             'the curves are moved onto their slices by the field '
+                             'rather than dragged there by changing f. 0 (default) '
+                             'trains both from the first step')
     parser.add_argument('--warmup', default='warmup/cube_warmup_axis.pt',
                         metavar='CKPT',
                         help='cube warm-up checkpoint loaded before the first fit, on '
@@ -210,20 +220,6 @@ def build_parser():
     parser.add_argument('--layers', type=int, default=2,
                         help='hidden layers in the shared network, each --neurons wide; '
                              'depth adds capacity without widening the conditioning path')
-    parser.add_argument('--smooth', type=float, default=0.0,
-                        help='weight of the bend penalty on d2 out/dz2, which is what '
-                             'keeps a fitted curve smooth: chamfer distance alone is '
-                             'happy with a curve that folds back over itself or '
-                             'wiggles between two branches. The penalty is scale free '
-                             '(a circle reads 39.5 at any radius), so the weight is in '
-                             'units of the chamfer loss, which is a squared distance. '
-                             'At 3e-5 the hand reads bend 494 -> 51 and dancing '
-                             'children 839 -> 65, at a mean error of 0.010 -> 0.015 on '
-                             'both and no loop over the limit; on cubic_lam3 the same '
-                             'weight doubles the median plane error to 0.034 and puts '
-                             '20 loops past the limit, because a thin two-sided loop '
-                             'can only be smooth by fattening away from its points. '
-                             '0 fits with no constraint at all')
     parser.add_argument('--normal', dest='align', default=0.0,
                         type=float, metavar='W',
                         help='weight of the normal term, which asks the normal the '
@@ -269,7 +265,7 @@ def build_parser():
                              'that phase is one number per loop, solved against the '
                              'code graph\'s neighbour pairs every --seam-every epochs. '
                              'Only the phases take a gradient -- the curves are read '
-                             'detached -- so the fit, bend and normal terms are the '
+                             'detached -- so the fit and normal terms are the '
                              'ones the same run makes without it, and the exported '
                              'loops start where their neighbours put the seam')
     parser.add_argument('--seam-every', type=int, default=10,
@@ -400,7 +396,7 @@ def code_neighbour_graph(keys, targets, gate=2.0, min_radius=0.4):
     return pairs, weights, dists
 
 
-def fit_loops(found, epochs=300, neurons=64, layers=2, smooth=0.0, align=0.0,
+def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
               max_err=0.03, large=1.5, normal_arrows=20,
               warmup='warmup/cube_warmup_axis.pt',
               snapshot_every=50,
@@ -411,7 +407,7 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, smooth=0.0, align=0.0,
               axis_condition=True,
               distill=0.0, distill_warmup=None,
               seam_align=0.0, seam_every=10, seam_start=0, seam_steps=100,
-              seam_lam=0.02):
+              seam_lam=0.02, freeze_f_epochs=0):
     """Fit every extracted loop and write the predictions, figures and tables.
 
     found: the loop extractor that has already run, whose cloud, planes, loops
@@ -443,6 +439,13 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, smooth=0.0, align=0.0,
              Unlike the direction term its weight is not annealed. `distill_warmup`
              defaults to `warmup`, so the teacher is the checkpoint the fit started
              from. Zero leaves the fit exactly as it was
+    freeze_f_epochs: freeze the shared MLP -- the f map -- for the first N epochs
+             and train only the conditioning field. The warm-up's map is what keeps
+             every loop closed, consistently oriented and starting from one square;
+             freezing it keeps that prior while the field moves each curve onto its
+             slice, instead of the first updates translating and scaling the loop by
+             rewriting the map. It is released after N epochs and the fit continues
+             as usual. 0 trains both from the first step
     snapshot_every: a fit grid is written every this many epochs while the run is
              still going, into <out>/snapshots/, so a run can be watched taking
              shape rather than only judged once it is over.  Each one is the grid
@@ -489,7 +492,7 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, smooth=0.0, align=0.0,
     seam_align, seam_every, seam_start, seam_steps, seam_lam: a phase-only seam
              alignment.  The fit is indifferent to where z = 0 falls on a closed
              loop -- sliding a curve through its own parameter changes no fit,
-             bend or normal term -- so that phase is one number per loop, solved
+             or normal term -- so that phase is one number per loop, solved
              against the same neighbour graph every `seam_every` epochs from
              `seam_start`, with `seam_steps` Adam steps per solve.  Only the phases
              get a gradient: the curves are detached, so the fit is exactly the one
@@ -881,11 +884,12 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, smooth=0.0, align=0.0,
                                 for i in range(len(targets))])
             trainer = mini_nn.Trainer(
                 targets, num_models=len(targets), num_neurons=neurons,
-                num_layers=layers, smooth=smooth, normals=normals, align=align,
+                num_layers=layers, normals=normals, align=align,
                 code_weights=code_weights, code_smooth=code_smooth,
                 feature_mode='triplane', triplane=triplane,
                 query_points=queries, feature_pairs=code_pairs,
                 feature_tv=triplane_tv, axis_condition=axis_condition,
+                freeze_f_epochs=max(0, freeze_f_epochs - done),
                 distill=distill_weight, distill_warmup=teacher_warmup,
                 distill_pairs=code_pairs, distill_weights=code_weights,
                 **seam_args)
@@ -893,24 +897,28 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, smooth=0.0, align=0.0,
             print(f'  fitting {len(targets)} loops, M = '
                   f'{trainer.dataloader.max_points} points each, triplane {shape}, '
                   f'{trainer.model.triplane.feat_dim}-D features, '
-                  f'{layers}x{neurons} net, smooth {smooth:g}, align {align:g}, '
+                  f'{layers}x{neurons} net, align {align:g}, '
                   f'axis condition {"on" if axis_condition else "off"}'
+                  f'{f", f map frozen for {freeze_f_epochs} epochs" if freeze_f_epochs else ""}'
                   f'{f", distill {distill_weight:g}" if distill_weight else ""}')
         else:
             codes = codes_for(loops)
             code_rows = [(int(codes[i]), int(codes[j])) for i, j in code_pairs]
             trainer = mini_nn.Trainer(targets, num_models=len(row_of), codes=codes,
                                       num_neurons=neurons, num_layers=layers,
-                                      smooth=smooth, normals=normals, align=align,
+                                      normals=normals, align=align,
                                       code_pairs=code_rows,
                                       code_weights=code_weights,
                                       code_smooth=code_smooth,
                                       axis_condition=axis_condition,
+                                      freeze_f_epochs=max(0, freeze_f_epochs
+                                                          - done),
                                       **seam_args)
             print(f'  fitting {len(targets)} loops, M = '
                   f'{trainer.dataloader.max_points} points each, {len(row_of)} plane '
-                  f'codes, {layers}x{neurons} net, smooth {smooth:g}, align {align:g}, '
-                  f'axis condition {"on" if axis_condition else "off"}')
+                  f'codes, {layers}x{neurons} net, align {align:g}, '
+                  f'axis condition {"on" if axis_condition else "off"}'
+                  f'{f", f map frozen for {freeze_f_epochs} epochs" if freeze_f_epochs else ""}')
         last_code_graph = (keys, code_pairs, code_weights, code_dists)
 
         ## a plane set added later takes the network over and seeds its own rows; the
@@ -967,7 +975,7 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, smooth=0.0, align=0.0,
         with open(terms_path, 'w', newline='') as fh:
             writer = csv.writer(fh)
             writer.writerow(['epoch', 'axis', 'loops', 'reversed', 'winding',
-                             'fold', 'fit', 'align', 'bend', 'loss'])
+                             'fold', 'fit', 'align', 'loss'])
             for row in trainer.epoch_stats:
                 for name in ('x', 'y', 'z'):
                     if name not in row['axes']:
@@ -978,7 +986,6 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, smooth=0.0, align=0.0,
                         f"{s['winding']:.6f}", f"{s['fold']:.6f}",
                         f"{s['fit']:.8f}",
                         '' if 'align' not in s else f"{s['align']:.6f}",
-                        '' if 'bend' not in s else f"{s['bend']:.2f}",
                         f"{row['loss']:.8f}"])
         wind_path = out / f'{stem}_loop_winding.npz'
         np.savez(wind_path,
@@ -998,8 +1005,8 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, smooth=0.0, align=0.0,
     ## ---- the run's own report, from one last pass over the same curves ----------
     preds, pred_normals, loop_errors, align_err, flipped = fitted()
 
-    ## the bend is the one reading that still needs the network's graph, since it is
-    ## the second derivative; a circle is 39.5
+    ## a reading, not a loss: the second derivative still needs the network's graph;
+    ## a circle is 39.5
     bend = trainer.bend()
 
     ## ---- the fitted network, so a later test can replay it --------------------
@@ -1189,7 +1196,7 @@ def main(argv=None):
     if args.train:
         fit_loops(found, epochs=args.epochs, neurons=args.neurons,
                   layers=args.layers,
-                  smooth=args.smooth, align=args.align, max_err=args.max_err,
+                  align=args.align, max_err=args.max_err,
                   large=args.large, normal_arrows=normal_arrows,
                   warmup=args.warmup,
                   snapshot_every=args.snapshot_every,
@@ -1201,6 +1208,7 @@ def main(argv=None):
                   triplane_channels=args.triplane_channels,
                   triplane_tv=args.triplane_tv,
                   axis_condition=args.axis_condition,
+                  freeze_f_epochs=args.freeze_f_epochs,
                   distill=args.distill, distill_warmup=args.distill_warmup,
                   seam_align=args.seam_align, seam_every=args.seam_every,
                   seam_start=args.seam_start, seam_steps=args.seam_steps,

@@ -278,10 +278,9 @@ def bend_penalty(d1, d2, eps=1e-12):
 
     Both derivatives scale with the curve, so their ratio does not: a circle reads
     4*pi^2 = 39.5 whatever its radius and whatever number of points describes it, and
-    a curve that zig-zags or doubles back over itself reads far above that. One
-    weight therefore means the same thing on a 0.05 loop and a 20 unit one, and on a
-    100-point loop and a 4000-point one, which is what makes it usable as a bare
-    number rather than a per-shape knob.
+    a curve that zig-zags or doubles back over itself reads far above that. The
+    number is therefore comparable across shapes and loop sizes. It is a reading,
+    not a loss term: the fit does not optimise it (the run prints it at the end).
 
     The derivative is taken with respect to the parameter, not the arc length, so
     the same curve parameterised unevenly reads higher too -- which is what a wiggly
@@ -977,7 +976,7 @@ class Trainer:
     def __init__(self, point_sets, num_models=1, max_points=None, batch_size=None,
                  latent_points=None, lr=1e-2, seed=0, num_neurons=64, num_layers=2,
                  feat_dim=32,
-                 smooth=0.0, normals=None, align=0.0, codes=None,
+                 normals=None, align=0.0, codes=None,
                  code_pairs=None, code_weights=None, code_smooth=0.0,
                  feature_mode='embedding', triplane=None, query_points=None,
                  feature_pairs=None, feature_tv=0.0, axis_condition=False,
@@ -985,7 +984,7 @@ class Trainer:
                  distill_weights=None,
                  seam_align=0.0, seam_pairs=None, seam_weights=None, seam_keys=None,
                  seam_every=10, seam_start=0, seam_steps=100, seam_lam=0.02,
-                 seam_lr=2e-2, seam_mu=1e-3):
+                 seam_lr=2e-2, seam_mu=1e-3, freeze_f_epochs=0):
         """
         Fit a list of point sets, one target per sample.
 
@@ -1004,11 +1003,6 @@ class Trainer:
                      with a lot of structure in it needs a wider one
         feat_dim: length of the latent vector each target is conditioned on, which is
                      what lets one MLP serve many different targets
-        smooth: weight of the bend penalty on d2 out/dz2. The fit alone is free to
-                     fold a curve back over itself or leave it wiggling between two
-                     branches of a point set, since chamfer distance only asks for the
-                     nearest point; the penalty is what makes the second derivative
-                     small, and 0 leaves the fit unconstrained
         normals: list of S_i x 3 outward unit normals, one per point of each set.
                      Chamfer distance pairs points by distance alone, so a curve can
                      cut across the surface it is meant to run along wherever two
@@ -1076,7 +1070,7 @@ class Trainer:
         seam_align: weight of the seam-alignment energy, 0 to leave every loop's
                      parameterisation alone. The fit cannot see where z = 0 falls on a
                      closed curve -- sliding a loop through its own parameter changes
-                     no chamfer, bend or normal term -- so that phase is one number per
+                     no chamfer or normal term -- so that phase is one number per
                      loop, learned against its neighbours and nothing else. The curves
                      are read once, detached, and only the phases take a gradient, so
                      the shape never moves: what changes is where the first sample of
@@ -1105,6 +1099,15 @@ class Trainer:
         seam_mu: weight of a zero-mean prior on the phases, which is what keeps the
                      whole run from rotating together: only differences are observable,
                      and this picks the one nearest the phases it started from
+        freeze_f_epochs: freeze the shared MLP -- the map from (sin z, cos z,
+                     feature, axis) to the curve -- for the first N epochs and train
+                     nothing but the conditioning field. The warm-up's map is what
+                     makes every loop close, circulate the same way and start from the
+                     same square; the fit's first job is to say where each shape loop
+                     is, which is the field's job. Frozen, the map keeps that prior
+                     while the grid moves the curves onto their slices; released after
+                     N epochs, it refines the shapes. 0 (default) trains both from the
+                     first step, as every run before this did
         """
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.feature_mode = feature_mode
@@ -1145,7 +1148,6 @@ class Trainer:
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.lr = lr
-        self.smooth = smooth
         self.align = align
         self.code_smooth = float(code_smooth)
         self.code_pairs = None
@@ -1253,17 +1255,40 @@ class Trainer:
         self.winding_history = []
         self._last_reversed = None
 
-    def _epoch_diagnostics(self, out, target, near, pair, d1, d2, axis):
-        """Per-loop fit, direction, bend, winding and fold for one batch, by axis."""
+        ## the shared map's first epochs: frozen, only the field trains. The counter
+        ## is the trainer's own, so a stage handed the trainer continues the same
+        ## budget rather than restarting it
+        self.freeze_f_epochs = int(freeze_f_epochs)
+        if self.freeze_f_epochs < 0:
+            raise ValueError(f'freeze_f_epochs must be non-negative, got '
+                             f'{self.freeze_f_epochs}')
+        self.epochs_done = 0
+        self.f_trainable = True
+
+    def set_f_trainable(self, trainable):
+        """Freeze or release the shared MLP, the f map, without rebuilding the run.
+
+        The triplane grid is a parameter of `self.model` but not of `self.model.model`,
+        so it keeps training either way. Freezing removes the map's gradients too, so
+        the frozen branch is cheaper as well as constrained; the optimizer keeps its
+        parameter list, and a parameter without a gradient is simply not stepped.
+        """
+        trainable = bool(trainable)
+        if trainable == self.f_trainable:
+            return
+        for parameter in self.model.model.parameters():
+            parameter.requires_grad_(trainable)
+        self.f_trainable = trainable
+        print(f'  f map {"released" if trainable else "frozen"}: '
+              f'{"every parameter trains" if trainable else "only the field trains"}')
+
+    def _epoch_diagnostics(self, out, target, near, pair, d1, axis):
+        """Per-loop fit, direction, winding and fold for one batch, by axis."""
         with torch.no_grad():
             near_t = target.gather(1, near[..., None].expand(-1, -1, 3))
             winding, fold = curve_winding(out, axis, centre=target.mean(1))
             loop = dict(fit=((out - near_t) ** 2).sum(-1).mean(1),
                         winding=winding, fold=fold)
-            if d1 is not None and d2 is not None:
-                loop['bend'] = ((d2 ** 2).sum(-1).mean(1)
-                                / ((d1 ** 2).sum(-1).mean(1).detach()
-                                   + 1e-12))
             if d1 is not None and pair is not None:
                 loop['align'] = (1.0 - normal_cosine(d1, pair, axis)).mean(1)
         return {name: value.cpu().numpy() for name, value in loop.items()}
@@ -1274,7 +1299,7 @@ class Trainer:
 
         The warm-up is a teacher of shape and orientation, and both are already in
         the student's weights. What the fit cannot see is where z = 0 falls: the
-        chamfer, bend and normal terms are invariant to sliding a closed curve
+        chamfer and normal terms are invariant to sliding a closed curve
         through its own parameter. The teacher can see it, so the teacher is read
         once at this shape's own queries and axes, and the per-pair seam distance D
         of its curves is the ceiling the student is held under: the term charges
@@ -1532,7 +1557,12 @@ class Trainer:
         step = 0
         history = []
         for e in range(epochs):
-            losses, fits, bends, aligns, weights = [], [], [], [], []
+            ## the first N epochs keep the warm-up's map and move only the field;
+            ## the counter is the trainer's, so a stage boundary does not refund the
+            ## frozen epochs or restart the budget
+            frozen = self.epochs_done < self.freeze_f_epochs
+            self.set_f_trainable(not frozen)
+            losses, fits, aligns, weights = [], [], [], []
             code_pens, tvs, distills = [], [], []
             diag = None
             if self.axes is not None:
@@ -1560,16 +1590,10 @@ class Trainer:
                 out = self.model(z, idx, feat, axis)       # B x N x 3
                 fit, near = self.loss_fn(out, target)
                 loss = fit
-                ## one set of backward passes serves both penalties when they are on
-                d1 = curve_tangent(out, z) if self.smooth or self.align else None
-                d2 = curve_curvature(d1, z) if self.smooth else None
+                ## the direction term is the only one that differentiates the
+                ## curve, so its tangent is the one derivative a step needs
+                d1 = curve_tangent(out, z) if self.align else None
                 pair = None
-                if self.smooth:
-                    ## both derivatives of the curve at the very coords it is drawn at,
-                    ## so the term acts on the curve the fit figure shows
-                    bend = bend_penalty(d1, d2)
-                    loss = loss + self.smooth * bend
-                    bends.append(bend.item())
                 if self.align:
                     ## the outward normal of the target point chamfer matched to each
                     ## predicted one, against the direction the curve travels there:
@@ -1592,7 +1616,7 @@ class Trainer:
                     ## used, so the record is the step's own state rather than a new
                     ## draw of it
                     reading = self._epoch_diagnostics(out, target, near, pair,
-                                                      d1, d2, axis)
+                                                      d1, axis)
                     where = np.asarray(ids)
                     diag_seen[where] += 1
                     for name, value in reading.items():
@@ -1673,8 +1697,6 @@ class Trainer:
             ## the terms separately: a weight is chosen by what it costs in the fit
             ## against what it buys in smoothness, which one total cannot show
             parts = [f'fit {np.mean(fits):.4f}']
-            if bends:
-                parts.append(f'bend {np.mean(bends):.1f}')
             if aligns:
                 parts.append(f'align {np.mean(aligns):.3f} '
                              f'(w {np.mean(weights):.4f})')
@@ -1687,7 +1709,10 @@ class Trainer:
                 parts.append(f'tv {np.mean(tvs):.5f}')
             if distills:
                 parts.append(f'distill {np.mean(distills):.6f}')
-            print(f' {e} epoch: loss: {np.mean(losses):.4f} ({", ".join(parts)})')
+            print(f' {e} epoch: loss: {np.mean(losses):.4f} '
+                  f'({", ".join(parts)})'
+                  f'{" [f frozen]" if frozen else ""}')
+            self.epochs_done += 1
             history.append(float(np.mean(losses)))
             if diag is not None:
                 ## the axis a loop belongs to is the plane it was cut on, so the
@@ -1710,8 +1735,6 @@ class Trainer:
                                reversed=int(np.nansum(diag['winding'][mask] < 0)))
                     if 'align' in diag:
                         row['align'] = float(np.nanmean(diag['align'][mask]))
-                    if 'bend' in diag:
-                        row['bend'] = float(np.nanmean(diag['bend'][mask]))
                     per_axis[name] = row
                 self.epoch_stats.append(dict(epoch=e + 1,
                                              loss=float(np.mean(losses)),
@@ -1936,11 +1959,12 @@ class Trainer:
 
     def bend(self):
         """
-        The bend penalty over every fitted curve as it now stands, all sets at once.
+        The bend reading over every fitted curve as it now stands, all sets at once.
 
         A circle reads 39.5, so the number says how many times round the fitted curves
-        run in the course of one, which is the thing the weight is buying: it is the
-        only way to tell a straightened fit from an equally well fitting wiggly one.
+        run in the course of one: it is the only way to tell a straightened fit from
+        an equally well fitting wiggly one. Nothing optimises this; the fit has no
+        bend term, and the number is printed so the curves' own shape stays visible.
         """
         idx = torch.as_tensor(self.codes, device=self.device)
         feat = self.feature_values() if self.feature_mode == 'triplane' else None

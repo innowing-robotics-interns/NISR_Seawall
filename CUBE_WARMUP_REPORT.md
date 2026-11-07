@@ -40,7 +40,7 @@ warm-up).
   (27 vs 43) and which family flips.
 - Its visible cost is bend: warm loops are 1.35–2.1× more bent than blank loops
   on all four shapes, because the cube's square corners train the network to
-  make corners. `--smooth` is the lever against that.
+  make corners. The fit has no bend term, so nothing pushes back against that.
 
 ## 1. What was run
 
@@ -163,7 +163,7 @@ What the table says:
   to the run's own median; in absolute terms the worst plane mean is 0.0266,
   under half the red limit. It is the many small limb loops that raise the
   spread, not a failing region.
-- **Bend is high everywhere** (a circle is 39.5). This run had `--smooth 0`, so
+- **Bend is high everywhere** (a circle is 39.5). The fit has no bend term, so
   nothing penalised it, and the cube-warmed network keeps a square-like
   tendency; see §7 where the blank controls show the warm-up raises it
   1.35–2.1×.
@@ -401,8 +401,8 @@ What the comparison shows:
 4. **Bend.** The cost is consistent across shapes and repeats: 1651 vs
    1042/1176 on `armadillo` (1.4–1.6×), 4953/5150 vs 2994/3663 on `bunny`
    (1.35–1.7×), 4500 vs 2132 on `horse` (2.1×), 2712 vs 1991 on `lucy` (1.36×).
-   The cube warm-up trains on squares, so it teaches corners; with `--smooth 0`
-   nothing removes them once the position term is satisfied. This is the
+   The cube warm-up trains on squares, so it teaches corners; the fit has no
+   bend term, so nothing removes them once the position term is satisfied. This is the
    concrete cost of §2's exact cube fit.
 
 ### 7.2 Recreated controls: fresh draws (2026-11-07)
@@ -511,7 +511,8 @@ What survives, and what does not:
   alone — the grid and MLP contributions are not separated here.
 - **No `--seam-align`.** D here is whatever the fit left; the number that
   matters for export with the phase solve on is a different experiment.
-- **No `--smooth`.** The bend readings are the unregularised ones.
+- **No bend term.** The fit does not optimise bend; the readings are the
+  curves' own.
 - **Blank start is degenerate.** With a zero grid every loop starts on the same
   curve. That is what `--no-warmup` means, but it makes the blank's initial D
   trivially 0 and its orientation arbitrary — the final numbers are the only
@@ -542,7 +543,7 @@ python rosa_main.py --path normalized_shapes_cuboid/bunny_points_cubic_lam3.ply 
 #   armadillo blank -> log/blank2_tri_tv01_armadillo
 
 # seam on any saved checkpoint (writes the D table above)
-python seam_check.py log/warm_tri_tv01_bunny/bunny_points_cubic_lam3_model.pt
+python plc_utils/seam_check.py log/warm_tri_tv01_bunny/bunny_points_cubic_lam3_model.pt
 ```
 
 Files: `*_model.pt` (network, grid, queries, keys, plane frame), `*_triplane.npz`

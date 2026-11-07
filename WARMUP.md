@@ -259,8 +259,8 @@ everywhere has no seam disagreement while fitting nothing (fit 0.1245 against
 
 Two caveats: the fit's own losses are seam-invariant, so it can and does slide
 `z = 0` after the warm-up (W10); holding it is `--seam-align`'s job. And the
-cube's sharp corners leave more bend in the warmed fit (2190 against 778), which
-`--smooth` addresses if it matters.
+cube's sharp corners leave more bend in the warmed fit (2190 against 778), and the
+fit has no bend term to push back against that.
 
 Runs: `log/fit300n_warm`, `log/fit300n_blank` (normal term on), `log/fit300_warm`,
 `log/fit300_blank` (normal term off).
