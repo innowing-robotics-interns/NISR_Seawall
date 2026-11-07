@@ -89,8 +89,8 @@ loaded in part.
 the triplane grid trains, so the field's only way to reduce chamfer is to move
 each loop's query onto its target points. Epoch lines carry `[f frozen]` and the
 boundary prints `f map released`; the freeze is a placement initialiser, and the
-rest of the run is the ordinary fit. The trainer counts epochs itself, so a
-resumed run does not re-freeze or refund epochs.
+rest of the run is the ordinary fit. Later refinement stages inherit the same
+budget, so they do not refund the frozen epochs.
 
 On the panel of eight shapes (29 planes per axis, 1000 epochs, controls are the
 matched `--distill 10` runs without the freeze, 1239 loops), the freeze cuts
