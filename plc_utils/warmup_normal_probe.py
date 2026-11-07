@@ -85,13 +85,13 @@ def build(ex, targets, normals, frame, feature, seed, align=0.01,
                             for i in range(len(targets))])
         return mini_nn.Trainer(
             targets, num_models=len(targets), num_neurons=neurons,
-            num_layers=layers, smooth=0.0, normals=normals, align=align,
+            num_layers=layers, normals=normals, align=align,
             seed=seed, feature_mode='triplane', triplane=tri,
             query_points=queries, feature_tv=0.01,
             axis_condition=axis_condition)
     return mini_nn.Trainer(
         targets, num_models=len(targets), codes=np.arange(len(targets)),
-        num_neurons=neurons, num_layers=layers, smooth=0.0, normals=normals,
+        num_neurons=neurons, num_layers=layers, normals=normals,
         align=align, seed=seed, feature_mode='embedding',
         axis_condition=axis_condition)
 

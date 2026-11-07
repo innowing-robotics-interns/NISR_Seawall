@@ -131,7 +131,7 @@ axes[1, 1].set_title('e  winding of every y loop over the run  (blue = clockwise
 
 final = {a: (int(series[a]['reversed'][-1]), int(series[a]['loops'][-1]))
          for a in AXES}
-fig.suptitle('horse y: ' + ', '.join(f'{a} {v[0]}/{v[1]} clockwise' for a, v in final.items())
+fig.suptitle(f'{STEM}: ' + ', '.join(f'{a} {v[0]}/{v[1]} clockwise' for a, v in final.items())
              + f'   |   y first turns at epoch {flip_lo}, half by {flip_hi}',
              fontsize=11)
 fig.tight_layout(rect=(0, 0, 1, 0.96))

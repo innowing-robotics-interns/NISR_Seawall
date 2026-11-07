@@ -215,6 +215,9 @@ def main():
         ## the set is the loops that end up reversed, so an early epoch shows
         ## the same loops as the final fit
         report = [r for r in report if r['w1'] < -0.5]
+    if not report:
+        raise SystemExit(f'{args.axis}: no loops to draw'
+                         + (' with winding < -0.5' if args.turned_only else ''))
 
     nx = 6
     ny = int(np.ceil(len(report) / nx))

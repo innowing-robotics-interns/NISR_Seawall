@@ -1,6 +1,6 @@
 """Measure the seam agreement a checkpoint actually exports.
 
-The fit cannot place the seam: Chamfer, bend and the normal term are invariant
+The fit cannot place the seam: Chamfer and the normal term are invariant
 to `f(z) -> f(z + p_i)`.  This script reads the network at its own `z` grid and
 compares the seams of neighbouring loops on the run's own
 `*_feature_graph.csv` pairs.  The distance is the one `--seam-align`

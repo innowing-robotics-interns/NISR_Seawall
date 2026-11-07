@@ -42,8 +42,10 @@ def build(ckpt, state, warmup):
     if state is None:
         mini_nn.load_warmup(warmup, model)
     else:
-        model.load_state_dict(torch.load(state, map_location='cpu',
-                                         weights_only=False))
+        ## either a bare state dict from replay_epochs.py or a finished run's
+        ## `*_model.pt`, which keeps the same weights under 'state_dict'
+        saved = torch.load(state, map_location='cpu', weights_only=False)
+        model.load_state_dict(saved.get('state_dict', saved))
     return model.eval()
 
 
