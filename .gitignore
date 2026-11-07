@@ -12,6 +12,7 @@ utils/intersect.sh
 3dModelsTemp/*
 **/__pycache__/
 inputmodels/*
+Mesh_Datasets/*
 demo/*
 *.txt
 *.pt

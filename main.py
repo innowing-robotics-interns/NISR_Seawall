@@ -27,6 +27,8 @@ from model.losses import (chamfer_distance, chamfer_distance_chunked, directiona
                                 mu_warmup_schedule,
                                 normal_constraint_loss,
                                 chunked_argmin_nn,
+                                isometry_loss,
+                                tangential_drift_loss,
                                 outer_boundary_rectangle_loss,
                                 sample_outer_boundary_correspondence,
                                              surface_jacobian,
@@ -2033,7 +2035,24 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                    render_min_coverage=0.1, render_preview=4,
                    render_view_clip=0.0, render_pixel_clip=0.0,
                    render_layers=1, render_far_weight=0.5,
+                   seq_ref=None, seq_prev=None, cur_norm=None,
+                   lambda_iso=0.0, iso_warmup_epochs=0, iso_warmup_delay=0,
+                   lambda_tan=0.0, tan_warmup_epochs=0, tan_warmup_delay=0,
                    tb_writer=None):
+    # Sequence anchors (frames >= 1 of a deformation sequence).  `seq_ref` /
+    # `seq_prev` are frozen copies of the frame-0 / previous-frame models,
+    # each a dict {'model', 'center', 'scale'}; `cur_norm` is this frame's
+    # {'center', 'scale'}.  Both terms compare the SAME (leaf, u, v) samples
+    # in world units, so frames normalized separately stay comparable.
+    if lambda_iso < 0 or lambda_tan < 0:
+        raise ValueError(f"--lambda_iso/--lambda_tan must be >= 0, got "
+                         f"{lambda_iso}/{lambda_tan}")
+    if lambda_iso > 0 and seq_ref is None:
+        raise ValueError("--lambda_iso > 0 needs the frame-0 reference (--ref_ckpt)")
+    if lambda_tan > 0 and seq_prev is None:
+        raise ValueError("--lambda_tan > 0 needs the previous-frame model (--prev_ckpt)")
+    if (lambda_iso > 0 or lambda_tan > 0) and cur_norm is None:
+        raise ValueError("sequence anchors need this frame's normalization (cur_norm)")
     if ext_mask_epoch < 0 or ext_mask_every < 0:
         raise ValueError("--ext_mask_epoch/--ext_mask_every must be >= 0")
     if ext_mode not in ('no_reg', 'no_fit'):
@@ -2234,6 +2253,7 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                'tangent': [], 'svd': [], 'normal': [],
                'normal_fwd': [], 'normal_bwd': [], 'ext_area': [],
                'render': [], 'render_lap': [], 'render_eff': [],
+               'iso': [], 'tan': [],
                'total': [], 'n_leaves': [], 'tangent_mode': [],
                'surface_phase': [], 'ghpr_stage': [], 'ext_masked': [],
                # first epoch of every GHPR stage / the full-cloud phase
@@ -2247,7 +2267,25 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
     events = []
     ext_mask = None
     zero = torch.tensor(0.0, device=device)
-    need_jac = (mu > 0) or (lam_svd > 0) or use_normal or (lambda_ext_area > 0)
+    # The tangential term needs uv gradients too: the previous frame's normal
+    # comes from its own Jacobian at the same samples.
+    need_jac = ((mu > 0) or (lam_svd > 0) or use_normal or (lambda_ext_area > 0)
+                or (lambda_iso > 0) or (lambda_tan > 0))
+    if cur_norm is not None:
+        cur_scale = float(cur_norm['scale'])
+        cur_center = torch.as_tensor(np.asarray(cur_norm['center'], np.float32),
+                                     device=device).reshape(1, 3)
+    if seq_prev is not None:
+        prev_center = torch.as_tensor(np.asarray(seq_prev['center'], np.float32),
+                                      device=device).reshape(1, 3)
+
+    def _frozen_jacobian(ref_model, pids_, uv_):
+        """Position and tangents of a frozen model at the given samples.
+        create_graph=True only because surface_jacobian calls autograd.grad
+        three times on one graph; everything is detached on return."""
+        Q_ref = ref_model(pids_, uv_)
+        tu_ref, tv_ref = surface_jacobian(Q_ref, uv_, create_graph=True)
+        return Q_ref.detach(), tu_ref.detach(), tv_ref.detach()
 
     # Fixed per-leaf UV grid for deterministic Chamfer sampling.
     cd_grid_uv = None
@@ -2818,12 +2856,18 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                                            delay_epochs=gamma_warmup_delay)
         if use_ddf:
             mu_eff *= ddf_mu_decay
+        iso_eff = mu_warmup_schedule(epoch, iso_warmup_epochs, lambda_iso,
+                                     schedule=schedule,
+                                     delay_epochs=iso_warmup_delay) if lambda_iso > 0 else 0.0
+        tan_eff = mu_warmup_schedule(epoch, tan_warmup_epochs, lambda_tan,
+                                     schedule=schedule,
+                                     delay_epochs=tan_warmup_delay) if lambda_tan > 0 else 0.0
 
         # One Jacobian, shared by all Jacobian-based terms.  The cadence applies
         # to every regularizer that depends on it, including the extension area.
         reg_due = reg_every <= 1 or epoch % reg_every == 0
         if (need_jac and reg_due
-                and (mu_eff > 0 or svd_eff > 0 or gamma_eff > 0
+                and (mu_eff > 0 or svd_eff > 0 or gamma_eff > 0 or iso_eff > 0
                      or (lambda_ext_area > 0 and in_ext is not None))):
             t_u, t_v = surface_jacobian(Q, uv)
         else:
@@ -2855,6 +2899,29 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
         else:
             ext_area_loss = zero
 
+        # Sequence anchors, on the same samples (and extension rule) as the
+        # μ/λ_svd regularizers.  (A) isometry against frame 0: the world-unit
+        # metric of each (leaf, u, v) must stay what it was in frame 0, which
+        # bending preserves.  (B) tangential drift against the previous frame:
+        # each sample may move along the previous surface's normal, not
+        # within it.  Reported in this frame's normalized units, like CD.
+        iso_loss = tan_loss = zero
+        if reg_due and (iso_eff > 0 or tan_eff > 0):
+            uv_reg = uv if reg is None else uv[reg]
+            if iso_eff > 0 and t_u is not None:
+                _, tu0, tv0 = _frozen_jacobian(seq_ref['model'], pids_reg, uv_reg)
+                iso_loss = isometry_loss(t_u_reg, t_v_reg, tu0, tv0,
+                                         scale=cur_scale,
+                                         ref_scale=float(seq_ref['scale']))
+            if tan_eff > 0:
+                Q_prev, tup, tvp = _frozen_jacobian(seq_prev['model'], pids_reg, uv_reg)
+                n_prev = torch.cross(tup, tvp, dim=-1)
+                n_prev = n_prev / (n_prev.norm(dim=-1, keepdim=True) + 1e-12)
+                Q_reg = Q if reg is None else Q[reg]
+                x_cur = Q_reg * cur_scale + cur_center
+                x_prev = Q_prev * float(seq_prev['scale']) + prev_center
+                tan_loss = tangential_drift_loss(x_cur, x_prev, n_prev) / cur_scale
+
         if gamma_eff > 0 and t_u is not None:
             t_u_fit, t_v_fit = (t_u, t_v) if fit is None else (t_u[fit], t_v[fit])
             if pool_tree is not None:
@@ -2883,7 +2950,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             normal_loss = normal_fwd = normal_bwd = zero
 
         loss = (surface_loss + mu_eff * tangent + svd_eff * svd_loss
-                + gamma_eff * normal_loss + lambda_ext_area * ext_area_loss)
+                + gamma_eff * normal_loss + lambda_ext_area * ext_area_loss
+                + iso_eff * iso_loss + tan_eff * tan_loss)
         opt.zero_grad()
         # A window with every term scheduled off (e.g. render_start_epoch > 0
         # while μ/SVD are still warming up) has no graph; stepping the scheduler
@@ -2915,6 +2983,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
             history['normal_fwd'].append(float(normal_fwd))
             history['normal_bwd'].append(float(normal_bwd))
             history['ext_area'].append(float(ext_area_loss))
+            history['iso'].append(float(iso_loss))
+            history['tan'].append(float(tan_loss))
             history['render'].append(float(render_loss_log))
             history['render_lap'].append(float(render_lap_log))
             history['render_eff'].append(float(render_eff))
@@ -2941,6 +3011,10 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 'normal_fwd': normal_fwd,
                 'normal_bwd': normal_bwd,
                 'ext_area': ext_area_loss,
+                'iso': iso_loss,
+                'tan': tan_loss,
+                'iso_eff': iso_eff,
+                'tan_eff': tan_eff,
                 'render': render_loss_log,
                 'render_raw': render_raw_log,
                 'render_clip_frac': render_clip_frac_log,
@@ -2964,6 +3038,8 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                 'svd': float(svd_eff) * float(svd_loss),
                 'gamma_normal': float(gamma_eff) * float(normal_loss),
                 'ext_area': float(lambda_ext_area) * float(ext_area_loss),
+                'iso': float(iso_eff) * float(iso_loss),
+                'tan': float(tan_eff) * float(tan_loss),
             }, epoch)
             tangent_tag = 'SymDir' if tangent_mode_eff == 'symmetric_dirichlet' else 'Tangent'
             normal_str = (f"Normal={float(normal_loss):.5f} "
@@ -2972,6 +3048,10 @@ def train_adaptive(model, pts3n, epochs, M_per_patch, lr, mu,
                           if use_normal else "")
             ext_area_str = (f"ExtArea={float(ext_area_loss):.5f}  "
                             if lambda_ext_area > 0 else "")
+            ext_area_str += (f"Iso={float(iso_loss):.5f}(w={float(iso_eff):.3f})  "
+                             if lambda_iso > 0 else "")
+            ext_area_str += (f"Tan={float(tan_loss):.5f}(w={float(tan_eff):.3f})  "
+                             if lambda_tan > 0 else "")
             # Mark which term is actually being optimized: '*' = in the loss,
             # '(·)' = evaluated for monitoring only.
             if render_active:
@@ -3044,6 +3124,8 @@ def build_run_config(args):
     if adaptive:
         if a.load_ckpt:
             init['load_ckpt'] = a.load_ckpt
+            if a.freeze_topology:
+                init['freeze_topology'] = True
         else:
             init['base_subdivisions'] = a.base_subdivisions
             if a.skip_pretrain:
@@ -3220,6 +3302,13 @@ def build_run_config(args):
                             'ext_nn_scale', 'ext_min_opening_vertices', 'ext_weld_tol',
                             'ext_face_res', 'lambda_ext_area'))
         cfg['extension_mask'] = ext
+
+        seq = pick('lambda_iso', 'lambda_tan')
+        if a.lambda_iso > 0:
+            seq.update(pick('ref_ckpt', 'iso_warmup_epochs', 'iso_warmup_delay'))
+        if a.lambda_tan > 0:
+            seq.update(pick('prev_ckpt', 'tan_warmup_epochs', 'tan_warmup_delay'))
+        cfg['sequence'] = seq
         cfg['debug'] = {'save_vertex_pos_every': a.save_vertex_pos_every}
     return cfg
 
@@ -3284,6 +3373,24 @@ def run_adaptive(args):
             f"--adaptive supports --pretrain_loss mse or l1, got '{args.pretrain_loss}'. "
             f"('cd' is only available in the fixed-grid pipeline.)")
     ghpr_gammas = _resolve_ghpr_gammas(args) if args.ghpr_init else None
+
+    # Sequence training: (leaf, u, v) must address the same quadtree in every
+    # frame, so a frozen topology turns subdivision off before anything else.
+    if args.freeze_topology:
+        if not args.load_ckpt:
+            raise ValueError("--freeze_topology needs --load_ckpt (the topology to keep)")
+        args.subdiv_threshold = 0.0
+        args.subdiv_cd_threshold = 0.0
+    if args.lambda_tan > 0 and args.prev_ckpt is None:
+        args.prev_ckpt = args.load_ckpt
+    if args.lambda_iso > 0 and not args.ref_ckpt:
+        raise ValueError("--lambda_iso > 0 needs --ref_ckpt (the frame-0 checkpoint)")
+    if args.lambda_tan > 0 and not args.prev_ckpt:
+        raise ValueError("--lambda_tan > 0 needs --prev_ckpt or --load_ckpt")
+    if (args.lambda_iso > 0 or args.lambda_tan > 0) and not args.freeze_topology:
+        print("  [warn] --lambda_iso/--lambda_tan without --freeze_topology: a "
+              "subdivision would renumber the leaves and break the sample "
+              "correspondence with the reference models.")
 
     result_dir = utils._get_unique_folder(args.result_dir)
     os.makedirs(result_dir, exist_ok=True)
@@ -3466,6 +3573,11 @@ def run_adaptive(args):
             'scale': float(meta['scale']),
         },
         'ghpr': ghpr_info,
+        'sequence': ({'ref_ckpt': args.ref_ckpt if args.lambda_iso > 0 else None,
+                      'prev_ckpt': args.prev_ckpt if args.lambda_tan > 0 else None,
+                      'lambda_iso': args.lambda_iso, 'lambda_tan': args.lambda_tan,
+                      'freeze_topology': bool(args.freeze_topology)}
+                     if (args.lambda_iso > 0 or args.lambda_tan > 0) else None),
         'box_init': {'mode': 'ghpr' if args.ghpr_init else args.box_init,
                      'center': np.asarray(box_center).tolist(),
                      # scalar for a cube, [x, y, z] half-extents for a cuboid
@@ -3495,6 +3607,37 @@ def run_adaptive(args):
             d_features=args.d_features, base_subdivisions=args.base_subdivisions,
             L=args.L, W=args.W, D=args.D, beta=args.beta).to(args.device)
         model.complex.rebuild_flat()
+
+    # frozen sequence anchors
+    def _load_frozen(path, role):
+        ckpt = torch.load(path, map_location='cpu')
+        if ckpt.get('normalization') is None:
+            raise ValueError(f"{role} checkpoint {path} stores no normalization; use a "
+                             f"checkpoint written during/after phase 2 (checkpoint*.pt)")
+        ref = AdaptiveCubeForwardMap.from_checkpoint(ckpt, device=args.device)
+        for p in ref.parameters():
+            p.requires_grad_(False)
+        a, b = model.complex, ref.complex
+        if (a.n_vertices != b.n_vertices
+                or [tuple(r) for r in a.subdiv_log] != [tuple(r) for r in b.subdiv_log]):
+            raise ValueError(
+                f"{role} checkpoint {path} has a different quadtree ({b.n_leaves} leaves, "
+                f"{b.n_vertices} vertices) than the model being trained ({a.n_leaves} "
+                f"leaves, {a.n_vertices} vertices); (leaf, u, v) would not correspond.")
+        print(f"  {role}: {path}  ({b.n_leaves} leaves, "
+              f"scale={float(ckpt['normalization']['scale']):.5f})")
+        return {'model': ref, 'center': ckpt['normalization']['center'],
+                'scale': float(ckpt['normalization']['scale'])}
+
+    seq_ref = _load_frozen(args.ref_ckpt, 'Isometry reference (frame 0)') \
+        if args.lambda_iso > 0 else None
+    seq_prev = None
+    if args.lambda_tan > 0:
+        seq_prev = (seq_ref if seq_ref is not None
+                    and os.path.abspath(args.prev_ckpt) == os.path.abspath(args.ref_ckpt)
+                    else _load_frozen(args.prev_ckpt, 'Tangential-drift reference (prev frame)'))
+    cur_norm = {'center': np.asarray(meta['center'], np.float64).tolist(),
+                'scale': float(meta['scale'])}
 
     # first phase: box pretraining
     pretrain_history = None
@@ -3607,6 +3750,11 @@ def run_adaptive(args):
         render_pixel_clip=args.render_pixel_clip,
         render_layers=args.render_layers,
         render_far_weight=args.render_far_weight,
+        seq_ref=seq_ref, seq_prev=seq_prev, cur_norm=cur_norm,
+        lambda_iso=args.lambda_iso, iso_warmup_epochs=args.iso_warmup_epochs,
+        iso_warmup_delay=args.iso_warmup_delay,
+        lambda_tan=args.lambda_tan, tan_warmup_epochs=args.tan_warmup_epochs,
+        tan_warmup_delay=args.tan_warmup_delay,
         ext_kwargs={'resolution': args.ext_resolution, 'nn_scale': args.ext_nn_scale,
                     'max_area_frac': args.ext_max_area_frac,
                     'min_opening_vertices': args.ext_min_opening_vertices,
@@ -3953,6 +4101,33 @@ def main():
     adaptive_group.add_argument('--load_ckpt', type=str, default=None,
                                 help='[Adaptive] Resume topology+weights from an adaptive '
                                      'checkpoint (skips pretraining)')
+
+    adaptive_group.add_argument('--freeze_topology', action='store_true',
+                                help='[Adaptive, --load_ckpt] Keep the loaded quadtree: '
+                                     'subdivision is turned off, so (leaf, u, v) addresses '
+                                     'the same chart point as in the loaded checkpoint')
+
+    # Sequence anchors: frames >= 1 of a deformation sequence, warm-started
+    # with --load_ckpt from the previous frame.
+    seq_group = parser.add_argument_group('sequence anchors (--adaptive)')
+    seq_group.add_argument('--ref_ckpt', type=str, default=None,
+                           help='[Adaptive] Frame-0 checkpoint, frozen. Reference metric '
+                                'for --lambda_iso')
+    seq_group.add_argument('--prev_ckpt', type=str, default=None,
+                           help='[Adaptive] Previous-frame checkpoint, frozen. Reference '
+                                'positions/normals for --lambda_tan (default: --load_ckpt)')
+    seq_group.add_argument('--lambda_iso', type=float, default=0.0,
+                           help='[Adaptive] Weight of the isometry term: relative change '
+                                'of the world-unit first fundamental form at each '
+                                '(leaf, u, v) vs. --ref_ckpt (0 = off)')
+    seq_group.add_argument('--iso_warmup_epochs', type=int, default=0)
+    seq_group.add_argument('--iso_warmup_delay', type=int, default=0)
+    seq_group.add_argument('--lambda_tan', type=float, default=0.0,
+                           help='[Adaptive] Weight of the tangential-drift term: mean '
+                                'in-surface displacement of each (leaf, u, v) from '
+                                '--prev_ckpt, in normalized units (0 = off)')
+    seq_group.add_argument('--tan_warmup_epochs', type=int, default=0)
+    seq_group.add_argument('--tan_warmup_delay', type=int, default=0)
 
     adaptive_group.add_argument('--save_vertex_pos_every', type=int, default=0,
                             help='[Adaptive] Save tracked logical vertex positions every N epochs (0 disables; the JSON grows quadratically and rewrites every save)')

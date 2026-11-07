@@ -439,6 +439,50 @@ def tangent_loss_from_jac(model=None,
 
     return energy
 
+def isometry_loss(t_u: torch.Tensor, t_v: torch.Tensor,
+                  t_u_ref: torch.Tensor, t_v_ref: torch.Tensor,
+                  scale: float = 1.0, ref_scale: float = 1.0,
+                  eps: float = 1e-12) -> torch.Tensor:
+    """
+    Relative change of the first fundamental form against a reference map.
+
+    Both Jacobians are taken at the same (patch, u, v) and converted to world
+    units with their own normalization scale, so frames normalized separately
+    are compared on the same footing:
+
+        I = (s J)^T (s J),  loss = mean ||I - I_ref||_F^2 / mean ||I_ref||_F^2
+
+    Pure bending keeps I unchanged, so this term is zero for an ideal bending
+    deformation and grows when the parameterization stretches, shears, or
+    slides non-isometrically. The batch-level normalization (rather than per
+    sample) keeps near-degenerate reference samples from dominating.
+    """
+    J = torch.stack([t_u, t_v], dim=2) * scale
+    J_ref = torch.stack([t_u_ref, t_v_ref], dim=2) * ref_scale
+    I = torch.matmul(J.transpose(1, 2), J)
+    I_ref = torch.matmul(J_ref.transpose(1, 2), J_ref)
+    num = ((I - I_ref) ** 2).sum(dim=(1, 2)).mean()
+    den = (I_ref ** 2).sum(dim=(1, 2)).mean().clamp_min(eps)
+    return num / den
+
+
+def tangential_drift_loss(x: torch.Tensor, x_prev: torch.Tensor,
+                          n_prev: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """
+    Mean in-surface displacement of each (patch, u, v) from the previous frame.
+
+    `x`, `x_prev` are the positions of the SAME parametric samples under the
+    current and previous map, `n_prev` the previous surface's unit normals.
+    Only the component of x - x_prev tangent to the previous surface is
+    penalized, so the surface may move freely along its normal (bending) but
+    not slide within itself. Units follow the inputs (unsquared distance, like
+    the Chamfer term).
+    """
+    d = x - x_prev
+    d_t = d - (d * n_prev).sum(dim=-1, keepdim=True) * n_prev
+    return torch.sqrt((d_t ** 2).sum(dim=-1) + eps).mean()
+
+
 def chunked_argmin_nn(query: torch.Tensor, candidates: torch.Tensor,
                       chunk_size: int = 2048) -> torch.Tensor:
     """Index of each query's nearest candidate for birdirectional normal loss"""
