@@ -1,0 +1,415 @@
+# TODO
+
+## Loop orientation: a learned axis condition, not a flip
+
+The loops must come out of the network already oriented. No per-loop sign buffer,
+no calibration pass, no flip at export: if a loop disagrees with its normals,
+that is a result to explain, not a correction to apply.
+
+- [x] Feed the slice axis to the network as an observation
+
+  The warm-up trains against outward normals (+0.997 cos on the cube), but
+  `miniNN.forward` received only `z` and the triplane feature. On a shape,
+  64–78% of loop queries read a zero feature at load (§2.1 of
+  `CUBE_WARMUP_REPORT.md`), so loops from different plane families received the
+  same condition and the network could not know which way round each should
+  run. The axis was in the loss, not in the input: the missing observation, not
+  the training.
+
+  Built: `miniNN(axis_condition=True)` concatenates the unit plane normal after
+  the feature, so the first layer reads `[sin z, cos z, feature, axis]` (53 wide
+  for a 48-D field). `Trainer` reads the axes off the targets with
+  `Square.from_points`, which is the same +x/+y/+z the direction term uses, and
+  builds them whenever `axis_condition` is on — not only when `--normal` is.
+  The training pass, `predict`, `predict_tangent`, `bend`, the seam solve and
+  the warm-up all pass the same vector; checkpoints store the flag and the
+  per-loop axes, and `load_warmup` refuses a checkpoint warmed in the other
+  mode. `--no-axis-condition` is the ablation; `warmup/cube_warmup_axis.pt` is
+  the axis warm-up and the default checkpoint.
+
+  Epoch 0 on the same loops, zero feature everywhere (the grid stays zero-init):
+
+  | shape | arm | zero features | cos med | reversed | D mean | bend |
+  |---|---|---|---|---|---|---|
+  | armadillo | off | 119/162 | 0.157 | 21 | 0.0116 | 1049 |
+  | armadillo | axis | 119/162 | 0.478 | **0** | 0.0011 | 714 |
+  | bunny | off | 59/80 | 0.055 | 7 | 0.0094 | 1071 |
+  | bunny | axis | 59/80 | 0.543 | **1** | 0.0002 | 703 |
+  | horse | off | 108/139 | 0.260 | 8 | 0.0168 | 1058 |
+  | horse | axis | 108/139 | 0.543 | **1** | 0.0006 | 738 |
+  | lucy | off | 101/157 | 0.099 | 39 | 0.0186 | 1045 |
+  | lucy | axis | 101/157 | 0.443 | **5** | 0.0362 | 703 |
+
+  The zero-feature counts are unchanged, so the improvement comes from the axis
+  alone: a loop whose field is the shared zero still gets its own plane. The
+  load-time fit error is a little higher (bunny 0.252 vs 0.255, horse 0.411 vs
+  0.574) because the axis warm-up draws each family's own square rather than one
+  shared square; D and bend are lower.
+
+- [x] Triplane initialisation: zero was right, Xavier was not
+
+  The grid starts at zero, so every cell the warm-up never reads stays zero and
+  most shape loops share one condition. Xavier removes that degeneracy but
+  hands the warm-up MLP codes it never trained on: at 1000 epochs on bunny it
+  ends with 8 reversed loops against 3 from the zero start, D mean 0.031 against
+  0.009, and bend 6765 against 4953, for a fit within 0.0006 of the same. The
+  init therefore trades a known degeneracy for an out-of-distribution one, and
+  the axis observation is what actually supplies the missing information.
+  Reverted to zeros; the Xavier checkpoint is left on disk as the ablation.
+
+- [ ] Keep the direction term; treat persistent disagreement as a junction signal
+
+  Do not release the direction term near the points and do not turn loops round
+  by hand. Keep the orientation term through the fit (at least at its nominal
+  weight; a far-from-target boost may be added, but it never falls to zero), and
+  report every loop whose direction stays ambiguous.
+
+  A loop that cannot be made consistent with its target normals is evidence that
+  the slice contains a junction, a branch, or several loops — a natural place to
+  segment the shape. The orientation residual is therefore a segmentation cue,
+  not a failure to hide. Flag loops below a cosine margin and write them with
+  the loop key, axis, cosine and fit error for the segmentation step.
+
+  Measured on bunny with two warm-ups that differ only at epoch 0 (zero vs
+  Xavier, both 200 epochs, `--normal 0.01`): the end is the same — fit 0.0170 vs
+  0.0192, cos median 0.809 vs 0.793, reversed 34 vs 33 — so the start does not
+  decide the orientation. The schedule does: the same shape and weight at 1000
+  epochs ends with 3 reversed (zero start) and 8 (Xavier start), because the
+  anneal is on for five times as long in absolute epochs (it is
+  `cosine_anneal(step, total)`). At 200 epochs the weight reaches 0 early and
+  the ~34 reversed loops are frozen while the fit error still converges. So the
+  budget changes the count by an order of magnitude; the init does not. Keeping
+  the term is therefore not optional; the comparison at equal budget is part of
+  the acceptance test.
+
+- [ ] Remove the manual export flip in `rosa_main.fitted()`
+
+  The function currently reverses any loop with mean cos < -0.1 before writing
+  the PLYs and figures. Once the axis is an input and orientation is learned,
+  that flip hides exactly the signal the previous item wants to keep. Report the
+  direction as the network produced it; if a file must follow the cloud's
+  normals for a consumer, that is the consumer's rendering choice, not a silent
+  change to the loop.
+
+## Teacher-student seam distillation (`--distill`)
+
+The cube warm-up sets shape and orientation; the follow-up fit is what has to
+make the seam distance `D` small. The warm-up is therefore loaded a second time
+as a frozen teacher, read once at the shape's own queries and axes, and its
+per-pair `D` is the **ceiling** the student is held under: only the excess over
+the teacher is charged, so the term can lower `D` but never raise it. The curves
+themselves are never matched pointwise: only `D` is, so a common deformation is
+free and shape and orientation stay with the fit. `D` is invariant to
+orientation, so the term has no direction of its own: it cannot flip a loop
+directly, and any change in the against-normal count is the fit's own outcome —
+that division of labour is deliberate.
+
+- [x] Implement the follow-up in `mini_nn.Trainer`
+
+  `Trainer._build_distill` validates the checkpoint kind, axis flag and feature
+  width, rebuilds the frozen teacher, maps each shape query through the
+  teacher's unit-cube frame (`teacher.centre + (q - centre)/half * teacher.half`),
+  and records `D` per neighbour pair. `D` is scale-free, so each side reads
+  **its own** curve size — the teacher draws at the warm-up's cube scale, the
+  student at the shape's — and the two relative disagreements are compared. The
+  pair's fixed shape-target radius only carries the dimensionless excess into
+  chamfer units: `weight * scale * max(D_student - D_teacher, 0)`. At step 0 the
+  student is the teacher, both `D` values are equal, and the term is exactly
+  zero. Flags: `--distill W` and `--distill-warmup CKPT` (defaults to
+  `--warmup`); off by default.
+
+  Two wrong versions were measured and replaced. Dividing the teacher's `D` by
+  the shape target's radius inflated its profile wherever a shape loop is small:
+  on armadillo the teacher's mean/max read `0.32 / 13.0` instead of
+  `0.0011 / 0.023`, and matching it raised the student's own-scale `D` mean
+  `0.108 -> 0.132` and max `1.28 -> 3.59`. Matching the profile symmetrically
+  (with the denominator fixed) still pulled lucy's worst pair up to the
+  teacher's `2.14` from the baseline's `1.53`. Hence the own-scale comparison
+  and the one-sided ceiling.
+
+- [x] Measure at 1000 epochs on six shapes (`W = 10`, 29 planes)
+
+  Matched arms: `log/axis_tri_tv01_<shape>` (baseline) and
+  `log/axis_seam10_<shape>` (distillation), both axis-conditioned triplane at
+  `--normal 0.01 --triplane-tv 0.01`, same loops and pairs. Each cell is
+  baseline → distillation.
+
+  | shape | loops / pairs | fit | bend | against normals | bad | D med | D mean | D p90 | D max |
+  |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+  | bunny | 80 / 61 | 0.0007 → 0.0010 | 4968 → 6000 | 0 → 0 | 3 → 4 | 0.000845 → 0.000042 | 0.009591 → 0.000168 | 0.021680 → 0.000519 | 0.170108 → 0.001383 |
+  | armadillo | 162 / 108 | 0.0007 → 0.0013 | 3484 → 2256 | 4 → 1 | 8 → 9 | 0.024032 → 0.000518 | 0.108036 → 0.002483 | 0.271146 → 0.005144 | 1.275502 → 0.032433 |
+  | horse | 139 / 99 | 0.0003 → 0.0005 | 5320 → 3983 | 11 → 3 | 4 → 5 | 0.011446 → 0.000507 | 0.022065 → 0.001094 | 0.061962 → 0.002535 | 0.151364 → 0.008623 |
+  | lucy | 157 / 83 | 0.0004 → 0.0007 | 2280 → 3969 | 13 → 14 | 0 → 0 | 0.056359 → 0.000470 | 0.289455 → 0.025304 | 0.883988 → 0.011167 | 2.798740 → 1.480760 |
+  | laurent hand | 149 / 90 | 0.0004 → 0.0006 | 8791 → 9545 | 0 → 0 | 33 → 38 | 0.004851 → 0.000214 | 0.067148 → 0.000826 | 0.074943 → 0.002397 | 3.228513 → 0.011227 |
+  | rocker arm | 153 / 119 | 0.0005 → 0.0007 | 14080 → 6530 | 1 → 0 | 0 → 3 | 0.001296 → 0.000136 | 0.045203 → 0.000734 | 0.171421 → 0.001625 | 0.650649 → 0.014472 |
+
+  The term works on all six: the median falls 9.5–120×, the mean 11–81×, the
+  p90 24–105×, and the max 18–288× (`lucy` is the exception at 1.9×). Fit
+  costs at most `0.0006` in absolute terms (`0.0003 → 0.0005` on horse, `0.0007 →
+  0.0013` on armadillo, `0.0005 → 0.0007` on rocker arm); no shape changes its
+  loop count or its pair graph. `bend` is printed with weight 0 in these runs,
+  so its move is curve roughness, not a loss cost; rocker arm's roughness falls
+  the most (`14080 → 6530`) while its bad-loop count rises.
+
+  "Against normals" is the per-loop direction vote (mean cosine below `-0.1`),
+  measured before the export flip. `D` is orientation-blind, so the term does
+  not target this count; what changes is the fit's own outcome: armadillo
+  `4 → 1` and horse `11 → 3` improve, rocker arm goes `1 → 0`, bunny and
+  laurent stay at zero, lucy goes `13 → 14`. The mean direction penalty moves
+  with it (`1 - cos`: bunny `0.104 → 0.103`, armadillo `0.314 → 0.265`, horse
+  `0.377 → 0.321`, lucy `0.462 → 0.531`, laurent `0.266 → 0.345`, rocker arm
+  `0.400 → 0.470`). The reporting line used to hard-code "0 aligned and 2
+  reversed" beside this vote; it now prints the measured count, so these are
+  read from the `N of M loops ran against the points' normals` line rather than
+  the stale prefix.
+
+  The cosine vote undercounts a folded family. Rocker arm's signed winding
+  (`curve_winding`, centre at the loop's target centroid) shows its y family
+  mostly clockwise, `33/57 → 41/57`, mean winding `0.000 → -0.439`, with x at
+  `1/59 → 0/59` and z at `21/37 → 21/37`. Those y loops have median foldover
+  `1.569 → 1.281`: forward and backward stretches pair with the same target
+  points, so the local cosine averages out and the vote reads almost nothing.
+  `D` is orientation-blind, so distillation neither caused nor removed this;
+  it is the fit's own outcome and reproduces the horse y-family reversal. Read
+  the signed winding next to the cosine vote, not instead of it.
+
+  Two honest tails. `lucy`'s mean and max stay high because the teacher's own
+  profile is high there (mean `0.0362`, max `2.1419`): some pairs in lucy have
+  no consistent seam even for the warm-up, and a `1.48` max under a `2.14`
+  ceiling is the hinge declining to move a loop far from its points. That pair
+  is a junction candidate, not a distillation failure. `laurent hand` pays +5
+  bad loops (`33 → 38`), the largest quality cost of the six; rocker arm pays
+  +3 (`0 → 3`). The student does not always reach the ceiling (`laurent` D mean
+  `0.000826` vs teacher `0.000237`), so the reported residual `distill`
+  (`4e-6`–`1.4e-5`) at the end is real: fit and seam still trade against each
+  other. The ceiling is approached, not attained: 45/61 bunny, 92/108
+  armadillo, 71/99 horse, 54/83 lucy, 77/90 laurent and 83/119 rocker arm pairs
+  still sit above their teacher `D`, by a median excess of `1.5e-5` to
+  `2.0e-4`.
+
+## Backlog
+
+- [x] Can we build a triplane to do the feature?
+
+  Built: `--feature triplane` conditions the shared MLP on three sampled 2D grids
+  instead of a row per loop (`mini_nn.TriplaneField`, exported as
+  `*_triplane.npz`). On 29-plane dancing children at 32 cells it matches the row
+  table on fit and is slightly ahead downstream (35 tubes / 138 loops vs
+  34 / 133); continuity alone does not smooth the features, the `--code-smooth`
+  term is still needed. 64 cells is worse; a 60-step warm-up gives the best fit.
+  Details, table and figures: [loop_propagation.md](loop_propagation.md#triplane-feature-field-instead-of-one-row-per-loop).
+
+## Loop alignment and generalized cylinders
+
+Currently, we are using linear interpolated features along the axis.
+
+**Implementation:** [align_loops.py](align_loops.py) — standalone module (numpy + optional scipy only). It implements the pair residual `D_ij`, the closed-form switch `s* = λ/(λ + D)`, the seam-offset solve, `v_i`, and the loft; `python align_loops.py` runs a synthetic self-test. It is not imported by `loop_extraction.py` or `rosa_main.py` yet.
+
+- [x] How to align two adjacent loops if they can be aligned, and drop those pairs that cannot be aligned
+
+  Implemented as `pair_residual` (FFT circular shift + parabolic refinement) → `switch(D; λ)` → keep when `s ≥ min_switch`; seam offsets come from the weighted least-squares solve. On hand planes y = −0.71 → −0.36 all 3 adjacent pairs are kept (`s = 0.857/0.767/0.806`, `D = 0.0033/0.0061/0.0048`), seam spread 0.030, residual RMS 7.5e−4. Visual: [hand_alignment.png](log/align_loops/hand_alignment.png), numbers: [hand_alignment.json](log/align_loops/hand_alignment.json).
+
+- [x] Whole-hand pass (λ = 0.02, min switch 0.3): 45 planes = 23 single-loop + 22 multi-loop (55 loops). The 23 single-loop planes form an x chain (14 planes) and a y chain (7 planes); 8/19 adjacent pairs pass. That gives **3 tubes covering 11 loops** — x planes 1–2, x planes 11–13, y planes 16–21 (6 loops, v span 0.607, s 0.623–0.742, seam 0.069). The other 12 single-loop planes stay outside (10 fail a pair switch, 2 z planes have no chain partner). The y tube is solid; the x 1–2 tube is shape-aligned but its centres jump 4.1× the plane spacing (`Δc/Δoff`), and y 15–16 is marginal (s = 0.2998). Multi-loop planes cannot join a tube with the current one-loop-per-plane API, so most of the hand's 78 loops remain uncovered. Visual: [hand_tubes.png](log/align_loops/hand_tubes.png), numbers: [hand_tubes.json](log/align_loops/hand_tubes.json), meshes: [hand_tubes.ply](log/align_loops/hand_tubes.ply) and [hand_tubes_cloud.ply](log/align_loops/hand_tubes_cloud.ply).
+
+- [ ] Can we make generalized cylinders from the loops
+
+### A smooth switch with a closed-form solution
+
+Use the switchable least-squares objective
+
+$$
+E_{ij} = s_{ij}^2\, D_{ij} + \lambda\,(1 - s_{ij})^2, \qquad \lambda > 0
+$$
+
+Here $D_{ij}$ is already a squared alignment error, so $s_{ij}^2 D_{ij}$ means multiplying the underlying residual by $s_{ij}$ before squaring. This is the standard structure of a switchable least-squares constraint.
+
+### Synchronized loops define the tube coordinates
+
+- [x] Assign a longitudinal coordinate $v_i$ to each loop — for example, cumulative distance between centers:
+
+$$
+v_0 = 0, \qquad v_{i+1} = v_i + \lVert c_{i+1} - c_i \rVert
+$$
+
+- [x] Now the data are samples of a two-parameter surface:
+
+$$
+F(z, v_i) = g_i(z + \alpha_i)
+$$
+
+Where:
+
+- $z$ runs around the tube
+- $v$ runs along the tube
+- $F(0, v)$ is the seam formed by the synchronized starting points
+
+- [x] First reconstruction: interpolate between successive loops with a simple loft (this is proposed, not a guarantee of staying on the original surface):
+
+$$
+F(z, v) = (1 - t)\, x_i(z) + t\, x_{i+1}(z),
+\qquad
+t = \frac{v - v_i}{v_{i+1} - v_i}
+$$
+
+  `loop_coordinates`, `synchronize`, and `sample_tube` implement this; the lofted hand tube is the bottom-right panel of [hand_alignment.png](log/align_loops/hand_alignment.png) (`v` span 0.362). The loft passes through the four synchronized loops but is not fitted to the cloud, so it is not guaranteed to stay on the surface.
+
+- [ ] Alternative: fit a shared neural surface $F_\theta(\mathrm{PE}(z), v)$ to the synchronized loops while regularizing smoothness between them; generalized-cylinder models similarly represent surfaces through a longitudinal path and varying cross-sections
+
+### Wiring alignment into training: two meanings, staged
+
+The seam is a free gauge in the current objective: Chamfer, bend and the normal
+term are all invariant to $f(z) \mapsto f(z + p)$, so "wiring alignment into
+training" can mean two different things. They should be staged.
+
+1. **Gauge alignment, no change to the objective.** Give every loop a phase
+   buffer $p_i$ and evaluate $z = (z + p_i) \bmod 1$ wherever the network is
+   sampled. Solve $p$ against the `code_neighbour_graph` pairs with the periodic
+   closed-form residual already in [align_loops.py](align_loops.py)
+   ($D_{ij}$ over circular shifts, sparse weighted least squares, switch
+   $s = \lambda/(\lambda + D)$). The solve can run after or between stages,
+   any number of times, on any checkpoint. Persist $p$ in `*_model.pt` and
+   write `phases.csv`, so predictions, snapshots and exports report the same
+   seam. This only changes where $z = 0$ is placed; the fitted curves and every
+   loss value stay the same. It is the prerequisite for tubes and does not
+   depend on the conditioning mode.
+
+   **Done** — `--seam-align` (see [WORKFLOW.md](WORKFLOW.md) §2.3). Two
+   departures from the plan above: the phases are solved by Adam on a
+   periodic linear interpolation of the detached curves rather than by the
+   closed-form least-squares solve, so the trainer needs no `align_loops`
+   import; and only `*_model.pt` is written (`phases`), no `phases.csv`.
+   Each pair is matched at its best circular shift first and votes
+   `lam/(lam + D_best)`, so a pair of two different loops cannot drag the
+   phases; the energy is the seam distance `D` itself, because the switched
+   value saturates and leaves a far seam with almost no gradient. Verified on
+   the trained 29-plane bunny: every one of 51 pairs moves to its best
+   achievable shift, none worse, p90 `D` `0.979 -> 0.0385`; a 30-epoch run
+   has identical epoch lines with the solve on and off.
+2. **Carry the phase on the warm-up, so the checkpoint needs no buffer. Done**
+   — `--seam-teacher` in [rosa_main.py](rosa_main.py) and
+   `Trainer.pretrain` in [mini_nn.py](mini_nn.py). The phase is not distilled
+   from the fitted checkpoint; the checkpoint supplies one number per loop, and
+   a fresh fit learns the seam from the warm-up target.
+
+   **Recipe.** Pass 1 is a normal `--seam-align` run (above); its checkpoint
+   stores `phases`. Pass 2 runs the same shape and the same first-stage plane
+   set with `--seam-teacher <pass1_model.pt>`, keeps `--pretrain` on, leaves
+   `--seam-align` off, and fits from scratch. Each loop's phase is looked up by
+   `(axis, offset, slot)`; the universal square's points *and* edge normals are
+   read at `z + p_i`:
+
+   $$Q_i(z) = Q(z + p_i), \qquad n_i(z) = n_Q(z + p_i)$$
+
+   Nothing else changes: no teacher weights, grid or fitted curve is copied,
+   the published objective is untouched, and the refit writes `phases = None`.
+   The warm-up runs on stage 0 only; planes added by refinement are seeded as
+   usual.
+
+   **Why the warm-up and not the fitted curves.** Chamfer, bend and the normal
+   term are invariant to `f(z) -> f(z + p_i)`, so the fit cannot hold a seam;
+   the only place to put the phase without a seam term is a target the fit
+   starts from. The square is shape-independent and already the pretraining
+   target, so the phase enters as one extra turn on that target.
+
+   **Measured** on bunny, 5 planes, 13 loops, 2×16 net, 300 epochs, seam solve
+   every 10 epochs (100 steps), `--normal 0.01`, TV `0.01`:
+
+   | run | fit | exported D | p90 | max |
+   |---|---:|---:|---:|---:|
+   | teacher, unshifted seam | 0.0099 | 0.5121 | 2.0458 | 2.2619 |
+   | teacher, aligned seam | 0.0099 | 0.1470 | 0.5137 | 0.8178 |
+   | refit, 300 warm-up steps | 0.0092 | 0.3407 | 0.8285 | 1.0249 |
+   | refit, 40 warm-up steps | 0.0152 | 0.2912 | 0.7824 | 0.8591 |
+
+   The refit removes about a third of the unshifted seam distance at equal fit
+   error, but it does not reach the teacher's aligned `0.15`: 3 of 10 pairs
+   (40-step) and 5 of 10 (300-step) are more than `0.02` worse than the
+   teacher. Short 30-epoch smoke runs can look better (median `0.06`) because
+   the curves have not moved far yet.
+
+   **Why it drifts.** `p_i` is an offset on the teacher's fitted
+   parameterisation, but the warm-up applies it to the square, whose arc-length
+   distribution differs; sample 0 therefore lands only approximately at the
+   teacher's geometric direction, and the free fit can move it further. Carrying
+   the phase exactly would need the teacher's fitted curves (a post-fit
+   distillation, not this path) or a live seam term (which changes the
+   objective).
+
+   **Acceptance** — [seam_check.py](seam_check.py) reads the checkpoint's own
+   `*_feature_graph.csv`, rebuilds the curves on its `z` grid and prints the
+   pair `D` at the exported seam (and at `z = 0` when the checkpoint has
+   phases), plus a per-pair comparison with `--teacher`. Verified:
+
+   - both refit checkpoints have `phases = None`;
+   - `D` at `z = 0` improves over the teacher's unshifted seam (`0.51 ->
+     0.29–0.34`) at the same or better fit;
+   - the teacher's own exported `D` is `0.147`, so the refit leaves a gap;
+   - 5 of 10 pairs exceed teacher + `0.02`; the tail is not hidden by the median.
+
+Both stages are now implemented: (1) gives aligned checkpoints with identical
+geometry; (2) moves that alignment into the warm-up target so the checkpoint
+needs no phase buffer, at the measured drift above.
+
+## Seed from confident loops, then propagate
+
+Right now the tubes may be wrong because of the loop-extraction algorithm. Start from the most confident extracted loops and propagate the construction to nearby planes.
+
+Probe of the propagation idea (rigid transfer, no refit): take the stable y loops 16–21, transfer one to each neighbouring plane, and measure two-sided coverage at 0.02 (1% of the hand extent). On their own planes the loops cover only 0.64 of the slice points on average (they are smooth envelopes of the blocky cubic slices), so that is the ceiling. Leave-one-out inside the band with the extrapolated centre gives 0.49–0.59 of the points and 0.59–0.69 of the loop for planes 17–20. If the loop is registered to the target cloud by translation only (shape fixed, placement from the cloud), the explanation is much better: plane 15 0.63/0.60, 16 0.74/0.82, 17–20 0.59–0.66/0.69–0.75, 22's main slab 0.58/0.58 (its detached thumb 0.09), 23 0.45/0.52, 24 0.34/0.40, 25 0.32/0.30. Beyond 24 point coverage can look like 0.37–0.42 but loop-side support is 0.13–0.21, so those are partial-arc coincidences, not explanations. Two conclusions: the stable loop's shape transfers well and the extrapolated centre is the weak link (e.g. plane 15 is 0.34/0.33 with the tube centre but 0.63/0.60 when registered); and the failure after 24 is topological, because the detached digits are separate loops and the stable loop's upper arc is exactly the part that becomes them. A free deformable fit (Fourier template) covers 100% of 15–21, but it is just a re-fit and no longer tests the seed. Numbers: [loop_explain_neighbors.json](log/align_loops/loop_explain_neighbors.json); panels and coverage curve: [loop_explain_neighbors.png](log/align_loops/loop_explain_neighbors.png).
+
+- [x] Define a confidence score for each extracted loop
+- [x] Use the highest-confidence loops as seeds
+- [x] Propagate the construction (alignment → synchronization → tube coordinates) to nearby planes
+- [x] Rebuild or replace tubes whose loops fall below the confidence threshold
+- [x] Allow a bounded deformation to fit the neighbouring point cloud
+
+  Implemented as `loop_propagation.py --step 2b` (see [loop_propagation.md](loop_propagation.md) §Step 2b). The seed may shift within the step-2 cap and deform along its in-plane normal by a constant taper mode plus 8 Fourier modes, fitted by robust ICP. An edge is admitted when rigid passes **or** deformation passes with an RMS offset ≤ 0.15 of the smaller section radius; the target's own fitted loop still continues the track, so the deformed seed is evidence only. On the hand: 52 accepted edges vs 37 rigid, 13 accepted edges need a deformed seed, 2 rejected only by the budget; 9 tubes / 30 loops vs 8 / 26 (a new distal `x` tube and a 6-loop palm `y` sleeve). The budget sweep 0.05/0.10/0.15/0.20 gives 37/43/52/52 edges, and accepted rescues need ≤ 0.143 while the next rejected pair needs 0.264. The remaining failure is still topological: a section that splits into detached digits cannot be explained by deforming one closed loop. Next step: cut the seed at that junction and close each arc against its own component.
+
+## Polycube from the loops
+
+We now have, per shape, fitted loops on 87 planes (`*_loops.ply`, and the same
+fit replayable from `*_model.pt`), each stored in its plane's local frame with
+the plane's origin and normal, plus tube chains and synchronized loops from
+[align_loops.py](align_loops.py). The question is how to turn these 1-D contours
+into a polycube: a coarse, axis-aligned cuboid complex approximating the same
+solid.
+
+Why the loops are a reasonable starting point: a polycube's faces are
+axis-aligned, so cutting it on an axis plane leaves an orthogonal polygon, and
+each extracted loop is already the smooth outline of one such slice. The three
+plane families (x, y, z) give redundant cross-sections of the same solid.
+
+- [ ] Extract a polycube from the loops we have
+
+  Candidate routes, cheapest first:
+
+  1. **Slice rasterisation** — rasterise every loop into a 2-D occupancy grid in
+     its plane, stack the grids along each axis with interpolation between
+     planes, threshold to a 3-D volume, then run a voxel-to-polycube pass
+     (dominant-normal snapping plus cube merging). The three axis reconstructions
+     can be intersected to remove family-specific artefacts.
+  2. **Loft and quantise** — reuse the tubes from [align_loops.py](align_loops.py):
+     loft between synchronized adjacent sections, snap the lofted surface
+     normals to ±x/±y/±z, and rasterise the snapped surface. This reuses the
+     seam alignment and the `v` coordinate instead of re-deriving them.
+  3. **Half-space carving** — treat every loop as the boundary of the solid in
+     its plane, carve the bounding box by the inside/outside test of all loops
+     and their holes, then quantise the remaining volume.
+
+  Decisions the first pass has to settle:
+
+  - cube size (cubes across the longest axis) and regular grid vs octree;
+  - how to combine the three axis families without double-counting, and how to
+    reconcile a cell that one family calls solid and another calls empty;
+  - multi-loop planes: holes and detached components are separate loops, so a
+    plane must not be filled as one polygon;
+  - closure and splits: a polycube is a closed manifold, so end caps and
+    junctions where one loop becomes several need explicit handling;
+  - evaluation: volume IoU against a voxelised input cloud, Chamfer to the loops
+    and to the cloud, cube count, and a manifold/self-intersection check.
+
+  Deliverable: a standalone `polycube_from_loops.py` producing the occupancy
+  volume, the cube mesh, a per-family comparison figure, and those metrics.
+  Run it first on horse (clean and elongated) and dancing children
+  (multi-component), then on bunny and armadillo, whose cross-sections changed
+  fastest along the axis.
+
