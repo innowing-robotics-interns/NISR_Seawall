@@ -1,8 +1,8 @@
 """Make the moved analysis scripts importable from either entry point.
 
-The scripts in this folder refer to `mini_nn`, `loop_extraction`, `rosa_main`
-and to one another by their bare module names, and they resolve run folders
-such as `log/...` against the repository root. Running
+The scripts in this folder refer to `plc_model.mini_nn`,
+`plc_model.loop_extraction`, `rosa_main` and to one another, and they resolve
+run folders such as `log/...` against the repository root. Running
 
     python plc_utils/<script>.py
     python -m plc_utils.<script>

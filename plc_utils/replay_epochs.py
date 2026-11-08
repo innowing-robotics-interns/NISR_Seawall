@@ -40,6 +40,10 @@ sys.argv = [
     '--samples', '29',
     '--normal', '0.01',
     '--distill', '10',
+    ## this replays the original axis-on/centroid run, which the current code can
+    ## no longer build; the pooling flag is kept so the other settings still match
+    '--feature-pool', 'centroid',
+    '--warmup', 'warmup/cube_warmup_axis.pt',
     '--distill-warmup', 'warmup/cube_warmup_axis.pt',
     '--out', str(out),
     '--snapshot-every', '0',
@@ -48,7 +52,7 @@ if args.freeze_f_epochs:
     sys.argv += ['--freeze-f-epochs', str(args.freeze_f_epochs)]
 
 import _paths  # noqa: E402
-import mini_nn
+from plc_model import mini_nn
 import rosa_main
 
 

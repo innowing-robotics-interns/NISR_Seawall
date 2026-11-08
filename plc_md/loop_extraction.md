@@ -495,10 +495,10 @@ for every loop i where mean cos(tangent x plane_normal, paired_normals) < -0.1:
 
 The network uses a periodic parameter \(z\): it is mapped through sine and cosine so the two ends of a fitted loop meet.
 
-The direction term's weight is **annealed** rather than held: `--normal` is the weight on the first batch, and `cosine_anneal(step, epochs * batches)` takes it down to nothing on the last, along half a cosine. The term settles which way round each loop runs, and that is decided while the fit is still coarse — early, two stretches of a contour passing close are told apart by the way they run rather than by where they are — while later it can only pull a fit that already sits on its points. The schedule counts batches rather than epochs, so it is smooth inside an epoch and a one-epoch run reaches its end just as a fifty-epoch one does. The `align` column of the epoch line is the term itself, unweighted, so it stays comparable across epochs; the weight it was taken at is printed beside it as `(w …)`. There is no bend term in the fit: the run prints the curve's bend at the end as a
+The direction term's weight is **held** at `--normal` for the whole run rather than annealed. The term settles which way round each loop runs, and that is decided while the fit is still coarse — early, two stretches of a contour passing close are told apart by the way they run rather than by where they are. The `align` column of the epoch line is the term itself, unweighted, so it stays comparable across epochs. There is no bend term in the fit: the run prints the curve's bend at the end as a
 reading (a circle is 39.5) and nothing optimises it.
 
-The run can also be watched while it is going. `--snapshot-every a` (50 by default, `0` for none) hands `Trainer.train` a callback that fires after epoch 50, 100, … and writes the fit grid of that moment to `snapshots/<stem>_fits_eNNNN.png`. It is the grid the run writes at its end — the same panels, the same colours, the same red `--max-err` limit — drawn from the network as the epoch line above it left it, measured by the very pass the end of the run is measured by, so a snapshot and the final figure can be laid side by side. A prediction pass per snapshot is what it costs; the alternative, cutting the run into 50-epoch calls, would restart the learning-rate and direction-term anneals at every cut.
+The run can also be watched while it is going. `--snapshot-every a` (50 by default, `0` for none) hands `Trainer.train` a callback that fires after epoch 50, 100, … and writes the fit grid of that moment to `snapshots/<stem>_fits_eNNNN.png`. It is the grid the run writes at its end — the same panels, the same colours, the same red `--max-err` limit — drawn from the network as the epoch line above it left it, measured by the very pass the end of the run is measured by, so a snapshot and the final figure can be laid side by side. A prediction pass per snapshot is what it costs; the alternative, cutting the run into 50-epoch calls, would restart the learning-rate schedule at every cut.
 
 ### Refining the planes during the run
 
@@ -527,7 +527,7 @@ A row added by a stage starts from one of two places, chosen by `--code-init` (d
 
 The table starts at zero — that is `Trainer`'s constructor, and in embedding mode no warm-up replaces it — but every later addition is blended or drawn, so no added row starts at zero. There is no zero-init option and no every-stage warm-up switch.
 
-Each stage is its own `train` call, so the learning rate and the direction term's anneal restart with every stage; new planes get a full direction term again. The seeded rows are learned inside that call, together with the inherited ones. And a stage at a count that has stopped growing is not a stage: once the `--samples-end` cap is reached the remaining epochs are one stage on that plane set, so nothing is re-cut for the same loops and the anneal spans the whole tail.
+Each stage is its own `train` call, so the learning-rate schedule restarts with every stage. The seeded rows are learned inside that call, together with the inherited ones. And a stage at a count that has stopped growing is not a stage: once the `--samples-end` cap is reached the remaining epochs are one stage on that plane set, so nothing is re-cut for the same loops.
 
 What it costs in fit, measured on `laurent_hand` against a flat run on the same final plane set (9 planes per axis, 47 loops, seed 0; median/mean of the per-loop error in `planes.txt`):
 
@@ -556,12 +556,14 @@ Two limits matter before trusting a threshold. The scale is run-specific — 48-
 
 ### The cube warm-up
 
-Before its first fit a run loads a cube-warm-up checkpoint (`--warmup`,
-`warmup/cube_warmup.pt` by default). The checkpoint is trained by its own script,
-`warmup_cube.py`, on a unit cube and nothing else: its loops are the cube's
-cross-sections, and the network learns to draw them on the cube, all circulating
-the same way and all putting \(z = 0\) where their neighbouring loops do. The
-checkpoint holds the shared MLP and the triplane grid, and nothing else — no
+Before its first fit a run loads a warm-up checkpoint (`--warmup`,
+`warmup/cube_warmup_random_ranges.pt` by default). The checkpoint is trained by
+its own script, `warmup_cube.py`, on cubes and nothing else: by default a fresh
+batch of random-size, random-place cubes every step (`--cubes 0` restores the
+single unit cube). Their loops are the cubes' cross-sections, and the network
+learns to draw them on each cube, all circulating the same way and all putting
+\(z = 0\) where their neighbouring loops do. The checkpoint holds the shared MLP
+and the triplane grid, and nothing else — no
 rows, no phases, no plane set — so the shape's loops, planes, targets and phases
 are its own, and the fit keeps its own triplane frame. [WARMUP.md](WARMUP.md) is
 the specification of the task; `--no-warmup` fits from a blank network.
@@ -580,24 +582,33 @@ tangent = analytic d(prediction)/dz from the network
 normal  = tangent x plane_normal
 ```
 
-The normal is calculated inside `Trainer.predict_with_normals()` from the analytic network tangent. The curve lies in its slice, which leaves one in-plane direction square to its tangent, and the order of the cross product is the whole choice between the two: crossing the tangent with the plane normal is one quarter turn, crossing the plane normal with the tangent is the same turn the other way. A quarter turn applied twice is a half turn, `plane_normal x (plane_normal x t) = -t`, so the surface normal is `t x plane_normal`; the other order would be that normal negated, the tangent turned the wrong way for a surface the curve is a contour of. The direction term is written the same way round: it takes `t x plane_normal` as the normal the fit implies and measures `1 - cos` against the point normal the curve was matched to, both read in the loop's plane. The arrow is therefore the surface normal the curve implies — the one the cloud would give — and on a fit the direction term is happy with, it agrees with the target normals; a loop running against them draws inward with it. That is a state the term can only prevent, not repair: at a reversed closed loop its penalty is at its maximum and its gradient is exactly zero, and the weight is annealed to zero besides. On the warm-up square, where the parameterisation orders the walk, it already matches the square's own normals to about 0.96 with the normal term switched off.
+The normal is calculated inside `Trainer.predict_with_normals()` from the analytic network tangent. The curve lies in its slice, which leaves one in-plane direction square to its tangent, and the order of the cross product is the whole choice between the two: crossing the tangent with the plane normal is one quarter turn, crossing the plane normal with the tangent is the same turn the other way. A quarter turn applied twice is a half turn, `plane_normal x (plane_normal x t) = -t`, so the surface normal is `t x plane_normal`; the other order would be that normal negated, the tangent turned the wrong way for a surface the curve is a contour of. The direction term is written the same way round: it takes `t x plane_normal` as the normal the fit implies and measures `1 - cos` against the point normal the curve was matched to, both read in the loop's plane. The arrow is therefore the surface normal the curve implies — the one the cloud would give — and on a fit the direction term is happy with, it agrees with the target normals; a loop running against them draws inward with it. That is a state the term can only prevent, not repair: at a reversed closed loop its penalty is at its maximum and its gradient is exactly zero. On the warm-up square, where the parameterisation orders the walk, it already matches the square's own normals to about 0.96 with the normal term switched off.
 
 Its length is left as the turn gives it rather than scaled to one: because the fitted curve runs inside its slice, that length is the tangent's own, i.e. how far the fit travels per step of the parameter. On the fit panels the projected normal is drawn at that length, so the arrows keep their proportions to each other and to the loops instead of all reading as unit vectors. It is written into the loop PLYs as `nx/ny/nz` and drawn on the fit panels; `--normal-arrows` controls the count per loop.
 
-**The written traversal is turned to agree with the points.** Because a reversed loop is a stationary point of the direction term, the fit's choice of direction is canonicalized once, after the fit, by `rosa_main.fitted()`, from the same nearest-neighbour pairing as the error: for each loop, the mean cosine between the unit predicted normal and the unit paired target normal (unit-normalized, so a fast stretch does not outvote a slow one). If that mean is below −0.1, the loop is turned round — prediction, tangent, predicted normal and per-point error reversed together, so the block a consumer reads is still one loop written in one direction. The margin leaves a folded or side-on loop alone, since such a loop has no one direction to take. `align` is measured before the turn, so it still reports what the fit did, and the run prints how many loops were turned. On the 30-step horse run that was 28 of 30 Y loops with align 0.490; on the 300-step run none were turned (align 0.193) because the fit itself was already right. The PLY `nx/ny/nz`, the fit figures and the per-plane files carry the turned normals; `loop_propagation.load_run` still canonicalizes traversal independently by signed area.
+**The written traversal is the fit's own.** Because a reversed loop is a stationary point of the direction term, the fit's choice of direction is reported, not corrected: `rosa_main.fitted()` measures, from the same nearest-neighbour pairing as the error, the mean cosine between the unit predicted normal and the unit paired target normal (unit-normalized, so a fast stretch does not outvote a slow one). A loop below −0.1 is counted as running against its points' normals and printed, but its prediction, tangent, normal and per-point error are left in the order the network produced them. The margin leaves a folded or side-on loop out of the count, since such a loop has no one direction to take. The PLY `nx/ny/nz`, the fit figures, the per-plane files and the snapshots therefore carry the fitted direction; a consumer that needs the cloud's orientation must make that choice itself. `loop_propagation.load_run` still canonicalizes traversal independently by signed area.
 
 ### Reading the parameter colours
 
 The network is evaluated at one uniform walk of the parameter, so the rows of a prediction are already in parameter order and each curve is drawn as segments coloured by where in that walk they sit. The map is cyclic (`hsv`), because the parameter is periodic: the colour at one full turn is the colour at zero, which is the seam ring. Red is therefore the start, and the walk runs red → yellow → green → cyan → blue → magenta → red. Two things read straight off it. The **direction** is the order the colours come in, and a loop running the other way round shows the reversed sequence. The **pace** is how much colour a stretch of arc carries: a long stretch of nearly one colour is crossed in few parameter steps, so the fit is moving fast there, while a short stretch holding the whole rainbow is where the fit spends most of its walk. A curve that doubles back on itself repeats the same colours on top of each other, which is how a folded fit shows up before its error is read. Under the colours a thin casing keeps the loop's own assignment colour, red and heavier past `--max-err`, so the colour scheme does not cost the bad-loop mark. The fit grid and every per-plane fit figure carry the same colour bar.
 
-### Two different error rules
+### Error rules
 
-There are currently two separate error classifications:
+The PLY split uses three independent checks; a loop goes to the bad side when any one fails:
 
-1. **PLY export:** if the maximum point error of a loop is greater than `0.15`, every predicted point in that loop is coloured red.
-2. **Fit figures and tables:** `--max-err` defines a fraction of the longest bounding-box side, and is applied to the loop's mean error.
+1. **Point limit:** `BAD_POINT_ERR = 0.15` (fixed, in the plane frame). One fitted point past it makes the whole loop bad.
+2. **Mean limit:** `--bad-loop-err` (default `0.015`, `0` off) is a fraction of the longest
+   bounding-box side. A loop whose mean error is past it is bad even when no single point is:
+   this is what catches a curve that is off along a whole arc.
+3. **Alignment limit:** `--max-align-err` (default `0`, off). When positive, a loop whose
+   mean `1 - cos` between its predicted normal and the paired target normals is past it is bad.
 
-These thresholds are independent.
+The fit figures and tables use a separate rule: `--max-err` (default `0.03`) is a fraction of
+the longest bounding-box side applied to the loop's mean error, and only highlights the curve,
+its title and `bad_loops.txt`; it does not move a loop between the split PLYs.
+
+`<stem>_loop_errors.csv` carries `mean_err`, `max_err` and `align_err` plus the three flags for
+every loop, so any threshold can be tried on a finished run without fitting it again.
 
 ---
 
@@ -610,10 +621,11 @@ By default, outputs go to `log/<input_stem>/`.
 | `<stem>_slices.ply` | Points selected for all slices |
 | `<stem>_slices.png` | Projected slices, normals, centres, and optional fields |
 | `<stem>_field.png` | Raw implicit fields with centres, when `--field` is used |
-| `<stem>_good_loops.ply` | Fitted loops whose maximum point error is at most `0.15`, vertex-coloured by cutting axis (x blue, y green, z red), with predicted normals in `nx/ny/nz`, turned to run with the target normals when the raw fit ran against them |
-| `<stem>_bad_loops.ply` | Fitted loops whose maximum point error exceeds `0.15`, all red, with normals, turned the same way. The two sides together hold every loop; no combined all-loops PLY is written |
+| `<stem>_good_loops.ply` | Fitted loops under all three export checks: maximum point error at most `0.15`, mean error at most `--bad-loop-err` of the longest extent (default `0.015`), and, when `--max-align-err` is positive, mean normal alignment `1 - cos` at most that value (default `0`, so alignment does not affect the split). Vertex-coloured by cutting axis (x blue, y green, z red), with predicted normals in `nx/ny/nz`, in the direction the fit produced (loops running against the target normals are reported, not turned) |
+| `<stem>_bad_loops.ply` | Fitted loops over any export check, all red, with normals, in the same fitted direction. The two sides together hold every loop; no combined all-loops PLY is written |
 | `<stem>_loop_split.txt` | One `g`/`b` per loop in checkpoint order, so the two split PLYs interleave back into the order of `_model.pt` |
-| `<stem>_fits.png` | Target loops and fitted curves with predicted-normal arrows; its subtitle carries the mean out-of-plane distance and the alignment penalty (`0` runs with the target normals, `2` against), the latter measured before the output turn. Each curve is coloured by the loop parameter, one cyclic turn from the seam ring back to it, with a colour bar under the figure |
+| `<stem>_loop_errors.csv` | One row per loop in checkpoint order: `axis, offset, slot, points, mean_err, max_err, align_err, bad_point, bad_mean, bad_align, bad` |
+| `<stem>_fits.png` | Target loops and fitted curves with predicted-normal arrows; its subtitle carries the mean out-of-plane distance and the alignment penalty (`0` runs with the target normals, `2` against), the latter measured on the fitted direction. Each curve is coloured by the loop parameter, one cyclic turn from the seam ring back to it, with a colour bar under the figure |
 | `snapshots/<stem>_fits_eNNNN.png` | The same grid taken during the run, every `--snapshot-every` epochs (50 by default, `0` for none), drawn from the network as it stood on that epoch and against the same red limit, so a run can be watched taking shape rather than only judged at its end. Flipping through the files shows the curves arriving on their loops; the last one is identical to `<stem>_fits.png` above |
 | `planes/` | Per-plane slice, assignment, fit PLYs with fit normals, and fit figures |
 | `planes.txt` | Per-plane counts and fitting-error summary |
@@ -621,7 +633,7 @@ By default, outputs go to `log/<input_stem>/`.
 | `<stem>_model.pt` | The fit, replayable without the cloud: network weights, architecture, embedding table or triplane field, and one `(axis, offset, slot)` key, plane origin and normal, and query centroid per loop |
 | `<stem>_triplane.npz` | Triplane mode only: `grid` (`3 x C x R x R`), sampling bounds `lo`/`hi`, query centroids, the 48-D feature sampled at each, and the keys |
 
-An empty good or bad category still produces an empty PLY file.
+A side that holds no loop is left out rather than written empty.
 
 A run that refines its planes writes the extraction artefacts (`_slices.ply`, `_slices.png`, `_field.png`) once, at the end, for the plane set it finished on: the intermediate plane sets are cut to train on, not to be kept. The fit artefacts are written for that same final plane set.
 

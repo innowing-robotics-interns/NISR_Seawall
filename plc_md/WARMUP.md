@@ -1,4 +1,4 @@
-# The warm-up: pretraining on a cube
+# The warm-up: pretraining on cubes
 
 Scope: **only** the warm-up. The shape fit is described in `WORKFLOW.md` and
 `loop_extraction.md`.
@@ -11,46 +11,55 @@ revised text, not patched.
 
 ## The idea
 
-We are not given a shape. We are given **a cube**, and nothing else.
+We are not given a shape. We are given **cubes**, and nothing else.
 
-Pretrain the network on that cube so that, when it draws the cube's
+Pretrain the network on those cubes so that, when it draws their
 cross-section loops:
 
 1. every loop runs the **same way round** along an axis — consistent orientation;
 2. every loop puts **`z = 0` where its neighbours put theirs** — consistent seam;
-3. every loop **lies on the cube** — the curves fit the 3D object.
+3. every loop **lies on its cube** — the curves fit the 3D object.
 
 That trained state is then handed to a real shape's fit as its initialisation.
-The cube is the same object for every shape and for every run, so the warm-up is
-identical everywhere: it is a fixed task, not a task derived from the shape.
+The cubes are the same objects for every shape and for every run, so the warm-up
+is identical everywhere: it is a fixed task, not a task derived from the shape.
 
-What the cube is for: it is the simplest 3D object whose cross-sections are
+What the cubes are for: a cube is the simplest 3D object whose cross-sections are
 loops, whose loops have exact closed-form parameterisations, and which has
 neighbouring loops along each axis to be consistent with. The bunny (or any other
-shape) plays no part in it.
+shape) plays no part in it. The original warm-up used one canonical unit cube;
+the default now draws a fresh batch of random-size, random-place cubes every step
+(W13), because real shape loops are mostly smaller than the unit cube.
 
 ---
 
 ## Running it
 
 ```
-python warmup_cube.py                  # train the cube, write warmup/cube_warmup.pt
-python rosa_main.py ... --train        # loads that checkpoint by default
+python warmup_cube.py                  # train the default random-cube batch,
+                                       # -> warmup/cube_warmup_random_ranges.pt
+python warmup_cube.py --cubes 0        # the original single unit cube
+python rosa_main.py ... --train        # loads the random-cube checkpoint by default
 python rosa_main.py ... --no-warmup    # ablation: fit from a blank network
 ```
 
-`warmup_cube.py`'s `--neurons`, `--layers`, `--resolution` and `--channels` must
-match the fit's, or `rosa_main` refuses the checkpoint rather than loading it in
-part.
+The defaults reproduce the default checkpoint: 8 cubes per step, half-sides
+uniform in 0.05-0.45, redrawn every step, `occupied_cells` features, no axis
+input, 300 steps. `warmup_cube.py`'s `--neurons`, `--layers`, `--resolution` and
+`--channels` must match the fit's, or `rosa_main` refuses the checkpoint rather
+than loading it in part. The fit must also pool features the same way and use the
+same axis-condition mode; a mismatch is refused with a message naming the mode.
 
 ---
 
 ## Decisions
 
-### W1 — The object is a canonical unit cube
+### W1 — The object is a canonical unit cube (original default; now W13)
 
 The warm-up's object is the unit cube, side 1: `[-0.5, 0.5]^3`, always the same
-numbers. It is a definition — no cloud, no bounding box, no extent is ever read
+numbers. This decision defines the original `--cubes 0` mode; W13 changes the
+default training distribution but keeps each cube's construction. It is a
+definition — no cloud, no bounding box, no extent is ever read
 to size or place it.
 
 Its surface is sampled deterministically (a fixed seam-free sample of the six
@@ -108,7 +117,9 @@ placement where `D` is already small without a phase buffer.
 ### W5 — What the network is conditioned on
 
 One network for the whole cube, conditioned on the field sampled at the loop's
-centroid — the same form the real run uses. The triplane grid is the carrier
+centroid — the same form the real run uses. (The default read is now
+`occupied_cells`, the mean of the unique grid nodes the loop covers; see W13.)
+The triplane grid is the carrier
 that transfers: it is a function of position on the unit cube (W9), so a field
 pretrained on the cube means the same thing on any shape's box. The centre cut
 is excluded precisely so every loop's query is its own (W2).
@@ -138,8 +149,9 @@ fit.)
 
 ### W7 — Optimisation
 
-A fixed schedule, same for every run: every loop of the cube in every step,
-cosine-annealed learning rate, 300 steps (default).
+A fixed schedule, same for every run: every loop of the current cube batch in
+every step (one unit cube, or the 8 random cubes W13 draws), cosine-annealed
+learning rate, 300 steps (default).
 
 The warm-up prints, per run: fit error, mean direction cos, and `D` between
 neighbouring loops at `z = 0` — the three things the task asks for.
@@ -147,7 +159,8 @@ neighbouring loops at `z = 0` — the three things the task asks for.
 ### W8 — Transfer: the warm-up is a checkpoint
 
 The warm-up is its own training script, `warmup_cube.py`, and its product is a
-checkpoint (`warmup/cube_warmup.pt` by default). The checkpoint holds:
+checkpoint (`warmup/cube_warmup_random_ranges.pt` by default). The checkpoint
+holds:
 
 - the trained network weights and the triplane field, unchanged;
 - **nothing else** — no per-loop rows, no phases, no plane set.
@@ -198,11 +211,37 @@ in triplane mode there is no row to seed.
 
 Per run:
 
-- warm-up fit error on the cube (same units as the fit),
+- warm-up fit error on the cubes (same units as the fit),
 - direction: mean `cos` between predicted normal and the cube's outward normal,
 - seam: `D` between neighbouring loops at `z = 0`, median and max.
 
 None of these is a shape-fit error, and they are printed separately from it.
+
+### W13 — Default: random-size, random-place cube batches
+
+**(changed 2026-11-08; supersedes W1's single unit cube as the default, and W5's
+centroid read as the default.)** The default warm-up draws 8 cubes per step with
+half-sides uniform in 0.05-0.45, places them at random offsets inside the unit
+grid, and redraws the batch every step. Each cube keeps W2-W4's construction
+(planes per axis, no centre cut, winding, neighbour pairs); only its size and
+place change. The network is trained across the interior of the domain at many
+scales instead of only where the one unit cube's loops fall.
+
+Two other defaults changed with it:
+
+- **Feature read:** `occupied_cells` (W5's centroid sample remains available as
+  `--feature-pool centroid`). The mean of the unique grid nodes a loop's points
+  occupy describes the loop's footprint, so two loops whose centres share a cell
+  still read different codes.
+- **Axis input:** off (`--no-axis-condition`). The default checkpoint is warmed
+  feature-only; `--axis-condition` needs an axis-conditioned checkpoint
+  (`warmup/cube_warmup_axis.pt`).
+
+The default checkpoint is `warmup/cube_warmup_random_ranges.pt`. The random
+batch is a more faithful reading of real loop sizes (measured loop RMS radius
+over mean triplane half: 0.05-0.9, median 0.16-0.69). The shape-fit aggregates
+do not rank it against the fixed cube, because the extracted loop set contains
+loops that are not intended fit targets; see Measured.
 
 ---
 
@@ -231,8 +270,10 @@ None of these is a shape-fit error, and they are printed separately from it.
 
 ## Measured
 
-The cube itself, 4 planes per axis (12 loops), 2×64 network, 32×32×3 grid of 16
-channels, 300 steps, seed 0:
+### Unit-cube checkpoint (previous default)
+
+Four planes per axis (12 loops), 2×64 network, 32×32×3 grid of 16 channels,
+300 steps, seed 0:
 
 | reading | value |
 |---|---|
@@ -243,7 +284,7 @@ channels, 300 steps, seed 0:
 The shape fit that loads it, bunny at 5 planes/axis, 13 loops, same network,
 300 epochs, `--normal 0.01` (the standard launcher's setting):
 
-| run | median plane error | loops turned round | D median / mean / p90 / max | feature graph ratio |
+| run | median plane error | loops against normals | D median / mean / p90 / max | feature graph ratio |
 |---|---|---|---|---|
 | cube warm-up | 0.0161 | 5 | 0.0716 / 0.1204 / 0.2727 / 0.2975 | 0.58 |
 | blank network | 0.0195 | 10 | 0.0947 / 0.1311 / 0.2417 / 0.3804 | 0.61 |
@@ -264,6 +305,49 @@ fit has no bend term to push back against that.
 
 Runs: `log/fit300n_warm`, `log/fit300n_blank` (normal term on), `log/fit300_warm`,
 `log/fit300_blank` (normal term off).
+
+### Random-cube default
+
+The default `warmup/cube_warmup_random_ranges.pt` (8 cubes per step, half
+0.05-0.45, `occupied_cells`, no axis input, 300 steps) reads:
+
+| reading | value |
+|---|---|
+| fit to the random batches | 0.211 mean, 0.365 max |
+| direction cos against each cube's outward normals | +0.991 |
+| `D` between neighbouring loops at `z = 0` | median 0.0002, max 0.0060 |
+
+Its advantage is coverage. On 8 held-out random cubes (half 0.1-0.45, seed 0,
+512 samples, occupied-cell pooling, unit-cube frame):
+
+| warm-up | held-out fit | direction cos |
+|---|---:|---:|
+| fixed unit cube (`cube_warmup_pool_noaxis.pt`) | 0.353 | +0.55 |
+| random, half 0.1-0.45 (`cube_warmup_random.pt`) | 0.133 | +0.97 |
+| random default, half 0.05-0.45 (`cube_warmup_random_ranges.pt`) | 0.227 | +0.99 |
+
+The random-cube warm-ups read the held-out cubes far better than the fixed one,
+so they carry a feature map that is meaningful across the interior at many
+scales; the default's higher fit than the 0.1-0.45 run is the cost of covering
+the smaller sizes as well.
+
+What the real fits report is an aggregate over every extracted loop. With
+matched flags (29 planes/axis, 1000 epochs, 2x64 net, `--normal 0.01
+--match-angle 150 --freeze-f-epochs 100 --distill 10`) on bunny, armadillo,
+horse and laurent hand:
+
+- half 0.05-0.45 (`cube_warmup_random_ranges.pt`): mean plane error differed
+  from the fixed-unit-cube warm-up by +0.0012 to +0.0057; laurent hand's
+  bad-loop count read 55 against 20.
+- half 0.1-0.45 (`cube_warmup_random.pt`): +0.0012 to +0.0106; laurent hand
+  75 against 20; epoch-999 fit lower on all four shapes.
+
+Part of the extracted loop set is not what the fit is meant to draw, so a larger
+mean error or bad-loop count can come from loops outside the intended target
+set. These readings therefore do not show that either warm-up is better; scoring
+on the intended loops is still open. The fixed/axis-on/centroid recipe remains
+available with `--warmup warmup/cube_warmup_axis.pt --axis-condition
+--feature-pool centroid`.
 
 ---
 
@@ -291,13 +375,14 @@ Runs: `log/seam_s5_300_unitcube`, `log/refit_s5_300_unitcube` and the older
 
 | what | where |
 |---|---|
-| cube and its loops | `mini_nn.cube_loops` — the unit cube cut at even offsets, no centre |
+| unit cube and its loops | `mini_nn.cube_loops` — the unit cube cut at even offsets, no centre |
+| random cube batches (default) | `mini_nn.random_cube_loops` — size, place and offset redrawn per step |
 | square geometry | `mini_nn.Square`, at `centre = d · axis` |
 | warm-up training | `mini_nn.warm_on_cube` — fit + direction + seam, all three through the network |
-| direction term | `mini_nn.normal_penalty`, against the cube's outward normals |
+| direction term | `mini_nn.normal_penalty`, against each cube's outward normals |
 | seam `D` | `D` between adjacent loops, denominator the cube pair's own scale |
 | checkpoint | `mini_nn.save_warmup` / `load_warmup`, `kind='cube_warmup'` |
-| training script | `warmup_cube.py` → `warmup/cube_warmup.pt` |
+| training script | `warmup_cube.py` → `warmup/cube_warmup_random_ranges.pt` |
 | fit that loads it | `rosa_main.py --warmup` (default), `--no-warmup` to skip |
 | triplane | `mini_nn.TriplaneField`, reused unchanged |
 

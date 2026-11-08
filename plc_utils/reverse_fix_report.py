@@ -37,7 +37,7 @@ import torch
 from scipy.spatial import cKDTree
 
 import _paths  # noqa: E402
-import mini_nn
+from plc_model import mini_nn
 from plot_epoch_matching import build
 from plot_loop_matching import targets_for
 from plot_axis_epochs import all_curves
@@ -70,8 +70,8 @@ def evaluate(ckpt, state, run, stem):
     ## an early curve can still be far from its slice, and a panel that swaps two
     ## loops of the same plane would report the wrong target for both
     final, _ = mini_nn.load_model(run / f'{stem}_model.pt')
-    final_curves, _ = all_curves(final, queries, axes_t, frame, n)
-    curves, tangents = all_curves(model, queries, axes_t, frame, n)
+    final_curves, _ = all_curves(final, queries, frame, n)
+    curves, tangents = all_curves(model, queries, frame, n)
 
     loops = list(range(len(keys)))
     groups = plane_members(keys, loops)

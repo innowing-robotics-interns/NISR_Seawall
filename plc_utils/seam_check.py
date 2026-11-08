@@ -31,7 +31,7 @@ import numpy as np
 import torch
 
 import _paths  # noqa: E402
-import mini_nn
+from plc_model import mini_nn
 
 
 def read_graph(path, keys):
@@ -64,14 +64,7 @@ def curves_of(model, meta):
                                  'save them')
             query = torch.as_tensor(np.asarray(meta['queries']), dtype=torch.float32)
             feat = model.triplane(query)
-            axis = None
-            if meta.get('axis_condition'):
-                axes = meta.get('axes')
-                if axes is None:
-                    raise SystemExit('this checkpoint is axis-conditioned but carries '
-                                     'no axes; re-run rosa_main to save them')
-                axis = torch.as_tensor(np.asarray(axes), dtype=torch.float32)
-            return model(z[None].expand(count, -1, -1), None, feat, axis).detach()
+            return model(z[None].expand(count, -1, -1), None, feat).detach()
         codes = torch.as_tensor(np.asarray(meta['codes']), dtype=torch.int64)
         return model(z[None].expand(count, -1, -1), codes).detach()
 

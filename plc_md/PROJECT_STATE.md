@@ -23,7 +23,10 @@ point cloud with normals
   -> seam / orientation / codes     plc_utils/*, code_clusters.py
 ```
 
-## Current committed state
+## Current state
+
+Committed unless marked; the 2026-11-08 warm-up/pooling/default changes are still
+in the working tree and are listed again under "In progress" below.
 
 - **Input data.** `normalized_shapes_cuboid/*_cubic_lam3.ply` (89 shapes) is
   `normalized_shapes/*.ply` passed through cubic ARAP stylization (Liu &
@@ -31,13 +34,26 @@ point cloud with normals
   at [plc_utils/cubic_stylize_points.py](plc_utils/cubic_stylize_points.py);
   parameters and per-shape metrics are in
   `normalized_shapes_cuboid/manifest.json`.
-- **Cube warm-up.** `warmup/cube_warmup_axis.pt` is a unit cube (side 1), axis
-  conditioned, 2x64 MLP, triplane 3x16 grids at 32x32. It fits the cube's 12
-  loops to about 0.0050 with direction cos about +0.997, and is both the
-  initialisation and the distillation teacher.
+- **Warm-up.** The default checkpoint is `warmup/cube_warmup_random_ranges.pt`
+  (2026-11-08): 8 random cubes per step, half-sides 0.05-0.45, redrawn every
+  step, with `occupied_cells` features and no axis input; 2x64 MLP, triplane
+  3x16 grids at 32x32. It fits the cubes to 0.211 mean (0.365 max) with
+  direction cos +0.991 and seam `D` median 0.0002 / max 0.0060. It is the
+  initialisation of a default run and the default distillation teacher when
+  `--distill` is on (`--distill` itself defaults to 0). The earlier
+  `warmup/cube_warmup_axis.pt` (one unit cube, axis conditioned, centroid
+  features, fit 0.0050, cos +0.997) remains as the matched checkpoint for the
+  axis-on/centroid recipe. Caveat: on bunny, armadillo, horse and laurent hand
+  the aggregate plane error over all extracted loops is higher than the
+  fixed-cube run at 1000 epochs, and laurent hand's bad-loop count reads 55
+  against 20. That aggregate includes loops that are not intended fit targets,
+  so it does not establish that either warm-up is better; the comparison
+  remains open until scored on the intended loops.
 - **Triplane conditioning.** 48-D code read from three 16-channel grids mapped
-  onto the cloud's box; `--feature triplane` is required by the warm-up and by
-  distillation.
+  onto the cloud's box. The default `--feature-pool occupied_cells` averages the
+  unique grid nodes a loop's points occupy; `centroid` samples one point at the
+  loop centre (the older code). `--feature triplane` is required by the warm-up
+  and by distillation.
 - **Seam distillation.** `--distill 10` holds the student under the teacher's
   per-pair seam distance `D`; it can lower `D` but never raise it, and it is
   orientation-blind by construction.
@@ -52,7 +68,10 @@ point cloud with normals
 ## Results snapshot
 
 Eight shapes, 29 planes per axis, 1000 epochs, `--normal 0.01 --distill 10`;
-controls are the same runs without the freeze.
+controls are the same runs without the freeze. These are the **axis-on,
+centroid** runs from before the 2026-11-08 default switch; the
+`occupied_cells`/axis-off panel has not been run on all eight shapes yet (open
+item 4); the four-shape aggregate did not rank the warm-ups.
 
 - Frozen start cuts loops whose own-centre winding is reversed from **207 to 47
   of 1239** (4.4x). Seven of eight shapes improve. Exceptions: dancing children
@@ -73,17 +92,28 @@ controls are the same runs without the freeze.
 ## In progress on the authoring device (not pushed as of 2026-11-08)
 
 The working tree has uncommitted changes (about 805 inserted lines) adding an
-`occupied_cells` footprint read of the triplane field and related flags:
+`occupied_cells` footprint read of the triplane field, random-cube warm-up
+batches, and the default switch described above:
 
 - `--feature-pool {centroid,occupied_cells}`: pool the grid nodes a loop covers
   instead of one bilinear sample at its centroid, so adjacent loops in the same
-  cell get different codes.
+  cell get different codes. `occupied_cells` is now the default.
 - `--match-angle`: gate chamfer pairs by the angle between the implied and
   target normals.
 - `--save-plane-files`: write per-plane artefacts only when requested.
+- `warmup_cube.py --cubes N`: train the warm-up on a fresh batch of random-size,
+  random-place cubes per step; `--cube-half-min/--cube-half-max` and
+  `--resample-every` control the batch. Defaults now reproduce
+  `warmup/cube_warmup_random_ranges.pt` (8 cubes, half-sides 0.05-0.45,
+  `occupied_cells`, no axis input).
+- `rosa_main.py` defaults now load that checkpoint, pool `occupied_cells` and
+  run `--no-axis-condition`. Axis-conditioned/centroid runs must pass
+  `--axis-condition --feature-pool centroid --warmup warmup/cube_warmup_axis.pt`
+  explicitly.
 
-Files touched: `mini_nn.py`, `rosa_main.py`, `loop_extraction.py`,
-`plc_utils/loop_propagation.py`, `warmup_cube.py`, `todo.md`, `WORKFLOW.md`.
+Files touched: `mini_nn.py`, `rosa_main.py`, `warmup_cube.py`,
+`loop_extraction.py`, `plc_utils/loop_propagation.py`, `todo.md`,
+`WORKFLOW.md`, `README_ROSA.md`, `WARMUP.md`.
 Run `git status` and `git log` before relying on these; they are not in the
 pushed state described above.
 
@@ -122,7 +152,9 @@ conda run -n seawall python plc_utils/cubic_stylize_points.py \
 
 - Shared through git: source, docs and this state file.
 - **Not shared**: `log/` run folders, `normalized_shapes/` and
-  `normalized_shapes_cuboid/` PLYs, and `warmup/cube_warmup_axis.pt`. `*.ply`,
+  `normalized_shapes_cuboid/` PLYs, and the warm-up checkpoints under
+  `warmup/` (`cube_warmup_random_ranges.pt` is the default; the axis-checkpoint
+  pair is needed for the old recipe). `*.ply`,
   `*.pt` and `log/` are gitignored, so a new device must copy the data, the
   warm-up checkpoint and any run folders it needs separately. The warm-up can be
   regenerated with `warmup_cube.py`, but only such a checkpoint reproduces the
@@ -139,8 +171,12 @@ conda run -n seawall python plc_utils/cubic_stylize_points.py \
    turn-overs happen; test it against the same panel.
 3. Field roughness: the frozen start costs 3-8x in tv. Try a tv anneal, or
    release `f` with the direction term held at a floor, at matched fit.
-4. Evaluate the in-progress `occupied_cells` pooling on the same eight-shape
-   panel with matched controls.
+4. Re-evaluate the new defaults (`occupied_cells`, axis off, random-cube
+   warm-up) on the eight-shape panel against matched fixed-cube/centroid/axis
+   controls. The first four-shape comparison reported higher aggregate error
+   and more bad loops for the random-cube arms, but that aggregate covers every
+   extracted loop, including loops not intended as fit targets, so it does not
+   rank the warm-ups; score the panel on the intended loop set.
 
 ## How to update this file
 

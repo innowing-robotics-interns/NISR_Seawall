@@ -27,6 +27,12 @@ that is a result to explain, not a correction to apply.
   mode. `--no-axis-condition` is the ablation; `warmup/cube_warmup_axis.pt` is
   the axis warm-up and the default checkpoint.
 
+  > Later (2026-11-08): the defaults were inverted. `--no-axis-condition` and
+  > `--feature-pool occupied_cells` are now the defaults, and the default
+  > checkpoint is `warmup/cube_warmup_random_ranges.pt` (W13 in
+  > [WARMUP.md](WARMUP.md)). This entry records the earlier comparison; the
+  > axis-on/centroid recipe now needs its flags stated explicitly.
+
   Epoch 0 on the same loops, zero feature everywhere (the grid stays zero-init):
 
   | shape | arm | zero features | cos med | reversed | D mean | bend |
@@ -91,7 +97,7 @@ that is a result to explain, not a correction to apply.
   the 23 epochs it was released. A floor on the weight is not a cosmetic
   change; it is what holds the orientation.
 
-- [ ] Remove the manual export flip in `rosa_main.fitted()`
+- [x] Remove the manual export flip in `rosa_main.fitted()`
 
   The function currently reverses any loop with mean cos < -0.1 before writing
   the PLYs and figures. Once the axis is an input and orientation is learned,
@@ -100,10 +106,21 @@ that is a result to explain, not a correction to apply.
   normals for a consumer, that is the consumer's rendering choice, not a silent
   change to the loop.
 
+  Done: `fitted()` still counts loops below the −0.1 cosine and prints them, but
+  no longer reverses prediction, tangent, normal or per-point error. The loop
+  PLYs, fit grids, snapshots and per-plane figures now carry the fitted
+  direction, and the summary line says the loops keep it. No measured number
+  changes: `align_err` was already computed before the old flip, point errors
+  are order-invariant, and winding, fit and the 48-D codes never used the
+  turned arrays. Only downstream consumers of the exported orientation change —
+  existing runs on disk keep their previously turned PLYs, while new runs and
+  `loop_propagation.load_run`'s signed-area canonicalisation see the raw fit.
+
 - [x] Reverse fix: start each loop at its target's scale and place, not at the
   cube's
 
-  Cause. The warm-up is trained on the unit cube, so the loop a fit starts from
+  Cause. The warm-up was then trained on the unit cube (now the default draws
+  random-size cubes; see WARMUP.md W13), so the loop a fit starts from
   is a square the size of the cube's cross-section, mapped by the triplane into
   the cloud's box. A slice's points often occupy a small part of that box and
   sit away from its centre -- on horse y = -0.66 the points span x -0.10..0.36
@@ -335,6 +352,81 @@ that is a result to explain, not a correction to apply.
   above; `WORKFLOW.md` §2.4 documents the flag. The cross-shape panel is still
   open.
 
+- [x] Sample the triplane code over the loop, not only at its centroid
+
+  The exported code is one bilinear sample at the loop centroid (the `queries`
+  in `<stem>_triplane.npz`). Centroids of adjacent same-family loops are close
+  enough to land in the same triplane cell, so their 48-D codes are nearly
+  identical: the code weakly encodes where the loop is and does not encode its
+  shape, which is exactly what lofting and clustering need to separate. Horse,
+  139 loops: of the 127 adjacent same-slot pairs, 11 (8.7%) share a cell in all
+  three planes at R=32; at R=64 that falls to 0, but the sweep-invariant plane
+  still aliases almost as often -- x-sweep YZ 13 -> 11 of 37, y-sweep XZ 11 -> 7
+  of 28, z-sweep XY 18 -> 17 of 62. Of all 9,591 pairs, 15 share all three
+  cells at R=32 and 0 at R=64, but 188 still share the XY cell at R=64 because
+  z-sweep centroids barely move in x,y. The invariant block is 16 of the 48
+  dims, so a third of the code carries no information about the position along
+  the sweep, at any resolution.
+
+  Resolution does not fix it. Adjacent-loop cosine distance rises only
+  0.059 -> 0.065 from R=32 to R=64, the participation ratio 9.5 -> 9.9 of 48
+  dims, and 99.8% of the R=32 grid energy is below 16 cycles/side; R=64 puts
+  only 2% above that, with a *smoother* cell-to-cell field (neighbour-diff /
+  variance 0.24 -> 0.13). The res-64 run costs 4x the grid storage for a
+  seed-averaged +0.04 silhouette at k=12 (single seed 0.655 -> 0.661) and no
+  tube-readiness change (54-55/139 ready, longest chain 18). Run
+  `log/axis_frz64_horse/`, group sheet
+  `axis_frz64_horse_cluster_loops_spectral_groups.png`, clustering helper
+  `utils/spectral_code_clusters.py`.
+
+  Next: sample K points around each loop (mean, or concatenate a few) instead
+  of one centroid, and/or widen `--triplane-channels`, then measure
+  adjacent-loop code distance, silhouette and tube readiness against the
+  centroid baseline on the eight-shape panel; the design is in `loop_code.md`.
+  Adding axis/offset to the
+  distance was tested separately: it raises axis purity (horse 0.906 -> 0.993
+  at k=12) but moves only 18-21/139 labels and leaves readiness unchanged
+  (55/139, longest 18), so it is not the fix either.
+
+  Tested: mean over occupied cells, axis input removed, frz100 recipe, all
+  eight shapes. The pooled code fits everywhere (final fit 0.0004-0.0010) and
+  clusters about as well as the centroid+axis baseline on some shapes, but not
+  better: spectral silhouette improves on 4/8 and drops on 4/8, axis purity
+  improves on 3/8 and drops badly on lucy (0.917 -> 0.707) and neptune
+  (0.804 -> 0.640). Adjacent-loop codes are closer on every shape (horse
+  median cosine distance 0.062 -> 0.032, rocker 0.051 -> 0.016; neptune
+  near-identical pairs 2 -> 14 of 178), so pooling does not hold neighbours
+  apart. Winding consistency, the convention the axis input supplies, degrades
+  on 7/8 and collapses on rocker-arm (0 -> 56 of 153 clockwise), armadillo
+  (1 -> 42 of 162), bunny (1 -> 23 of 80) and lucy (5 -> 24 of 157). Tube
+  readiness is mixed (improves on neptune and lucy, ties on dancing, drops on
+  five). Conclusion: keep the axis; pooling is not a substitute for it. Runs
+  `log/pool_axisoff_frz100_<shape>/`, warm-up
+  `warmup/cube_warmup_pool_noaxis.pt`, summary
+  `log/pool_axisoff_eight_summary.md`, full table and reading in
+  `loop_code.md`.
+
+  Tested next: the same pool with the axis kept, eight shapes, frz100
+  (`log/pool_axison_frz100_<shape>/`, warm-up
+  `warmup/cube_warmup_pool_axis.pt`). Axis restores orientation (clockwise
+  fraction 16.6% -> 5.1% mean, against-normal alignment back to the baseline on
+  7/8) and gives the best tube readiness of the three arms (47.3% vs 45.7%
+  centroid+axis and 43.8% no-axis; better on 6/8). It does not restore
+  clustering: mean silhouette 0.510 vs 0.527 base, mean purity 0.792 vs 0.857;
+  it beats the base on bunny, dancing and laurent only. Adjacent codes are
+  still closer than the baseline on 7/8 (bunny 0.010 vs 0.037, rocker 0.018 vs
+  0.051), so local code separation remains the open problem. Lucy is an outlier
+  (`align` 0.680, 27/157 clockwise, silhouette 0.317); a repeat
+  (`log/pool_axison_frz100_lucy_b/`) fits better (align 0.463) but still
+  clusters worse (silhouette 0.273, 17/157 clockwise vs 5 baseline), so the
+  loss there is stable. Summary `log/pool_axis_three_arm_summary.md`, reading
+  in `loop_code.md`. Next: keep centroid+axis as the default, and test a
+  neighbour-code separation term or a distance with an explicit shape/offset
+  component. (Later, 2026-11-08: this recommendation was not taken; the defaults
+  are now `occupied_cells` and axis off, WARMUP.md W13.) Per-plane output is now
+  opt-in (`--save-plane-files`), so these
+  runs keep only `planes.txt`/`bad_loops.txt`.
+
 ## Teacher-student seam distillation (`--distill`)
 
 The cube warm-up sets shape and orientation; the follow-up fit is what has to
@@ -354,7 +446,8 @@ that division of labour is deliberate.
   width, rebuilds the frozen teacher, maps each shape query through the
   teacher's unit-cube frame (`teacher.centre + (q - centre)/half * teacher.half`),
   and records `D` per neighbour pair. `D` is scale-free, so each side reads
-  **its own** curve size — the teacher draws at the warm-up's cube scale, the
+  **its own** curve size — the teacher draws at cube scale (the sizes the
+  warm-up trained on), the
   student at the shape's — and the two relative disagreements are compared. The
   pair's fixed shape-target radius only carries the dimensionless excess into
   chamfer units: `weight * scale * max(D_student - D_teacher, 0)`. At step 0 the
@@ -657,3 +750,113 @@ plane families (x, y, z) give redundant cross-sections of the same solid.
   (multi-component), then on bunny and armadillo, whose cross-sections changed
   fastest along the axis.
 
+### Cubic domain from the code clusters
+
+`code_clusters.py` already labels every loop from its 48-D triplane code and
+writes `<run>_code_clusters.csv` (`axis, offset, slot, x, y, z, cluster`), plus
+the matching PNG and sphere PLY. That gives a part-level partition of the loops;
+the open question is how to turn it into the cubic domain the polycube is built
+on — one axis-aligned cube grid, or one box per cluster merged afterwards.
+
+- [ ] Build a cubic domain from the loop cluster labels
+
+  Inputs per run: `<run>_triplane.npz` (queries, keys, features),
+  `<run>_code_clusters.csv` (labels), the exported loop PLYs, and the source
+  cloud. Candidate routes, cheapest first:
+
+  1. **Cluster boxes on a common grid.** For each cluster take the bounding box
+     of its loop points (optionally including the in-band cloud points), snap
+     the faces to a shared cube size, and fill the cells inside each loop. The
+     domain is the union of the per-cluster boxes; overlaps and gaps are
+     resolved by the loops' inside/outside tests.
+  2. **Cluster label field.** Interpolate a per-voxel cluster label from the
+     loop centroids (nearest loop, or a classifier on the same triplane
+     features), fill each label's region up to its loop boundaries, and
+     quantise the result to cubes.
+  3. **Cluster-wise lofts.** Keep only clusters whose loops form tube chains,
+     loft within each cluster reusing `align_loops.py` synchronisation, snap the
+     lofted normals, and rasterise. Clusters without a chain fall back to
+     route 1 or 2.
+
+  Decisions:
+
+  - one global grid vs per-cluster boxes; if per-cluster, how to merge the boxes
+    into a single closed manifold without gaps or double-covered cells;
+  - spatial connectivity: cosine clustering can join loops from disjoint parts
+    (e.g. left and right legs of the same code family), so a cluster must be
+    split by the loop adjacency graph or by position before it can seed a box;
+  - how many clusters: silhouette `k` answers a clustering question, not a
+    domain-complexity one; the domain route may need a coarser `k` or an
+    explicit merge/split pass;
+  - holes and multi-loop planes: detached components stay separate, and a plane
+    must not be filled as one polygon;
+  - cube size, and the same evaluation as the polycube route (volume IoU,
+    Chamfer to loops and cloud, cube count, manifold/self-intersection check).
+
+  Deliverable: a `cluster_domain.py` (or a `--domain` mode of
+  `code_clusters.py`) that writes `*_cluster_domain.npz` with labels, per-cluster
+  boxes and occupancy plus a cube mesh, tested first on horse and dancing
+  children.
+
+## Pretrain f, then freeze it for the shape fit
+
+- [ ] Freeze the pretrained `f` for the whole fit and train only the feature
+
+  For cubes the map from the warm-up square to the shape should be fixed: the
+  cube warm-up already gives `f` the shape-independent square, and the existing
+  `--freeze-f-epochs 100` shows that a frozen start places the loops with the
+  triplane field alone, keeps the code partition (`ARI` 0.64–0.93 at e100) and
+  cuts reversed loops 207 → 47 of 1239. Now hold `f` frozen past the placement
+  phase — the entire run — so the only trainable quantity is the triplane
+  feature, and the loops become a read-out of a fixed cube-to-shape map.
+
+  Acceptance: on the eight-shape panel at the frz100 recipe, compare the
+  fully-frozen arm against the 100-epoch freeze and the joint baseline on fit,
+  reversed/against counts, code silhouette and axis purity, tube readiness, and
+  field tv. The known risk is the field roughness the shorter freezes already
+  show (tv 3–8× the baseline) and a fit floor once `f` cannot adapt; report
+  both rather than only the orientation gain, and check that the code clusters
+  do not collapse when the feature is the only degree of freedom.
+
+  First test: rocker-arm and laurent hand, 1000 epochs, `--freeze-f-epochs
+  1000`, axis off, `occupied_cells`, `--normal 0.01 --distill 10`; the control
+  is the same path with the 100-epoch freeze
+  (`log/pool_axisoff_frz100_<shape>`). Cells are control -> full freeze.
+
+  | shape | fit | align | reversed | bad | sil | purity | ready | longest | adj cos |
+  |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+  | rocker-arm | 0.0008 -> 0.0174 | 0.369 -> 0.505 | 56 -> 59 of 153 | 1 -> 28 | 0.647 -> 0.548 | 0.954 -> 0.922 | 129 -> 130 | 19 -> 14 | 0.0161 -> 0.0303 |
+  | laurent_hand | 0.0006 -> 0.0103 | 0.194 -> 0.475 | 12 -> 10 of 149 | 35 -> 43 | 0.555 -> 0.501 | 0.980 -> 0.946 | 62 -> 63 | 14 -> 14 | 0.0675 -> 0.1230 |
+
+  The fit floor is real: 17–22× the control, with field tv ending at 0.103
+  (rocker) and 0.119 (laurent) against a 0.01 regulariser — the feature alone
+  cannot hold the fit once `f` is fixed. Orientation does not improve either
+  (laurent 12 -> 10 is the only move; rocker's x family stays turned, 59/59
+  against 56/59), and code clustering degrades on both (silhouette -0.05 to
+  -0.10, adjacent cosine distance almost doubles). Conclusion: the whole-run
+  freeze is not the route. The 100-epoch freeze is a placement initialiser and
+  `f` must be released for the fit stage; a longer freeze would need a
+  different `f` (trained on cubes with the shape variation left to the feature)
+  or a field-side capacity/regularisation fix, not just a longer hold. Runs:
+  `log/freeze1000_rocker-arm/`, `log/freeze1000_laurent_hand/`.
+
+## Cross-attention from loops to cubes
+
+- [ ] Consider cross-attention to get a cube from the loops
+
+  Let a set of cube tokens query the loop tokens instead of rasterising and
+  unioning the three plane families by hand. Loop tokens carry the 48-D triplane
+  code plus axis/offset (optionally a few sampled curve points), cube tokens
+  carry their grid position; cross-attention aggregates the loops that pass
+  through or near each cube, and a head predicts occupancy or the six face
+  labels. This is a learned replacement for the intersection/merge step in
+  "Slice rasterisation" and could consume multi-loop planes and holes as
+  separate tokens rather than as one polygon.
+
+  Open questions: cube resolution and locality of the attention, permutation
+  invariance over loops, how to enforce a closed manifold (quantised occupancy
+  vs face logits plus a snapping/merge pass), and supervision — voxelised input
+  cloud, the loops' own inside/outside tests, or both. Deliverable: a prototype
+  that takes a run's loop PLYs plus `*_triplane.npz`, predicts a cube occupancy
+  grid, and is scored with the same volume IoU / Chamfer / manifold checks as the
+  raster route; test on horse and dancing children first.

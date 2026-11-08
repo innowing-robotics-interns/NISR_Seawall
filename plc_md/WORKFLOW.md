@@ -179,11 +179,17 @@ of `[0, 1)` then map to the same input so the loop closes without a seam). In
 triplane mode the input is
 
 ```
-[ sin(2 pi z), cos(2 pi z), feature (48) ]
+[ sin(2 pi z), cos(2 pi z), feature (48), axis (3) ]
 ```
 
-and it outputs a 3-D point in the loop's plane-local frame. In embedding mode
-the feature is the loop's row instead of the triplane sample.
+and it outputs a 3-D point in the loop's plane-local frame. The last block is
+the loop's slice axis as a unit vector (`+x`, `+y` or `+z`), appended by
+`--axis-condition`, which is **off by default** like the default warm-up: the
+network reads the plane direction from the feature alone. Passing
+`--axis-condition` states "counter-clockwise about this axis" instead of learning
+it, and needs a checkpoint warmed the same way. In embedding mode the feature is
+the loop's row instead of the triplane sample, and the axis block is appended the
+same way.
 
 Architecture flags:
 
@@ -226,19 +232,19 @@ to the fit when judging whether a loop doubles back.
 `rosa_main.py --normal` is the **normal-orientation** loss. It is unrelated to
 the loop-parameter seam alignment in `loop_propagation.py` step 3.
 
-The normal term is annealed inside every `Trainer.train()` call: its weight is
-`--normal` on the first batch and falls to zero by half a cosine on the last. The
-printed `align` number is the unweighted term, so it stays comparable across
-epochs; the printed `(w ...)` is the weight actually applied. Runs in this repo
-use `--normal 0.01`, and their logs end at `w 0.0000`.
+The normal term is held at a constant weight inside every `Trainer.train()` call:
+its weight is `--normal` on every batch. The printed `align` number is the
+unweighted term, so it stays comparable across epochs.
 
 The warm-up now settles the sense before the fit (see §2.4), but the fine-tune
 can still flip loops while the cube shrinks onto the loop: on the horse at
 `--normal 0.01` two identical runs ended with 7 and 12 of 139 reversed. Holding
 the fine-tune term at `--normal 0.3` ends with 0/139 on two seeds at the same fit
 loss (TV 0.027–0.031 against 0.019–0.021), while `--normal 1.0` also reaches zero
-but roughly doubles the fit error. The default stays 0.01; use 0.3 when zero
-reversals matter more than the last of the field's smoothness. The frozen start
+but roughly doubles the fit error. The CLI default is `0` (the term off) so an
+unflagged run trains on position alone; the runs in this repository pass `0.01`.
+Use 0.3 when zero reversals matter more than the last of the field's
+smoothness. The frozen start
 is the other route and keeps the default weight: 100 frozen epochs end at
 2/139 reversed on horse at baseline fit (§2.4).
 
@@ -285,27 +291,33 @@ runs.
 ### 2.4 The cube warm-up (`--warmup`)
 
 Before the first fit, `rosa_main` loads a cube-warm-up checkpoint
-(`warmup/cube_warmup.pt` by default) into the network and the triplane field.
-The checkpoint comes from its own training script, `warmup_cube.py`, which fits
-a network on a unit cube and nothing else; [WARMUP.md](WARMUP.md) is the
+(`warmup/cube_warmup_random_ranges.pt` by default) into the network and the
+triplane field. The checkpoint comes from its own training script,
+`warmup_cube.py`, which fits a network on cubes and nothing else — the default
+warm-up uses cubes of random size and place; [WARMUP.md](WARMUP.md) is the
 specification of that task. The checkpoint carries the shared MLP weights and
 the triplane grid, and nothing else — no per-loop rows, no phases, no plane set.
+It is trained with `--no-axis-condition` and occupied-cell pooling and records
+both modes, because they must match the run's: a checkpoint warmed
+axis-conditioned cannot be loaded by `--no-axis-condition`, and vice versa, and
+the same holds for the pooling.
 The shape's extraction, planes, loops, targets and phases are all its own, and
 the fit keeps its own triplane frame: the grid is a function of unit-cube
 position and the frame is where that cube is laid on the cloud's box.
 
 `--no-warmup` fits from a blank network. `--feature embedding` prints a note and
 skips the load: embedding rows name cube planes and have no meaning on a shape's
-plane set. The checkpoint's `--neurons`, `--layers`, `--triplane-res` and
-`--triplane-channels` must match the run's; a mismatch is refused rather than
-loaded in part.
+plane set. The checkpoint's `--neurons`, `--layers`, `--triplane-res`,
+`--triplane-channels`, axis-condition mode and pooling must match the run's; a
+mismatch is refused rather than loaded in part.
 
 The warm-up only applies once, before the first fit; planes added by refinement
 are seeded as usual (or, in triplane mode, have no row to seed).
 
-Measured on bunny, 5 planes, 13 loops, 2×64 net, 300 epochs, `--normal 0.01`:
+Measured with the unit-cube checkpoint (the previous default) on bunny, 5
+planes, 13 loops, 2×64 net, 300 epochs, `--normal 0.01`:
 
-| run | median plane error | turned round | D median / mean / p90 / max |
+| run | median plane error | against normals | D median / mean / p90 / max |
 |---|---:|---:|---|
 | cube warm-up | 0.0161 | 5 / 13 | 0.0716 / 0.1204 / 0.2727 / 0.2975 |
 | blank network | 0.0195 | 10 / 13 | 0.0947 / 0.1311 / 0.2417 / 0.3804 |
@@ -328,9 +340,9 @@ per-pair `D` is the **ceiling** the student's `D` is held under: the loss charge
 orientation stay with the fit; `D` is also invariant to orientation, so the term
 has no direction of its own and any change in the against-normal count is the
 fit's, not a correction the term makes. `D` is scale-free, so each side reads
-**its own** curve size — the teacher draws at the warm-up's cube scale, the
-student at the shape's — and the pair's fixed target radius only carries the
-dimensionless excess into chamfer units. Using one denominator for both is
+**its own** curve size — the teacher draws at cube scale (the sizes the warm-up
+trained on), the student at the shape's — and the pair's fixed target radius only
+carries the dimensionless excess into chamfer units. Using one denominator for both is
 wrong: on armadillo the teacher's curves are cube-scale while some shape loops
 are tiny, and a shape denominator inflated the teacher profile from
 `D ≈ 0.0011` to `mean 0.32 / max 13`, enough to pull those seams the wrong way.
@@ -352,7 +364,8 @@ each cell baseline → distillation):
 The median falls 9.5–120×, the mean 11–81×, the p90 24–105×, the max 18–288×
 (lucy 1.9×); fit costs at most `0.0006` absolute, and no shape changes its loop
 count or pair graph. "Against normals" is the per-loop direction vote (mean
-cosine below `-0.1`) taken before the export flip; `D` is orientation-blind, so
+cosine below `-0.1`) taken on the fitted direction — loops are no longer turned
+round at export; `D` is orientation-blind, so
 the shifts are the fit's own outcome, not a correction the term makes —
 armadillo and horse improve, bunny and laurent stay at zero, rocker arm goes
 `1 → 0`, lucy gains one. The mean direction penalty moves with it (`1 - cos`:
@@ -390,17 +403,36 @@ Runs:
 `armadillo`, `horse`, `lucy`, `laurent_hand`, `rocker-arm`.
 
 **Frozen start** (`--freeze-f-epochs N`, default 0) holds the warm-up's map
-while the field places the loops. The warm-up square is sized on the unit cube,
-while a slice's points usually occupy a smaller, off-centre part of the cloud's
-box; the first updates therefore drag the loop onto its points, and because the
-shared MLP `f` is trainable, the drag also rewrites that map at every query. On
+while the field places the loops. The warm-up saw cube loops of 0.05-0.45
+half-side (or one unit cube in the original mode), while a slice's points usually
+occupy a smaller, off-centre part of the cloud's box; the first updates therefore
+drag the loop onto its points, and because the shared MLP `f` is trainable, the
+drag also rewrites that map at every query. On
 horse this is what turns the y family clockwise and keeps it there. With
 `--freeze-f-epochs 100` every parameter of the shared MLP has
-`requires_grad = False` for the first 100 epochs and only the triplane grid
-trains; the epoch lines carry `[f frozen]` and the boundary prints
+`requires_grad = False` for the first 100 epochs and only the conditioning
+trains — the triplane grid in triplane mode, the embedding rows in embedding
+mode; the epoch lines carry `[f frozen]` and the boundary prints
 `f map released`. `Trainer.set_f_trainable` does the switch without rebuilding
 the run, and the trainer's own epoch counter drives it, so a resumed stage does
-not refund frozen epochs.
+not refund frozen epochs. `N` is the **total** across refinement stages, not per
+stage: `--refine-every 100 --freeze-f-epochs 100` freezes only the first stage
+and releases `f` for every later one. The flag is meant to be used with the
+warm-up; with `--no-warmup` it freezes a random map.
+
+Exact spelling and a horse command:
+
+```bash
+conda run -n seawall python rosa_main.py --train \
+    --path normalized_shapes_cuboid/horse_points_cubic_lam3.ply \
+    --out log/freeze100_horse --samples 29 --epochs 1000 \
+    --feature triplane --triplane-tv 0.01 --normal 0.01 \
+    --freeze-f-epochs 100
+```
+
+The flag is `--freeze-f-epochs` (plural, double dash); there is no
+`-freeze-f-epoch`. Prefix the epoch lines with `--snapshot-every 50` if you want
+to watch the placement while `f` is held.
 
 Measured on horse (139 loops, 1000 epochs, `--normal 0.01 --distill 10`,
 [log/reverse_fix_horse/freeze100_full](log/reverse_fix_horse/freeze100_full)),
@@ -458,10 +490,11 @@ off the field afterwards.
 
 ### 2.5 Schedule and refinement
 
-- **Cube warm-up** is on by default via `--warmup warmup/cube_warmup.pt`, a
-  separate artifact trainable with `python warmup_cube.py` (WARMUP.md).
-  `--no-warmup` fits from a blank network. The warm-up is tied to the network
-  and grid size, not to the shape.
+- **Cube warm-up** is on by default via
+  `--warmup warmup/cube_warmup_random_ranges.pt`, a separate artifact trainable
+  with `python warmup_cube.py` (WARMUP.md). `--no-warmup` fits from a blank
+  network. The warm-up is tied to the network, grid size, axis-condition mode and
+  pooling, not to the shape.
 - **Learning rate** is cosine-annealed across each `train()` call; the optimiser
   rate is reset at the start of every stage.
 - **Refinement**: with `--refine-every N`, every `N` epochs the widest gaps on
@@ -488,7 +521,8 @@ At the end of a trained run, `mini_nn.save_model` writes
 
 - the model state dict (network, triplane field or embedding table);
 - architecture metadata: `num_neurons`, `num_layers`, `pe`, `embedding_dim`,
-  `feature_mode`, `latent_points`;
+  `feature_mode`, `latent_points`, `axis_condition` (whether the slice-axis block
+  is part of the input), and `axes` (the per-loop slice axis used in the fit);
 - triplane configuration and bounds, when used;
 - `phases`: the seam phase of every loop in checkpoint order, or `None` when
   the run did not use `--seam-align`.
@@ -505,9 +539,10 @@ is what makes `loop_shift_probe.py` possible without retraining.
 
 | file | content |
 |---|---|
-| `<stem>_good_loops.ply` | loops at or under the `0.15` bad-point limit, `N_loops x M` vertices, coloured by cutting axis (x blue, y green, z red), with predicted in-plane normals in `nx/ny/nz` |
-| `<stem>_bad_loops.ply` | loops over the `0.15` export limit, all red. Both sides together hold every loop; no combined all-loops PLY is written |
+| `<stem>_good_loops.ply` | loops under all export checks, `N_loops x M` vertices, coloured by cutting axis (x blue, y green, z red), with predicted in-plane normals in `nx/ny/nz` |
+| `<stem>_bad_loops.ply` | loops over any export check, all red. Both sides together hold every loop; no combined all-loops PLY is written |
 | `<stem>_loop_split.txt` | one `g`/`b` per loop in checkpoint order, used to interleave the two split PLYs back |
+| `<stem>_loop_errors.csv` | one row per loop in checkpoint order: `axis, offset, slot, points, mean_err, max_err, align_err, bad_point, bad_mean, bad_align, bad` |
 | `<stem>_fits.png` | grid of loops and fitted curves |
 | `planes/plane_SS_<axis><offset>_{slice,loops,fit}.ply` and `.png` | per-plane files |
 | `planes.txt` | per-plane counts and errors, `!` marks an outlier |
@@ -518,20 +553,45 @@ is what makes `loop_shift_probe.py` possible without retraining.
 | `<stem>_feature_graph.csv`, `<stem>_feature_smoothness.txt` | neighbour graph and smoothness report (triplane) |
 | `<stem>_code_graph.csv`, `<stem>_code_smoothness.txt` | the same for embedding rows |
 
-There are two different limits, and they do different jobs:
+There are three kinds of export check, and a loop is bad if it fails any one:
 
-- `--max-err` (default `0.03`, a fraction of the longest extent) is the
-  **highlighting** limit. It turns a loop red in the figures, writes the `!` in
-  `planes.txt`, and fills `bad_loops.txt`. It does not split the PLY export.
-- `BAD_POINT_ERR = 0.15` (fixed, in the plane frame) is the **export** limit. A
-  loop with any single fitted point past it goes to `_bad_loops.ply`; every other
-  loop goes to `_good_loops.ply`. The two files plus `_loop_split.txt` hold every
-  loop, and no combined `_loops.ply` is written by current runs.
+- `BAD_POINT_ERR = 0.15` (fixed, in the plane frame) is the **point** limit. A
+  loop with any single fitted point past it goes to `_bad_loops.ply`.
+- `--bad-loop-err` (default `0.015` of the longest extent, `0` off) is the
+  **mean** limit. A loop whose mean error is past it is bad even when no single
+  point is: this catches a curve that is off along a whole arc, which the point
+  limit cannot see.
+- `--max-align-err` (default `0`, off) is the **alignment** limit. When positive,
+  a loop whose mean `1 - cos` between its predicted normal and the paired target
+  normals is past it also goes to `_bad_loops.ply`, even when its points fit: a
+  curve can lie on its target and still run across it. `1` is side-on, `2`
+  reversed. The alignment error is always measured and printed, including runs
+  that were not trained with the direction term, but at the default it does not
+  change the split.
 
-A loop whose traversal disagrees with the majority of its paired point normals is
-reversed before export (curve, normals, errors and tangents together), so the
-saved block always runs the way the surface does. The printed `align` value is
-measured before that reversal.
+Every loop not past any check goes to `_good_loops.ply`. The two files plus
+`_loop_split.txt` hold every loop, and no combined `_loops.ply` is written by
+current runs. `_loop_errors.csv` records the three readings and three flags for
+every loop, so a different threshold can be applied without fitting again.
+`--max-err` is separate: it only highlights loops in the figures and fills
+`bad_loops.txt`.
+
+To apply new criteria to a finished run, use
+
+```
+python plc_utils/reclassify_run.py log/<run> [--bad-loop-err ...]
+```
+
+It rebuilds the loops from the run's own cloud, loads the checkpoint, replays
+the predictions and rewrites the two split PLYs, `_loop_split.txt` and
+`_loop_errors.csv`. The replay is checked against the saved PLYs first; a loop
+the old export had reversed is recognised as a reversal, not a different fit,
+and the rewritten files carry the fit's own traversal.
+
+The exported traversal is the fit's own. A loop that disagrees with its paired
+point normals is reported in `align` and in the per-loop alignment error, but it
+is not turned round at export, so the saved block carries the direction the
+network produced.
 
 ---
 
@@ -797,7 +857,10 @@ STEM=my_shape
 RUN=log/my_shape_triplane
 
 # 1+2. extract and fit, with checkpoint. The cube warm-up
-#      (warmup/cube_warmup.pt) is loaded by default; --no-warmup ablates it.
+#      (warmup/cube_warmup_random_ranges.pt) is loaded by default; --no-warmup
+#      ablates it. The network reads the pooled occupied cells without the slice
+#      axis by default (--feature-pool occupied_cells, axis off); the checkpoint
+#      must have been warmed in the same mode.
 #      Add --seam-align 1 --seam-every 10 --seam-steps 100 to solve the seam.
 #      Add --freeze-f-epochs 100 when a loop family reverses during the drag
 #      (WORKFLOW.md §2.4); the field places the loops while f is held.

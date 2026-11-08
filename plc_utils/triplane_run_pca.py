@@ -91,8 +91,8 @@ def explained(ax, ev, label, note):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('checkpoint', help='a run\'s *_model.pt')
-    ap.add_argument('--warmup', default='warmup/cube_warmup_axis.pt',
-                    help='the cube warm-up the fit started from')
+    ap.add_argument('--warmup', default='warmup/cube_warmup_random_ranges.pt',
+                    help='the warm-up the fit started from')
     ap.add_argument('--delta', action='store_true',
                     help='add a row with the change from the warm-up')
     ap.add_argument('--out', default=None, help='output PNG')

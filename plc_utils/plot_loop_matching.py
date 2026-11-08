@@ -25,15 +25,15 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 import _paths  # noqa: E402
-import mini_nn
-from loop_extraction import plane_basis
+from plc_model import mini_nn
+from plc_model.loop_extraction import plane_basis
 from plot_first_iteration import arrow, plane_file, read_ply
 
 AXES = 'xyz'
 GREEN, RED = '#1a9850', '#d73027'
 
 
-def fitted(model, queries, axes, frame, n):
+def fitted(model, queries, frame, n):
     """Every loop as the trained network draws it, in the cloud frame, with its
     analytic tangent."""
     z = torch.linspace(0, 1, n + 1)[:-1, None]
@@ -42,8 +42,7 @@ def fitted(model, queries, axes, frame, n):
     outs, tans = [], []
     for i in range(len(queries)):
         zz = z.clone().requires_grad_(True)
-        out = model(zz[None].expand(1, -1, -1), None, feat[i:i + 1],
-                    axes[i:i + 1])
+        out = model(zz[None].expand(1, -1, -1), None, feat[i:i + 1])
         tans.append(mini_nn.curve_tangent(out, zz).detach())
         ## the network predicts in the plane's frame; the export adds the plane's
         ## centre point back, which is what puts the curve on the cloud
@@ -127,7 +126,7 @@ def main():
     ap.add_argument('--samples', type=int, default=100)
     ap.add_argument('--turned-only', action='store_true',
                     help='only the loops whose final fit runs the other way')
-    ap.add_argument('--warmup', default='warmup/cube_warmup_axis.pt')
+    ap.add_argument('--warmup', default='warmup/cube_warmup_random_ranges.pt')
     ap.add_argument('--epoch0', action='store_true',
                     help='pair the cube warm-up to the targets instead of the fit')
     ap.add_argument('--state', type=Path,
@@ -141,11 +140,10 @@ def main():
     ckpt = torch.load(args.run / f'{args.stem}_model.pt', map_location='cpu',
                       weights_only=False)
     if args.epoch0 or args.state is not None:
-        model = mini_nn.miniNN(1, num_neurons=ckpt['num_neurons'],
-                               num_layers=ckpt.get('num_layers', 2),
-                               pe=ckpt['pe'], feature_mode='triplane',
-                               triplane=dict(ckpt['triplane']),
-                               axis_condition=bool(ckpt.get('axis_condition')))
+        model = mini_nn.TriplaneNN(num_neurons=ckpt['num_neurons'],
+                                   num_layers=ckpt.get('num_layers', 2),
+                                   pe=ckpt['pe'],
+                                   triplane=dict(ckpt['triplane']))
         if args.state is None:
             mini_nn.load_warmup(args.warmup, model)
         else:
@@ -163,7 +161,7 @@ def main():
     queries = torch.as_tensor(ckpt['queries'])
     axes_t = torch.as_tensor(axes)
     frame = np.asarray(ckpt['plane_point'])
-    curves, tangents = fitted(model, queries, axes_t,
+    curves, tangents = fitted(model, queries,
                               torch.as_tensor(frame), n)
 
     wind = np.load(args.run / f'{args.stem}_loop_winding.npz')

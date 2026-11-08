@@ -22,8 +22,8 @@ import torch
 from scipy.spatial import cKDTree
 
 import _paths  # noqa: E402
-import mini_nn
-from loop_extraction import plane_basis
+from plc_model import mini_nn
+from plc_model.loop_extraction import plane_basis
 from plot_epoch_matching import build
 from plot_loop_matching import targets_for
 from plot_axis_epochs import all_curves, sheet
@@ -56,7 +56,7 @@ def main():
     ## the fitted model says which target colour group is which slot: an early
     ## curve can be far from its slice and would otherwise swap two loops
     final, _ = mini_nn.load_model(args.run / f'{args.stem}_model.pt')
-    final_curves, _ = all_curves(final, queries, axes_t, frame, n)
+    final_curves, _ = all_curves(final, queries, frame, n)
 
     plane_of = {}
     for i in loops:
@@ -76,7 +76,7 @@ def main():
     for spec in args.state:
         label, path = spec.split('=', 1)
         model = build(ckpt, path, None)
-        curves, tangents = all_curves(model, queries, axes_t, frame, n)
+        curves, tangents = all_curves(model, queries, frame, n)
         report = []
         for i in loops:
             pts = curves[int(i)].numpy()

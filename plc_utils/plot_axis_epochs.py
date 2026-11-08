@@ -28,26 +28,26 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 import _paths  # noqa: E402
-import mini_nn
-from loop_extraction import plane_basis
+from plc_model import mini_nn
+from plc_model.loop_extraction import plane_basis
 from plot_epoch_matching import build
 from plot_loop_matching import targets_for, panel, GREEN, RED
 
 AXES = 'xyz'
 
 
-def all_curves(model, queries, axes_t, frame, n):
+def all_curves(model, queries, frame, n):
     """Every loop in one batched forward, with its analytic tangent.
 
-    The network conditions each sample on its own axis and feature, so a batch
-    of 139 loops is as valid as the trainer's batch of a few, and much faster
-    than 139 separate passes.
+    The network conditions each sample on its own feature, so a batch of 139
+    loops is as valid as the trainer's batch of a few, and much faster than 139
+    separate passes.
     """
     z = torch.linspace(0, 1, n + 1)[:-1, None]
     z = z[None].expand(len(queries), -1, -1).clone().requires_grad_(True)
     with torch.no_grad():
         feat = model.triplane(queries)
-    out = model(z, None, feat, axes_t)
+    out = model(z, None, feat)
     tan = mini_nn.curve_tangent(out, z).detach()
     return out.detach() + frame[:, None, :], tan
 
@@ -96,7 +96,7 @@ def main():
     ap.add_argument('--last', type=int, default=20)
     ap.add_argument('--states', type=Path,
                     help='folder replay_epochs.py wrote (default run/replay)')
-    ap.add_argument('--warmup', default='warmup/cube_warmup_axis.pt')
+    ap.add_argument('--warmup', default='warmup/cube_warmup_random_ranges.pt')
     ap.add_argument('--samples', type=int, default=100)
     ap.add_argument('--columns', type=int, default=6)
     args = ap.parse_args()
@@ -114,7 +114,7 @@ def main():
 
     ## the final fit fixes which target colour belongs to which loop of a plane
     final, _ = mini_nn.load_model(args.run / f'{args.stem}_model.pt')
-    final_curves, _ = all_curves(final, queries, axes_t, frame, n)
+    final_curves, _ = all_curves(final, queries, frame, n)
 
     plane_of = {}
     for i in range(len(keys)):
@@ -146,7 +146,7 @@ def main():
     for e_i, e in enumerate(epochs):
         model = (build(ckpt, None, args.warmup) if e == 0
                  else build(ckpt, str(states / f'state_e{e}.pt'), None))
-        curves, tangents = all_curves(model, queries, axes_t, frame, n)
+        curves, tangents = all_curves(model, queries, frame, n)
 
         for k, axis in enumerate(AXES):
             mine = sorted((int(i) for i in loops[k]),

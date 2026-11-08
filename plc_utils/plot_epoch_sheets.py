@@ -26,8 +26,8 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 import _paths  # noqa: E402
-import mini_nn
-from loop_extraction import plane_basis
+from plc_model import mini_nn
+from plc_model.loop_extraction import plane_basis
 from plot_epoch_matching import build
 from plot_loop_matching import fitted, targets_for, panel, GREEN, RED
 
@@ -55,8 +55,8 @@ def main():
     ap.add_argument('--last', type=int, default=13)
     ap.add_argument('--states', type=Path,
                     help='folder replay_epochs.py wrote (default run/replay)')
-    ap.add_argument('--warmup', default='warmup/cube_warmup_axis.pt',
-                    help='the cube warm-up, drawn as epoch 0')
+    ap.add_argument('--warmup', default='warmup/cube_warmup_random_ranges.pt',
+                    help='the warm-up, drawn as epoch 0')
     ap.add_argument('--samples', type=int, default=100)
     ap.add_argument('--columns', type=int, default=6)
     args = ap.parse_args()
@@ -79,7 +79,7 @@ def main():
 
     ## the final fit fixes which target colour belongs to which loop of a plane
     final, _ = mini_nn.load_model(args.run / f'{args.stem}_model.pt')
-    final_curves, _ = fitted(final, queries[loops], axes_t[loops],
+    final_curves, _ = fitted(final, queries[loops],
                              frame[loops], n)
 
     plane_of = {}
@@ -109,7 +109,7 @@ def main():
             model = build(ckpt, None, args.warmup)
         else:
             model = build(ckpt, str(states / f'state_e{e}.pt'), None)
-        curves, tangents = fitted(model, queries[loops], axes_t[loops],
+        curves, tangents = fitted(model, queries[loops],
                                   frame[loops], n)
 
         report = []

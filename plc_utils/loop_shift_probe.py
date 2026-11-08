@@ -22,7 +22,7 @@ import torch
 import trimesh
 
 import _paths  # noqa: E402
-import mini_nn
+from plc_model import mini_nn
 
 
 def resolve(run, model=None, loop_ply=None):

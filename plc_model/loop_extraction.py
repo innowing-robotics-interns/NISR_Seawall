@@ -1238,12 +1238,12 @@ def save_fit_grid(img_path, loops, preds, p_normal, p_point, max_err=None, large
 # every plane on its own: its slice, its loops and the curve fitted to each
 def save_plane_files(out_dir, pc, pcn, slices, centres, loops, preds,
                      p_normal, p_point, max_err=None, large=1.5,
-                     pred_normals=None, n_arrows=20):
+                     pred_normals=None, n_arrows=20, write_files=True):
     """
     One set of files per slice plane, so a plane can be loaded, coloured and
     compared on its own instead of only inside the run's combined figures.
 
-    Under <out_dir>/planes/:
+    With write_files, under <out_dir>/planes/:
       plane_SS_<axis><offset>_slice.ply   the plane's points as they were sliced
       plane_SS_<axis><offset>_loops.ply   the same points coloured by the loop each
                                           was assigned to, grey where none
@@ -1257,7 +1257,8 @@ def save_plane_files(out_dir, pc, pcn, slices, centres, loops, preds,
 
     <out_dir>/bad_loops.txt lists those loops alone, one per line with the plane,
     the centre, the point count and the error, since that is the list a loop is
-    dropped from.
+    dropped from. The two text files are written whether or not the per-plane
+    files are: they are the run's summary, not the per-plane detail.
 
     pc, pcn, slices, centres: as slice_point_cloud and loop_centres return them
     loops, preds: as save_fit_grid takes them
@@ -1270,10 +1271,13 @@ def save_plane_files(out_dir, pc, pcn, slices, centres, loops, preds,
              array per loop and in the same order as preds; written into the fit
              PLY as nx/ny/nz and drawn as arrows without an outward sign correction
     n_arrows: predicted-normal arrows per loop, 0 for none, None for every point
+    write_files: write the per-plane PLYs and PNGs under <out_dir>/planes/; False
+             skips that folder entirely and writes only the two text files
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    if write_files:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
 
     p_normal = np.atleast_2d(np.asarray(p_normal, dtype=np.float64))
     p_normal = p_normal / np.linalg.norm(p_normal, axis=1, keepdims=True)
@@ -1294,7 +1298,8 @@ def save_plane_files(out_dir, pc, pcn, slices, centres, loops, preds,
             normal_at.setdefault(s, []).append(np.asarray(normals, dtype=np.float64))
 
     out = Path(out_dir) / 'planes'
-    out.mkdir(parents=True, exist_ok=True)
+    if write_files:
+        out.mkdir(parents=True, exist_ok=True)
     lines = [f'{len(slices)} planes, {len(loops)} loops']
     size_of = {(s, c): len(pts) for s, c, pts, _ in loops}
     bad = []
@@ -1302,7 +1307,7 @@ def save_plane_files(out_dir, pc, pcn, slices, centres, loops, preds,
     for s, idx in enumerate(slices):
         axis = 'xyz'[s // cols] if s // cols < 3 else f'p{s // cols}'
         offset = p_point[s] @ p_normal[s]
-        base = str(out / f'plane_{s:02d}_{axis}{offset:+.2f}')
+        base = str(out / f'plane_{s:02d}_{axis}{offset:+.2f}') if write_files else None
         items = per.get(s, [])
         mean = float(np.mean([e for *_, e in items])) if items else 0.0
         over = max_err is not None and any(e > max_err for *_, e in items)
@@ -1311,47 +1316,48 @@ def save_plane_files(out_dir, pc, pcn, slices, centres, loops, preds,
         big = bool(items) and (over or mean > limit)
         large_planes += big
 
-        ## the slice as it was cut: one grey, so a viewer shows the contour itself
-        grey = np.full((len(idx), 4), 200, dtype=np.uint8)
-        grey[:, 3] = 255
-        write_points(f'{base}_slice.ply', pc[idx], grey,
-                     None if pcn is None else np.asarray(pcn)[idx])
+        if write_files:
+            ## the slice as it was cut: one grey, so a viewer shows the contour itself
+            grey = np.full((len(idx), 4), 200, dtype=np.uint8)
+            grey[:, 3] = 255
+            write_points(f'{base}_slice.ply', pc[idx], grey,
+                         None if pcn is None else np.asarray(pcn)[idx])
 
-        ## the same points again, coloured by loop, which is the parting the solve saw
-        lab = np.full(len(idx), -1, dtype=int) if centres is None else centres[s][2]
-        colors = np.full((len(idx), 4), 158, dtype=np.uint8)
-        colors[:, 3] = 255
-        for k in np.unique(lab[lab >= 0]):
-            colors[lab == k] = (np.array(plt.cm.tab10(int(k) % 10)) * 255).astype(np.uint8)
-        write_points(f'{base}_loops.ply', pc[idx], colors,
-                     None if pcn is None else np.asarray(pcn)[idx])
+            ## the same points again, coloured by loop, which is the parting the solve saw
+            lab = np.full(len(idx), -1, dtype=int) if centres is None else centres[s][2]
+            colors = np.full((len(idx), 4), 158, dtype=np.uint8)
+            colors[:, 3] = 255
+            for k in np.unique(lab[lab >= 0]):
+                colors[lab == k] = (np.array(plt.cm.tab10(int(k) % 10)) * 255).astype(np.uint8)
+            write_points(f'{base}_loops.ply', pc[idx], colors,
+                         None if pcn is None else np.asarray(pcn)[idx])
 
-        if fit_at.get(s):
-            point_sets = [p for _, p in fit_at[s]]
-            curve = np.concatenate(point_sets)
-            tints = np.concatenate([
-                np.repeat((np.array(plt.cm.tab10(int(c) % 10)) * 255).astype(np.uint8)[None],
-                          len(p), axis=0) for c, p in fit_at[s]])
-            write_points(f'{base}_fit.ply', curve, tints,
-                         None if not normal_at.get(s)
-                         else np.concatenate(normal_at[s]))
+            if fit_at.get(s):
+                point_sets = [p for _, p in fit_at[s]]
+                curve = np.concatenate(point_sets)
+                tints = np.concatenate([
+                    np.repeat((np.array(plt.cm.tab10(int(c) % 10)) * 255).astype(np.uint8)[None],
+                              len(p), axis=0) for c, p in fit_at[s]])
+                write_points(f'{base}_fit.ply', curve, tints,
+                             None if not normal_at.get(s)
+                             else np.concatenate(normal_at[s]))
 
-            fig, ax = plt.subplots(figsize=(4.2, 4.2), dpi=140,
-                                   constrained_layout=True)
-            draw_fit_panel(ax, items, fit_window(items), max_err,
-                           normal_per.get(s), n_arrows)
-            errs = ', '.join(mark_error(e, max_err) for *_, e in items)
-            ## this figure is opened on its own, so it carries the multiple rather
-            ## than leaving the reader to remember the grid's median
-            title = (f'{axis} = {offset:.2f} | '
-                     f'{len(items)} loop{"" if len(items) == 1 else "s"} | err {errs}')
-            if big:
-                title += f' | {mean / typical:.1f}x the {typical:.3f} median'
-            ax.set_title(f'! {title}' if big else title, fontsize=8,
-                         color='#bf1b1b' if big else 'black')
-            param_colorbar(fig, ax)
-            fig.savefig(f'{base}_fit.png')
-            plt.close(fig)
+                fig, ax = plt.subplots(figsize=(4.2, 4.2), dpi=140,
+                                       constrained_layout=True)
+                draw_fit_panel(ax, items, fit_window(items), max_err,
+                               normal_per.get(s), n_arrows)
+                errs = ', '.join(mark_error(e, max_err) for *_, e in items)
+                ## this figure is opened on its own, so it carries the multiple rather
+                ## than leaving the reader to remember the grid's median
+                title = (f'{axis} = {offset:.2f} | '
+                         f'{len(items)} loop{"" if len(items) == 1 else "s"} | err {errs}')
+                if big:
+                    title += f' | {mean / typical:.1f}x the {typical:.3f} median'
+                ax.set_title(f'! {title}' if big else title, fontsize=8,
+                             color='#bf1b1b' if big else 'black')
+                param_colorbar(fig, ax)
+                fig.savefig(f'{base}_fit.png')
+                plt.close(fig)
 
         for c, _, _, e in items:
             if max_err is not None and e > max_err:
@@ -1370,9 +1376,11 @@ def save_plane_files(out_dir, pc, pcn, slices, centres, loops, preds,
         f'figures and marked "!" in planes.txt')
     (Path(out_dir) / 'bad_loops.txt').write_text(head + '\n' + '\n'.join(bad) +
                                                  ('\n' if bad else ''))
+    limit_txt = 'no max_err' if max_err is None else f'{max_err:.4f}'
+    dest = (f'per-plane files in {out}, ' if write_files else '')
     print(f'  {len(slices)} planes, {len(loops)} loops, {large_planes} planes over '
-          f'{large:g}x the {typical:.4f} median, {len(bad)} loops over {max_err:.4f}: '
-          f'-> {out}, {Path(out_dir) / "planes.txt"}, '
+          f'{large:g}x the {typical:.4f} median, {len(bad)} loops over {limit_txt}: '
+          f'-> {dest}{Path(out_dir) / "planes.txt"}, '
           f'{Path(out_dir) / "bad_loops.txt"}')
 
 

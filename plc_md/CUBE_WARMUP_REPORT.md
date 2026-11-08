@@ -2,6 +2,12 @@
 
 Date: 2026-11-07
 
+> Historical: this report measures the unit-cube, axis-conditioned checkpoint
+> `warmup/cube_warmup.pt`. Since 2026-11-08 the default is the random-cube,
+> occupied-cell, axis-free `warmup/cube_warmup_random_ranges.pt`; see
+> [WARMUP.md](WARMUP.md) W13 and the random-cube measurements there. The
+> conclusions below describe the earlier checkpoint, not the current default.
+
 This report measures what the cube warm-up (`warmup_cube.py` →
 `warmup/cube_warmup.pt`) does when it initialises a real shape's loop fit. It
 covers two things separately: the warm-up artifact itself, and four 29-plane
@@ -321,8 +327,9 @@ repeat spread is quoted in §7.1 and used as the bar for every comparison.
 | lucy | blank | 0.564 | 0.0296 | 0.0005 | 0.0053 | 0 | 1991 | 0.458 | 17 | 0.0481 | 0.2467 |
 
 `align` is the fit's own reading: mean `1 − cos`, 0 aligned and 2 reversed.
-`loops reversed` is the count with mean cos < −0.1, i.e. the loops turned round
-before export.
+`loops reversed` is the count with mean cos < −0.1, i.e. the loops that run
+against the points' normals. They are reported but no longer turned round at
+export.
 
 Blank-run orientation, rebuilt the same way as §5:
 

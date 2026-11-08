@@ -26,19 +26,18 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 import _paths  # noqa: E402
-import mini_nn
-from loop_extraction import plane_basis
+from plc_model import mini_nn
+from plc_model.loop_extraction import plane_basis
 from plot_loop_matching import fitted, targets_for, panel, GREEN, RED
 
 AXES = 'xyz'
 
 
 def build(ckpt, state, warmup):
-    model = mini_nn.miniNN(1, num_neurons=ckpt['num_neurons'],
-                           num_layers=ckpt.get('num_layers', 2),
-                           pe=ckpt['pe'], feature_mode='triplane',
-                           triplane=dict(ckpt['triplane']),
-                           axis_condition=bool(ckpt.get('axis_condition')))
+    model = mini_nn.TriplaneNN(num_neurons=ckpt['num_neurons'],
+                               num_layers=ckpt.get('num_layers', 2),
+                               pe=ckpt['pe'],
+                               triplane=dict(ckpt['triplane']))
     if state is None:
         mini_nn.load_warmup(warmup, model)
     else:
@@ -56,7 +55,7 @@ def main():
     ap.add_argument('axis', choices=tuple(AXES))
     ap.add_argument('--state', action='append', default=[], metavar='LABEL=PATH',
                     help='an epoch to replay, in row order')
-    ap.add_argument('--warmup', default='warmup/cube_warmup_axis.pt')
+    ap.add_argument('--warmup', default='warmup/cube_warmup_random_ranges.pt')
     ap.add_argument('--samples', type=int, default=100)
     ap.add_argument('--columns', type=int, default=6)
     ap.add_argument('--out', type=Path)
@@ -81,7 +80,7 @@ def main():
     drawn = {}
     for label, state in rows:
         curves, tangents = fitted(build(ckpt, state, args.warmup), queries,
-                                  axes_t, torch.as_tensor(frame), n)
+                                  torch.as_tensor(frame), n)
         drawn[label] = (curves, tangents)
         print(f'{label}: {len(curves)} loops')
 

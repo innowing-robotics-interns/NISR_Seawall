@@ -4,11 +4,12 @@
 Each cell of each of the three planes carries a 16-D feature. All cells are
 stacked, centred, and the top three principal directions are painted into
 R, G and B, so every plane becomes a 32 x 32 colour snapshot in one shared
-feature basis. The cube's 12 loop centroids are marked as the places the
-warm-up actually reads.
+feature basis. The unit cube's 12 reference loop centroids are marked as fixed
+places on the grid.
 
     python plc_utils/triplane_pca.py warmup/cube_warmup_xavier.pt
-    python plc_utils/triplane_pca.py warmup/cube_warmup.pt warmup/cube_warmup_xavier.pt
+    python plc_utils/triplane_pca.py warmup/cube_warmup_random_ranges.pt \\
+        warmup/cube_warmup_axis.pt
 
 The checkpoint's frame is the unit cube, so cell centres are on [-0.5, 0.5].
 The colour scale is symmetric per component, with zero fixed at 0.5, and
@@ -173,7 +174,7 @@ def render(checkpoints, out, delta=False, init='auto'):
     what = ('change from initialisation' if delta else 'cell features')
     fig.suptitle(f'Cube warm-up triplane {what}: RGB = PC1/PC2/PC3 of the 16-D '
                  'cell vectors (shared basis, zero at 0.5); white circles = the '
-                 '12 cube loop centroids', fontsize=11)
+                 'unit cube\'s 12 reference loop centroids', fontsize=11)
     fig.savefig(out, dpi=170, bbox_inches='tight')
     print(f'wrote {out}')
 
@@ -184,9 +185,10 @@ def render(checkpoints, out, delta=False, init='auto'):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('checkpoints', nargs='*', default=['warmup/cube_warmup.pt'],
+    parser.add_argument('checkpoints', nargs='*',
+                        default=['warmup/cube_warmup_random_ranges.pt'],
                         help='cube warm-up checkpoints (default: '
-                             'warmup/cube_warmup.pt)')
+                             'warmup/cube_warmup_random_ranges.pt)')
     parser.add_argument('--out', default='log/triplane_pca/triplane_pca.png',
                         help='output PNG')
     parser.add_argument('--delta', action='store_true',

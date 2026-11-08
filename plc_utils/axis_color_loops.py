@@ -21,7 +21,7 @@ import trimesh
 
 import _paths  # noqa: E402
 import loop_propagation as lp  # noqa: E402
-from loop_extraction import AXIS_COLORS, AXIS_HEX  # noqa: E402
+from plc_model.loop_extraction import AXIS_COLORS, AXIS_HEX  # noqa: E402
 
 AXCOL = dict(zip('xyz', AXIS_HEX))
 AXRGB = dict(zip('xyz', AXIS_COLORS))

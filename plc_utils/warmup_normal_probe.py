@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """What the cube warm-up does to a loop's normals.
 
-The warm-up trains the network on a unit cube and nothing else: every cube loop is
+This probe uses the unit-cube mode of the warm-up (`mini_nn.warm_on_cube` with
+`cubes=0`): every cube loop is
 walked counter-clockwise seen from its plane normal, so the cube fixes a
 circulation. This probe asks whether the circulation that transfers to a real
 shape agrees with the normals the cloud's points carry, and whether it depends on
@@ -36,8 +37,8 @@ import numpy as np
 import torch
 
 import _paths  # noqa: E402
-import mini_nn
-from loop_extraction import LoopExtractor
+from plc_model import mini_nn
+from plc_model.loop_extraction import LoopExtractor
 
 
 def unit(a, eps=1e-12):
@@ -74,7 +75,7 @@ def extract(path, samples):
 
 
 def build(ex, targets, normals, frame, feature, seed, align=0.01,
-          layers=2, neurons=64, axis_condition=True):
+          layers=2, neurons=64):
     if feature == 'triplane':
         extent = np.ptp(ex.points, axis=0)
         pad = 0.02 * float(extent.max())
@@ -85,15 +86,13 @@ def build(ex, targets, normals, frame, feature, seed, align=0.01,
                             for i in range(len(targets))])
         return mini_nn.Trainer(
             targets, num_models=len(targets), num_neurons=neurons,
-            num_layers=layers, normals=normals, align=align,
+            num_layers=layers, normals=normals, align_normal=align,
             seed=seed, feature_mode='triplane', triplane=tri,
-            query_points=queries, feature_tv=0.01,
-            axis_condition=axis_condition)
+            query_points=queries, feature_tv=0.01)
     return mini_nn.Trainer(
         targets, num_models=len(targets), codes=np.arange(len(targets)),
         num_neurons=neurons, num_layers=layers, normals=normals,
-        align=align, seed=seed, feature_mode='embedding',
-        axis_condition=axis_condition)
+        align_normal=align, seed=seed, feature_mode='embedding')
 
 
 def measure(trainer, ex, targets, normals):
@@ -145,9 +144,7 @@ def decode_at(trainer, xyz, axis):
                         device=trainer.device)
     feat = trainer.model.triplane.sample(q)
     z = trainer.z[None].clone().requires_grad_(True)
-    a = torch.as_tensor(np.asarray(axis, dtype=np.float32).reshape(1, 3),
-                        device=trainer.device)
-    out = trainer.model(z, None, feat, a)
+    out = trainer.model(z, None, feat)
     tangent = mini_nn.curve_tangent(out, z)[0].detach().cpu().numpy()
     points = out[0].detach().cpu().numpy()
     return points, np.cross(tangent, unit(axis)[None, :])

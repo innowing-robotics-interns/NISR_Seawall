@@ -151,7 +151,73 @@ def signed_area2(q):
                         np.dot(q[:, 1], np.roll(q[:, 0], -1))))
 
 
+def load_split_loops(run: Path, good_only: bool = False):
+    """Rebuild the loop blocks from the run-level split PLYs.
+
+    A run that does not keep `planes/` still writes `<stem>_good_loops.ply` and
+    `<stem>_bad_loops.ply`, whose vertices are the fitted curves in checkpoint
+    order, plus `<stem>_loop_split.txt` with one flag per loop.  The triplane
+    npz carries the same loops' axis, offset and slot in that order, so the two
+    together give back what `load_run` reads from the per-plane files.  Only the
+    keys, block geometry and a fitted plane normal are needed for colouring and
+    drawing; the labelled slice points that the per-plane PLYs also hold are not.
+    """
+    npz_hits = sorted(run.glob('*_triplane.npz'))
+    if len(npz_hits) != 1:
+        raise SystemExit(f'{run}: expected one *_triplane.npz, found '
+                         f'{len(npz_hits)}')
+    keys = np.load(npz_hits[0])['keys']
+    split_hits = sorted(run.glob('*_loop_split.txt'))
+    if len(split_hits) != 1:
+        raise SystemExit(f'{run}: expected one *_loop_split.txt, found '
+                         f'{len(split_hits)}')
+    flags = split_hits[0].read_text().strip()
+    if len(flags) != len(keys):
+        raise SystemExit(f'{split_hits[0].name}: {len(flags)} flags for '
+                         f'{len(keys)} loops')
+
+    blocks = [None] * len(keys)
+    for flag, name in (('g', 'good_loops'), ('b', 'bad_loops')):
+        idx = [i for i, c in enumerate(flags) if c == flag]
+        if not idx:
+            continue
+        hits = sorted(run.glob(f'*_{name}.ply'))
+        if len(hits) != 1:
+            raise SystemExit(f'{run}: expected one *_{name}.ply, found '
+                             f'{len(hits)}')
+        v = np.asarray(trimesh.load(hits[0], process=False).vertices, float)
+        if len(v) % len(idx):
+            raise SystemExit(f'{hits[0].name}: {len(v)} vertices do not split '
+                             f'into {len(idx)} blocks')
+        per = len(v) // len(idx)
+        for j, i in enumerate(idx):
+            blocks[i] = v[j * per:(j + 1) * per]
+
+    loops = []
+    for i, (key, block) in enumerate(zip(keys, blocks)):
+        axis = 'xyz'[int(key[0])]
+        c, n, e1, e2 = canonical(block, axis)
+        b2 = np.stack([(block - c) @ e1, (block - c) @ e2], 1)
+        if signed_area2(b2) < 0:
+            block = block[::-1]
+            b2 = b2[::-1]
+        loops.append(dict(
+            key=f'{i}:{int(key[2])}', plane=i, axis=axis,
+            off=float(key[1]), k=int(key[2]), n=int(len(block)), block=block,
+            pts=block, centre=c, normal=n, e1=e1, e2=e2,
+            b2=b2, q2=b2, loop2=resample2(b2),
+            radius=float(np.sqrt((b2 ** 2).sum(1).mean()))))
+    if good_only:
+        keep = [c == 'g' for c in flags]
+        loops = [L for L, k in zip(loops, keep) if k]
+        print(f'  good loops only: kept {len(loops)} of {len(keep)} loops')
+    return loops
+
+
 def load_run(run: Path, good_only: bool = False):
+    ## a run that keeps no per-plane files is still readable from its split PLYs
+    if not (run / 'planes').is_dir():
+        return [], load_split_loops(run, good_only=good_only)
     planes = parse_planes(run)
     loops = []
     nblock = None

@@ -29,9 +29,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 import _paths  # noqa: E402
-import mini_nn
-from mini_nn import winding_number
-from loop_extraction import plane_basis
+from plc_model import mini_nn
+from plc_model.mini_nn import winding_number
+from plc_model.loop_extraction import plane_basis
 
 AXES = 'xyz'
 PLY_TYPES = {'float': '<f4', 'float32': '<f4', 'double': '<f8',
@@ -70,20 +70,17 @@ def read_ply(path):
 
 def first_iteration(ckpt, warmup):
     """Every loop as the fit draws it before its first update, in the cloud frame."""
-    model = mini_nn.miniNN(1, num_neurons=ckpt['num_neurons'],
-                           num_layers=ckpt['num_layers'], pe=ckpt['pe'],
-                           feature_mode='triplane',
-                           triplane=dict(ckpt['triplane']),
-                           axis_condition=ckpt['axis_condition'])
+    model = mini_nn.TriplaneNN(num_neurons=ckpt['num_neurons'],
+                               num_layers=ckpt['num_layers'], pe=ckpt['pe'],
+                               triplane=dict(ckpt['triplane']))
     mini_nn.load_warmup(warmup, model)
     model.eval()
     n = int(ckpt['latent_points'])
     z = torch.linspace(0, 1, n + 1)[:-1, None]
     queries = torch.as_tensor(ckpt['queries'])
-    axes = torch.as_tensor(ckpt['axes'])
     with torch.no_grad():
         feat = model.triplane(queries)
-        out = model(z[None].expand(len(queries), -1, -1), None, feat, axes)
+        out = model(z[None].expand(len(queries), -1, -1), None, feat)
     ## the network draws each loop in its plane's frame, whose origin is the plane's
     ## centre point; the export adds it back, and so must any replay of the fit.
     ## The checkpoint keeps that point per loop, not per plane
@@ -117,7 +114,7 @@ def main():
     ap.add_argument('run', type=Path)
     ap.add_argument('stem')
     ap.add_argument('axis', choices=tuple(AXES))
-    ap.add_argument('--warmup', default='warmup/cube_warmup_axis.pt')
+    ap.add_argument('--warmup', default='warmup/cube_warmup_random_ranges.pt')
     ap.add_argument('--out', default=None)
     ap.add_argument('--zoom', action='store_true',
                     help='frame each panel on the target, not the warm-up square')

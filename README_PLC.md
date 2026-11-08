@@ -11,10 +11,10 @@ items — is in [PROJECT_STATE.md](PROJECT_STATE.md).
 
 | file | role |
 |---|---|
-| `rosa_main.py` | command line and the run |
-| `loop_extraction.py` | slicing, loop centres, PLY and figure writing |
-| `mini_nn.py` | network, trainer, warm-up load, seam distillation |
-| `warmup/cube_warmup_axis.pt` | warm-up checkpoint (initialisation and distill teacher) |
+| `plc_main.py` | command line and the run |
+| `plc_model/loop_extraction.py` | slicing, loop centres, PLY and figure writing |
+| `plc_model/mini_nn/` | network, trainer, warm-up load, seam distillation (one class per module) |
+| `warmup/cube_warmup_random_ranges.pt` | default warm-up checkpoint (initialisation and distill teacher) |
 | an input `.ply` with normals | default `normalized_shapes/laurent_hand_normal.ply` |
 
 Python packages: PyTorch (CUDA), NumPy, SciPy, trimesh, matplotlib. Use the
@@ -74,7 +74,8 @@ python rosa_main.py \
 | `--feature triplane` | triplane conditioning; required by the warm-up and distillation |
 | `--normal` | weight of the direction term (0.01 in the experiments) |
 | `--triplane-tv` | total-variation weight on the three grids (0.01) |
-| `--warmup` | warm-up checkpoint, default `warmup/cube_warmup_axis.pt` |
+| `--feature-pool` | how a loop reads the field; `occupied_cells` by default, `centroid` for the earlier runs |
+| `--warmup` | warm-up checkpoint, default `warmup/cube_warmup_random_ranges.pt` (with occupied cells) |
 | `--distill W` | seam-distillation weight; 0 is off |
 | `--distill-warmup` | teacher checkpoint, defaults to `--warmup` |
 | `--freeze-f-epochs N` | freeze the shared MLP `f` for the first N epochs; only the triplane grid trains (100 in the experiments) |
@@ -82,9 +83,9 @@ python rosa_main.py \
 | `--snapshot-every` | checkpoint cadence; 0 disables snapshots |
 | `--out` | run folder, default `log/<input stem>/` |
 
-The warm-up checkpoint must match the run's network and grid: axis-conditioned,
-2x64 MLP, 32x32x3 grids with 16 channels. A mismatch is refused instead of being
-loaded in part.
+The warm-up checkpoint must match the run's network, grid and mode: the
+default checkpoint is a 2x64 MLP, 32x32x3 grids with 16 channels, occupied-cell
+pooling and no axis input. A mismatch is refused instead of being loaded in part.
 
 ## Frozen start
 
@@ -169,7 +170,10 @@ the same command and 1000-epoch schedule and kept as
 - `<stem>_slices.ply`, `<stem>_slices.png` — extraction, one colour per slice
 - `<stem>_model.pt` — fitted network plus replay metadata
 - `<stem>_good_loops.ply`, `<stem>_bad_loops.ply`, `<stem>_loop_split.txt` —
-  predictions split at the worst-point error limit, and the per-loop flag
+  predictions split at the point-error, mean-error and optional normal-alignment
+  limits, and the per-loop flag
+- `<stem>_loop_errors.csv` — per-loop mean, max and alignment error plus the
+  three split flags
 - `<stem>_fits.png` — target vs fitted curve for every loop
 - `<stem>_epoch_terms.csv`, `<stem>_loop_winding.npz` — per-epoch losses and
   signed winding per loop
@@ -177,8 +181,20 @@ the same command and 1000-epoch schedule and kept as
   `<stem>_feature_smoothness.txt` — field samples and the loop-pair graph
 - `planes.txt`, `planes/` — per-plane readings and figures
 
-`bad` in the final report means a loop with a point past `0.15` from its target.
-The `bad_loops.txt` shortlist uses the separate `--max-err` mean-error rule.
+`bad` in the final report means a loop failing any export check: a point past
+`0.15` from its target, a mean error past `--bad-loop-err` (default `0.015` of
+the longest extent), or, when `--max-align-err` is positive, alignment past that
+limit. The `bad_loops.txt` shortlist uses the separate `--max-err` mean-error
+rule.
+
+A finished run can be reclassified without retraining:
+
+```
+python plc_utils/reclassify_run.py log/<run> --bad-loop-err 0.015
+```
+
+It replays the checkpoint's own predictions (checked against the saved PLYs) and
+rewrites only the split artefacts.
 
 ## More
 

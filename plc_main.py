@@ -1,10 +1,10 @@
 """Run the cross-section loop pipeline end to end.
 
-`loop_extraction` owns the geometry: slicing, Poisson fields, loop centres and
-loop assignment, behind one `LoopExtractor` object.  This module owns the run: it
-exposes the only command line, extracts the loops through that object and, with
-``--train``, fits every loop with the shared mini network and writes the fit
-figures and coloured PLY exports.
+`plc_model.loop_extraction` owns the geometry: slicing, Poisson fields, loop
+centres and loop assignment, behind one `LoopExtractor` object.  This module
+owns the run: it exposes the only command line, extracts the loops through that
+object and, with ``--train``, fits every loop with the shared mini network and
+writes the fit figures and coloured PLY exports.
 """
 
 import argparse
@@ -14,16 +14,30 @@ import os
 import numpy as np
 import torch
 
-import mini_nn
-from loop_extraction import (AXIS_COLORS, DEFAULT_PLY, LoopExtractor,
-                             bisect_offsets_trace, plane_keys, save_fit_grid,
-                             save_plane_files, write_points)
+from plc_model import mini_nn
+from plc_model.loop_extraction import (AXIS_COLORS, DEFAULT_PLY,
+                                       LoopExtractor, bisect_offsets_trace,
+                                       plane_keys, save_fit_grid,
+                                       save_plane_files, write_points)
 
 
 ## a fitted point past this distance from its target makes the whole loop bad.
 ## The value is in the plane frame, where the outputs are compared, and is not
 ## the mean loop error `--max-err` uses to highlight a loop in the fit figures.
 BAD_POINT_ERR = 0.15
+
+## a loop whose mean 1 - cos between its predicted normal and the paired target
+## normals is past this is exported as bad even when its points fit. 0 (default)
+## turns the alignment side of the split off and leaves classification to the
+## point limit; a positive value is a mean 1 - cos, where 1 is side-on, 2 reversed,
+## and 0.5 a mean 60-degree disagreement.
+BAD_ALIGN_ERR = 0.0
+
+## a loop whose mean error is past this fraction of the longest extent is exported
+## as bad. The point limit above only sees the worst fitted point, so a curve that
+## is off along a whole arc but never far at one point stays good; the mean is the
+## size-independent reading of that. 0 turns this side of the split off.
+BAD_LOOP_ERR = 0.015
 
 
 def refine_plan(samples, epochs, every=0, add=2, end=None):
@@ -90,6 +104,12 @@ def build_parser():
     parser.add_argument('--normal-arrows', default='20',
                         help='arrows drawn from each fitted curve along its '
                              'predicted normal, per loop (0 for none, all for every point)')
+    parser.add_argument('--save-plane-files', dest='plane_files',
+                        action='store_true', default=False,
+                        help='write the per-plane slice/loops/fit PLYs and fit PNGs '
+                             'under <out>/planes/. Off by default: planes.txt and '
+                             'bad_loops.txt are always written, and the combined fit '
+                             'grid and split loop PLYs carry the same verdict')
     parser.add_argument('--field', action='store_true',
                         help='draw the implicit field of each loop behind the slice '
                              'points, and on its own in a second png')
@@ -123,14 +143,18 @@ def build_parser():
                              'the curves are moved onto their slices by the field '
                              'rather than dragged there by changing f. 0 (default) '
                              'trains both from the first step')
-    parser.add_argument('--warmup', default='warmup/cube_warmup_axis.pt',
+    parser.add_argument('--warmup', default='warmup/cube_warmup_random_ranges.pt',
                         metavar='CKPT',
                         help='cube warm-up checkpoint loaded before the first fit, on '
-                             'by default. `warmup_cube.py` trains it on a unit cube '
-                             'and nothing else: its loops are the cube\'s '
-                             'cross-sections, and the network learns to draw them on '
-                             'the cube, all circulating the same way and all putting '
-                             'z = 0 where their neighbouring loops do. The checkpoint '
+                             'by default. `plc_model/warmup_cube.py` trains it on cubes and '
+                             'nothing else: their cross-sections are exact squares, '
+                             'and the network learns to draw them on the cubes, all '
+                             'circulating the same way and all putting z = 0 where '
+                             'their neighbouring loops do. The default is warmed on '
+                             'cubes of random size and place with occupied-cell '
+                             'features, so a fit that uses it must use '
+                             '--feature-pool occupied_cells (the default; or name a '
+                             'checkpoint warmed for this run\'s pooling). The checkpoint '
                              'holds the shared network and the triplane field and '
                              'nothing shape-specific -- no rows, no phases, no plane '
                              'set -- so the shape\'s loops, planes and targets are '
@@ -138,24 +162,22 @@ def build_parser():
                              'this run\'s triplane frame kept: the grid is a function '
                              'of unit-cube position, and the frame is where that cube '
                              'is laid on the cloud\'s box. The load is refused if the '
-                             'checkpoint\'s network or grid shape differs from this '
-                             'run\'s. A missing path is an error: run warmup_cube.py '
-                             'first')
+                             'checkpoint\'s network, grid shape or pooling '
+                             'differs from this run\'s. A missing path is an error: run '
+                             'plc_model/warmup_cube.py first')
     parser.add_argument('--no-warmup', dest='warmup', action='store_const', const=None,
                         help='fit the loops from a blank network, which is the '
                              'ablation of the cube warm-up')
-    parser.add_argument('--axis-condition', dest='axis_condition',
-                        action='store_true', default=True,
-                        help='concatenate each loop\'s slice axis (+x/+y/+z) to the '
-                             'feature the network reads, so the direction is the '
-                             'network\'s reading of "counter-clockwise about this '
-                             'axis" rather than something inferred from the field. '
-                             'The cube warm-up is trained the same way, and the '
-                             'checkpoint says which mode it was warmed in (default on)')
-    parser.add_argument('--no-axis-condition', dest='axis_condition',
-                        action='store_false',
-                        help='condition on the feature alone, as the runs before the '
-                             'axis input did; needs a checkpoint warmed without it')
+    parser.add_argument('--feature-pool', choices=('centroid', 'occupied_cells'),
+                        default='occupied_cells',
+                        help='how a loop reads the triplane field. occupied_cells '
+                             '(default) snaps each target point to its nearest grid '
+                             'node in every plane and averages the unique nodes, so '
+                             'the code describes the loop\'s footprint and two loops '
+                             'whose centres share a cell still read different codes. '
+                             'centroid samples the one query at the loop\'s world '
+                             'centre, the 48-D code every earlier run used. Needs '
+                             '--feature triplane and a warm-up trained the same way')
     parser.add_argument('--distill', type=float, default=0.0, metavar='W',
                         help='weight of a teacher-student seam distillation: the '
                              'cube warm-up is read at this shape\'s own queries and '
@@ -236,20 +258,31 @@ def build_parser():
                              'whose normal is the one the cloud gives, 1 one whose '
                              'normal sits square to it, 2 one pointing the other way, '
                              'and the weight is in the same units as the chamfer loss. '
-                             'It is annealed: the term is taken at this weight on the '
-                             'first batch and at nothing on the last, so it settles '
-                             'which way round each loop runs while the fit is coarse '
-                             'and stops pulling once the fit sits on its points')
+                             'It is held at this weight for the whole run, so it keeps '
+                             'settling which way round each loop runs while the fit is '
+                             'coarse and goes on holding the loop once the fit sits on '
+                             'its points')
+    parser.add_argument('--match-angle', type=float, default=150.0, metavar='DEG',
+                        help='largest angle, in degrees, between the normal a fitted '
+                             'curve implies and the outward normal of a target point '
+                             'for chamfer to pair them; the pair is allowed when the '
+                             'angle is no greater. Both normals are read in the slice '
+                             'plane. 150 by default: it passes over a point on the far '
+                             'side of a thin feature, whose normal points back at the '
+                             'curve, while keeping nearly every true pair. A point '
+                             'with no allowed partner is left out of the fit on that '
+                             'step. 180 pairs by distance alone, as earlier runs did')
     parser.add_argument('--code-smooth', type=float, default=0.0,
-                        help='weight of a smoothness term on the loop codes: the '
-                             'codes of loops on neighbouring planes are pulled '
-                             'together, weighted by how close their in-plane centres '
-                             'are. A neighbouring cross-section of the same limb then '
-                             'starts from a similar code and the fits vary along the '
-                             'axis instead of each row being free. The term is in the '
-                             'same units as the chamfer loss (a squared distance summed '
-                             'over xyz), so it competes with the fit; 0 learns every '
-                             'row freely, which is the earlier behaviour')
+                        help='weight of a smoothness term on the embedding-table '
+                             'codes: the codes of loops on neighbouring planes are '
+                             'pulled together, weighted by how close their in-plane '
+                             'centres are. A neighbouring cross-section of the same '
+                             'limb then starts from a similar code and the fits vary '
+                             'along the axis instead of each row being free. The term '
+                             'is in the same units as the chamfer loss (a squared '
+                             'distance summed over xyz), so it competes with the fit; '
+                             '0 learns every row freely. It applies in embedding mode '
+                             'only; triplane mode smooths its field with --triplane-tv')
     parser.add_argument('--code-gate', type=float, default=2.0,
                         help='a pair must have in-plane centres closer than this many '
                              'median plane spacings along their axis to enter the code '
@@ -292,9 +325,10 @@ def build_parser():
                              'embedding is the '
                              'per-plane row table: every loop has a code of its own. '
                              'triplane replaces it with three orthogonal 2D feature '
-                             'grids, sampled at each loop\'s world centre, so the code '
-                             'is a continuous function of position and neighbouring '
-                             'loops start similar by construction')
+                             'grids; by default the code pools the grid nodes the '
+                             'loop\'s points occupy (--feature-pool occupied_cells), '
+                             'so it is a continuous function of footprint and '
+                             'neighbouring loops start similar by construction')
     parser.add_argument('--triplane-res', type=int, default=32,
                         help='cells per side of each triplane grid; the grid is the '
                              'unit cube, laid over the cloud bounding box, so a cell is '
@@ -316,6 +350,19 @@ def build_parser():
                              'in the fit figures, its title and table entry red, and a '
                              'line in bad_loops.txt. The list is a shortlist to drop '
                              'loops by, not a cut, and nothing is removed here')
+    parser.add_argument('--max-align-err', type=float, default=BAD_ALIGN_ERR,
+                        help='a loop whose mean 1 - cos between its predicted normal '
+                             'and the paired target normals is past this is written '
+                             'as a bad loop, even when its points fit. Default 0 '
+                             'turns the alignment side off; a positive value turns '
+                             'it on (1 side-on, 2 reversed, 0.5 a mean 60-degree '
+                             'disagreement)')
+    parser.add_argument('--bad-loop-err', type=float, default=BAD_LOOP_ERR,
+                        help='a loop whose mean error is past this fraction of the '
+                             'longest extent is written as a bad loop. Unlike the '
+                             'point limit it sees a curve that is off along an arc '
+                             'rather than at one point. Default 0.015; 0 turns the '
+                             'mean side off')
     parser.add_argument('--large', type=float, default=1.5,
                         help='a plane whose mean error is over this multiple of the '
                              'run\'s median plane error gets its title marked "!" and '
@@ -397,14 +444,17 @@ def code_neighbour_graph(keys, targets, gate=2.0, min_radius=0.4):
 
 
 def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
-              max_err=0.03, large=1.5, normal_arrows=20,
-              warmup='warmup/cube_warmup_axis.pt',
+              match_angle=150.0,
+              max_err=0.03, max_align_err=BAD_ALIGN_ERR,
+              bad_loop_err=BAD_LOOP_ERR, large=1.5, normal_arrows=20,
+              plane_files=False,
+              warmup='warmup/cube_warmup_random_ranges.pt',
               snapshot_every=50,
               refine_every=0, add_planes=2,
               samples_end=None, code_init='blend', code_smooth=0.0,
               code_gate=2.0, code_min_radius=0.4, feature='embedding',
               triplane_res=32, triplane_channels=16, triplane_tv=0.0,
-              axis_condition=True,
+              feature_pool='occupied_cells',
               distill=0.0, distill_warmup=None,
               seam_align=0.0, seam_every=10, seam_start=0, seam_steps=100,
               seam_lam=0.02, freeze_f_epochs=0):
@@ -412,24 +462,43 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
 
     found: the loop extractor that has already run, whose cloud, planes, loops
              and run folder are what is fitted and written
-    warmup: a cube warm-up checkpoint from `warmup_cube.py`, loaded into the
+    warmup: a cube warm-up checkpoint from `plc_model/warmup_cube.py`, loaded into the
              network before the first fit; None fits from a blank network.  The
-             warm-up was trained on a unit cube and nothing else, so it carries no
-             shape information: what it hands over is a network that draws
-             on-cube, consistently oriented loops, and the triplane field it draws
-             them from.  Only the weights and the grid are copied -- the triplane
+             warm-up was trained on cubes and nothing else (by default of random
+             size and place), so it carries no shape information: what it hands
+             over is a network that draws on-cube, consistently oriented loops,
+             and the triplane field it draws them from.  Only the weights and the grid are copied -- the triplane
              frame stays this run's, so the grid, which is a function of unit-cube
              position, is read on the cloud's box.  Nothing else is loaded: the
              loops, planes, targets and phases below are the shape's own.  The
              transfer needs `feature='triplane'`; in embedding mode the warm-up is
              skipped, because a row named by a cube plane does not index a shape's
              planes
-    axis_condition: concatenate each loop's slice axis to the feature the network
-             reads, so the direction is read from the axis instead of the field.
-             The axis is `Square.from_points`' unit normal of each target, which is
-             the same +x/+y/+z the direction term uses and the axes the cube
-             warm-up walked, so the rule learned there is the rule applied here.
-             Off, the loop is conditioned on the feature alone, as before
+    feature_pool: how a loop reads the field. 'centroid' samples the one query at
+             its world centre, the code every earlier run used. 'occupied_cells'
+             snaps each target point to its nearest grid node in every plane and
+             averages the unique nodes, so the code is the mean of the grid cells
+             the loop covers rather than one bilinear read; that gives loops with
+             different extent or offset different codes even when their centres
+             share a cell. The width and the network interface are unchanged. The
+             warm-up has to be trained with the same pool
+    plane_files: write the per-plane PLYs and PNGs under <out>/planes/, so one
+             slice can be loaded and judged on its own. Off by default: the run's
+             planes.txt and bad_loops.txt are always written, and the combined
+             fit grid and the split loop PLYs carry the same verdict at less cost
+    match_angle: degrees; chamfer pairs a predicted point only with a target point
+             whose outward normal, read in the slice plane, is at most this angle
+             from the normal the fitted curve implies. Pairing by distance alone can
+             reach across a thin feature to a point facing the other way; 150 by
+             default passes over those but keeps nearly every true pair, and a point
+             with no allowed partner is left out of the fit on that step. 180 pairs
+             by distance alone, as earlier runs did
+    bad_loop_err: a loop whose mean error is past this fraction of the longest
+             extent is written to the bad side of the split. The fixed point limit
+             only sees the single worst fitted point, so a curve that is off along
+             an arc while never far at one point would otherwise pass; 0 turns the
+             mean side off. The three checks (point, mean, optional alignment) are
+             independent, and every loop's readings go to <stem>_loop_errors.csv
     distill, distill_warmup: a teacher-student seam distillation on top of the fit.
              The checkpoint is read as a frozen teacher at this shape's own queries
              and axes, and its per-pair seam distance D is the target profile. Each
@@ -478,8 +547,10 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
              to the loss at weight `code_smooth`.  The graph is rebuilt for every
              stage, since a stage cuts new planes.  Zero leaves every row free
     feature: 'embedding' is the row table above.  'triplane' conditions the network
-             on three orthogonal 2D grids sampled at each loop's world centre, so
-             the code is a continuous function of position: two loops close in 3D
+             on three orthogonal 2D grids, read by default as the pool of grid
+             nodes the loop's points occupy (`feature_pool='occupied_cells'`) or
+             as one sample at its world centre (`'centroid'`). The code is a
+             continuous function of position either way: two loops close in 3D
              read overlapping cells and start from similar features, and a plane
              set added later needs no row seed.  The graph is still built for
              diagnostics and for the same smoothness term, now applied to the
@@ -528,15 +599,22 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
                          'are parted between centres, which needs normals')
     if max_err <= 0.0:
         raise ValueError(f'max_err must be positive, got {max_err}')
+    if not 0.0 <= max_align_err <= 2.0:
+        raise ValueError(f'max_align_err must be in [0, 2], got {max_align_err}')
+    if bad_loop_err < 0.0:
+        raise ValueError(f'bad_loop_err must be non-negative, got {bad_loop_err}')
     if snapshot_every < 0:
         raise ValueError(f'snapshot_every must be 0 or a count of epochs, '
                          f'got {snapshot_every}')
+    if feature_pool != 'centroid' and feature != 'triplane':
+        raise SystemExit('--feature-pool occupied_cells needs --feature triplane; '
+                         'an embedding row is not read from the field')
 
     ## the cube warm-up is a file, not a stage of this run: fail on a missing one
     ## before the extraction has produced loops nothing will warm
     if warmup is not None and not os.path.isfile(warmup):
         raise SystemExit(f'--warmup: no checkpoint at {warmup}. Train one with '
-                         f'`python warmup_cube.py`, or pass --no-warmup to fit from '
+                         f'`python plc_model/warmup_cube.py`, or pass --no-warmup to fit from '
                          f'a blank network')
     ## the rehearsal is a second reading of the same checkpoint, so it is resolved
     ## once here rather than in every stage's trainer
@@ -550,7 +628,7 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
         if teacher_warmup is None or not os.path.isfile(teacher_warmup):
             raise SystemExit(f'--distill: no teacher checkpoint at {teacher_warmup}. '
                              f'Pass --distill-warmup, or train one with '
-                             f'`python warmup_cube.py`')
+                             f'`python plc_model/warmup_cube.py`')
 
     ## the limit is stated in the shape's own units, but chosen as a fraction of its
     ## longest extent, which is the only scale both a normalised and a raw copy of
@@ -559,6 +637,11 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
     limit = max_err * np.ptp(pc, axis=0).max()
     print(f'  max_err {max_err}: loops past {limit:.4f} '
           f'({max_err:.1%} of the {np.ptp(pc, axis=0).max():.3f} extent) are red')
+    loop_limit = bad_loop_err * np.ptp(pc, axis=0).max()
+    if bad_loop_err > 0.0:
+        print(f'  bad_loop_err {bad_loop_err}: loops whose mean error is past '
+              f'{loop_limit:.4f} ({bad_loop_err:.1%} of the extent) go to the '
+              f'bad side')
 
     ## The grids are the unit cube, uniformly subdivided and the same for every
     ## shape; the cloud's box, with a small margin so a loop centre on the bounding
@@ -750,27 +833,29 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
         ## 0 means every fitted curve runs the way its target points' normals say, 2
         ## that it runs against them.  Same curves and same pairing as the fit error
         ## above, over the whole target rather than a fresh sample of it, so the
-        ## number does not depend on a draw
-        align_err = float('nan')
-        if trainer.axes is not None:
-            ## one plane normal per loop, in the order the loops came in: the trainer
-            ## reads them the same way, so the number is the term the fit is trained on
-            d1 = torch.from_numpy(np.stack(tangents)).float().to(trainer.device)
-            pair = torch.from_numpy(np.stack(paired)).float().to(trainer.device)
-            align_err = float(mini_nn.normal_penalty(d1, pair, trainer.axes))
+        ## number does not depend on a draw.  Read per loop as well, because a curve
+        ## can sit on its points and still run across them, and the good/bad split
+        ## below must see that even when the direction term was not trained on
+        d1 = torch.from_numpy(np.stack(tangents)).float().to(trainer.device)
+        pair = torch.from_numpy(np.stack(paired)).float().to(trainer.device)
+        ## the trainer's axes, read off each loop's own plane
+        axes = trainer.axes
+        loop_align = mini_nn.normal_penalty(
+            d1, pair, axes, per_curve=True).cpu().numpy()
+        align_err = float(mini_nn.normal_penalty(d1, pair, axes))
 
-        ## ---- run every loop the way its points' normals do ------------------------
+        ## ---- report the direction the fit ended on --------------------------------
         ## Chamfer distance places the curve but says nothing about which way it is
         ## walked, and a closed loop walked backwards is a stationary point of the
         ## 1 - cos normal term, so once the fit has settled on it the term cannot pull
-        ## it out again: its gradient vanishes exactly at the reversal.  The direction
-        ## the fit ended up with is therefore reported in `align`, and the traversal
-        ## handed to the figures and files is turned to agree with the points' own
-        ## normals -- the majority vote of predicted against paired target normals.
-        ## Curve, tangent, normal and per-point error are reversed together, so the
-        ## block a consumer reads is still one loop written in one direction.
+        ## it out again: its gradient vanishes exactly at the reversal. The direction
+        ## the fit ended up with is therefore reported in `align` and kept in the
+        ## curves: nothing is turned round here, so the PLYs, figures and snapshots
+        ## carry the traversal the network produced. A loop that disagrees with its
+        ## normals is the signal the segmentation step wants; a consumer that needs
+        ## the cloud's orientation must make that choice itself.
         flipped = 0
-        for i, (t, n) in enumerate(zip(tangents, pred_normals)):
+        for i, n in enumerate(pred_normals):
             ## the cosine the direction term is trained on, so the vote does not
             ## depend on how fast the fit sweeps each stretch of the loop: a mean
             ## rather than a sum, so it does not grow with the point count either.
@@ -780,11 +865,7 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
             p_hat = paired[i] / (np.linalg.norm(paired[i], axis=1, keepdims=True) + 1e-12)
             if float(np.einsum('ij,ij->i', n_hat, p_hat).mean()) < -0.1:
                 flipped += 1
-                preds[i] = preds[i][::-1]
-                pred_normals[i] = -n[::-1]
-                loop_errors[i] = loop_errors[i][::-1]
-                tangents[i] = -t[::-1]
-        return preds, pred_normals, loop_errors, align_err, flipped
+        return preds, pred_normals, loop_errors, loop_align, align_err, flipped
 
     ## a fit grid every snapshot_every epochs, so a run can be watched taking shape
     ## rather than only judged once it is over: the same figure the run ends with,
@@ -803,7 +884,7 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
             return
         ## the network as the epoch line above it left it, measured the way the end of
         ## the run is measured rather than by a cheaper reading of its own
-        preds_, normals_, _, align_, _ = fitted()
+        preds_, normals_, _, _, align_, _ = fitted()
         save_fit_grid(snapshots / f'{stem}_fits_e{done + n:04d}.png',
                       loops, preds_, p_normal, p_point, limit, large,
                       normals_, normal_arrows, align=align_)
@@ -882,13 +963,20 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
             ## plane's local frame, so the frame origin is added back here
             queries = np.stack([frame[i] + targets[i].mean(0)
                                 for i in range(len(targets))])
+            ## pooled features read the loop's own points, again carried into the
+            ## world frame; they are the observation, not the fitted curve
+            query_sets = ([frame[i] + targets[i] for i in range(len(targets))]
+                          if feature_pool == 'occupied_cells' else None)
             trainer = mini_nn.Trainer(
                 targets, num_models=len(targets), num_neurons=neurons,
-                num_layers=layers, normals=normals, align=align,
-                code_weights=code_weights, code_smooth=code_smooth,
+                num_layers=layers, normals=normals, align_normal=align,
+                match_angle=match_angle,
+                code_weights=code_weights,
                 feature_mode='triplane', triplane=triplane,
-                query_points=queries, feature_pairs=code_pairs,
-                feature_tv=triplane_tv, axis_condition=axis_condition,
+                query_points=queries, query_sets=query_sets,
+                feature_pool=feature_pool,
+                feature_pairs=code_pairs,
+                feature_tv=triplane_tv,
                 freeze_f_epochs=max(0, freeze_f_epochs - done),
                 distill=distill_weight, distill_warmup=teacher_warmup,
                 distill_pairs=code_pairs, distill_weights=code_weights,
@@ -897,8 +985,8 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
             print(f'  fitting {len(targets)} loops, M = '
                   f'{trainer.dataloader.max_points} points each, triplane {shape}, '
                   f'{trainer.model.triplane.feat_dim}-D features, '
-                  f'{layers}x{neurons} net, align {align:g}, '
-                  f'axis condition {"on" if axis_condition else "off"}'
+                  f'{feature_pool}, '
+                  f'{layers}x{neurons} net, align {align:g}'
                   f'{f", f map frozen for {freeze_f_epochs} epochs" if freeze_f_epochs else ""}'
                   f'{f", distill {distill_weight:g}" if distill_weight else ""}')
         else:
@@ -906,18 +994,17 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
             code_rows = [(int(codes[i]), int(codes[j])) for i, j in code_pairs]
             trainer = mini_nn.Trainer(targets, num_models=len(row_of), codes=codes,
                                       num_neurons=neurons, num_layers=layers,
-                                      normals=normals, align=align,
+                                      normals=normals, align_normal=align,
+                                      match_angle=match_angle,
                                       code_pairs=code_rows,
                                       code_weights=code_weights,
                                       code_smooth=code_smooth,
-                                      axis_condition=axis_condition,
                                       freeze_f_epochs=max(0, freeze_f_epochs
                                                           - done),
                                       **seam_args)
             print(f'  fitting {len(targets)} loops, M = '
                   f'{trainer.dataloader.max_points} points each, {len(row_of)} plane '
-                  f'codes, {layers}x{neurons} net, align {align:g}, '
-                  f'axis condition {"on" if axis_condition else "off"}'
+                  f'codes, {layers}x{neurons} net, align {align:g}'
                   f'{f", f map frozen for {freeze_f_epochs} epochs" if freeze_f_epochs else ""}')
         last_code_graph = (keys, code_pairs, code_weights, code_dists)
 
@@ -935,9 +1022,10 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
             else:
                 random_added_codes(trainer, previous_trainer.num_models, inserts)
         ## the cube warm-up, once, before the first fit.  The checkpoint is a network
-        ## and a field trained on the unit cube and nothing else, so it carries no
-        ## shape: only the weights and the grid are copied, and the triplane frame
-        ## stays this run's, which is where the cube is laid on the cloud's box.  A
+        ## and a field trained on cubes and nothing else (by default random size and
+        ## place), so it carries no shape: only the weights and the grid are copied,
+        ## and the triplane frame stays this run's, which is where the cube is laid
+        ## on the cloud's box.  A
         ## plane set added later is not warmed again; its seeded rows are its
         ## starting curves
         if not stage and warmup is not None:
@@ -948,9 +1036,16 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
             else:
                 meta = mini_nn.load_warmup(warmup, trainer.model)
                 report = meta.get('warmup') or {}
+                warm_pool = meta.get('feature_pool', 'centroid')
+                if warm_pool != feature_pool:
+                    raise SystemExit(
+                        f'--warmup {warmup} was trained with {warm_pool} features '
+                        f'and this fit pools them as {feature_pool}; warm up with '
+                        f'`plc_model/warmup_cube.py --feature-pool {feature_pool}`')
                 print(f'  warm-up {warmup}: {report.get("steps", "?")} steps on '
                       f'{report.get("loops", "?")} cube loops '
-                      f'({report.get("planes", "?")} per axis), fit '
+                      f'({report.get("planes", "?")} per axis), '
+                      f'{warm_pool}, fit '
                       f'{report.get("fit", float("nan")):.4f}, direction '
                       f'{report.get("cos", float("nan")):+.3f} cos, seam D median '
                       f'{report.get("seam_median", float("nan")):.4f}')
@@ -1003,7 +1098,7 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
                       f'{int(mask.sum())} loops run clockwise seen from +{name}')
 
     ## ---- the run's own report, from one last pass over the same curves ----------
-    preds, pred_normals, loop_errors, align_err, flipped = fitted()
+    preds, pred_normals, loop_errors, loop_align, align_err, flipped = fitted()
 
     ## a reading, not a loss: the second derivative still needs the network's graph;
     ## a circle is 39.5
@@ -1093,9 +1188,13 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
                  lo=field.lo.cpu().numpy(), hi=field.hi.cpu().numpy(),
                  resolution=field.resolution, channels=field.channels,
                  queries=trainer.queries.cpu().numpy(), features=feats,
+                 feature_pool=np.asarray(feature_pool),
+                 cell_counts=(trainer.cell_counts.cpu().numpy()
+                              if trainer.cell_counts is not None
+                              else np.zeros((0, 3), dtype=np.int64)),
                  keys=np.asarray(keys, dtype=np.float64))
         print(f'  triplane field {tuple(field.grid.shape)} and {len(feats)} sampled '
-              f'features -> {out / f"{stem}_triplane.npz"}')
+              f'features ({feature_pool}) -> {out / f"{stem}_triplane.npz"}')
 
     ## ---- report -----------------------------------------------------------------
     print(f'  bend {bend:.1f} (a circle is 39.5)')
@@ -1103,15 +1202,26 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
         print(f'  align {align_err:.3f} (mean 1 - cos over all loops; {flipped} of '
               f'{len(loops)} loops ran against the points\' normals)')
     if flipped:
-        print(f'  {flipped} loop{"" if flipped == 1 else "s"} ran against the points\' '
-              f'normals and {"was" if flipped == 1 else "were"} turned round for the '
-              f'saved files and figures')
+        print(f'  those {flipped} loop{"" if flipped == 1 else "s"} keep the direction '
+              f'the fit gave {"it" if flipped == 1 else "them"} in the saved files '
+              f'and figures')
 
     ## ---- save -------------------------------------------------------------------
     err = np.concatenate(loop_errors)
 
-    ## one point past the limit makes the whole loop bad, not just that point
-    bad_loops = np.array([e.max() > BAD_POINT_ERR for e in loop_errors])
+    ## a loop is bad when any of three checks fails: one point past the point limit,
+    ## its mean error past the mean limit, or a mean direction error past the
+    ## alignment limit. The point limit misses a curve that is off along a whole arc
+    ## without a single far point; the mean limit is the size-independent reading of
+    ## that, and the alignment limit catches a curve that lies on its target and
+    ## still runs across it. One loop is one flag
+    loop_mean = np.array([float(e.mean()) for e in loop_errors])
+    bad_point = np.array([e.max() > BAD_POINT_ERR for e in loop_errors])
+    bad_mean = (loop_mean > loop_limit if bad_loop_err > 0.0
+                else np.zeros(len(loop_errors), dtype=bool))
+    bad_align = (loop_align > max_align_err if max_align_err > 0.0
+                 else np.zeros(len(loop_errors), dtype=bool))
+    bad_loops = bad_point | bad_mean | bad_align
     bad = np.repeat(bad_loops, [len(e) for e in loop_errors])
     loop_points = np.concatenate(preds)
     loop_normals = np.concatenate(pred_normals)
@@ -1127,6 +1237,20 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
     ## is kept here in the checkpoint's own order; a character per loop is enough
     (out / f'{stem}_loop_split.txt').write_text(
         ''.join('b' if b else 'g' for b in bad_loops) + '\n')
+    ## one row per loop in checkpoint order, with every error and every flag, so a
+    ## different threshold can be tried on a finished run without fitting it again
+    with open(out / f'{stem}_loop_errors.csv', 'w', newline='') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(['axis', 'offset', 'slot', 'points', 'mean_err', 'max_err',
+                         'align_err', 'bad_point', 'bad_mean', 'bad_align', 'bad'])
+        for key, e, mean, align, bp, bm, ba, b in zip(
+                keys, loop_errors, loop_mean, loop_align, bad_point, bad_mean,
+                bad_align, bad_loops):
+            writer.writerow([key[0], f'{key[1]:.4f}', key[2], len(e),
+                             f'{mean:.6f}', f'{float(e.max()):.6f}',
+                             f'{float(align):.6f}', int(bp), int(bm), int(ba),
+                             int(b)])
+    print(f'  per-loop errors -> {out / f"{stem}_loop_errors.csv"}')
     ## a side that holds no loop is left out rather than written empty: trimesh has
     ## no vertices to take a normals range over, and an empty ply says nothing anyway
     for name, keep, cols in (('good', ~bad, good_colors),
@@ -1136,9 +1260,25 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
                          cols[keep], loop_normals[keep])
         else:
             print(f'  no {name} loops: {out / f"{stem}_{name}_loops.ply"} not written')
+    mean_reason = (f'{np.count_nonzero(bad_mean)} past the mean limit '
+                   f'{loop_limit:.3f}' if bad_loop_err > 0.0 else 'mean limit off')
+    print(f'  loop mean error {loop_mean.min():.3f}-{loop_mean.max():.3f} '
+          f'({mean_reason})')
+    if max_align_err > 0.0:
+        print(f'  alignment per loop {loop_align.min():.3f}-'
+              f'{loop_align.max():.3f} (mean 1 - cos; bad past '
+              f'{max_align_err:.3f})')
+        align_reason = f'{np.count_nonzero(bad_align)} past the alignment limit'
+    else:
+        print(f'  alignment per loop {loop_align.min():.3f}-'
+              f'{loop_align.max():.3f} (mean 1 - cos; not used for the split)')
+        align_reason = 'alignment limit off'
+    reasons = (f'{np.count_nonzero(bad_point)} past the point limit '
+               f'{BAD_POINT_ERR:.2f}, {mean_reason}, {align_reason}')
+    n_bad = int(np.count_nonzero(bad_loops))
     print(f'  {len(preds)} fitted loops, error {err.min():.3f}-{err.max():.3f} '
-          f'({np.count_nonzero(bad_loops)} bad loops all red, the rest coloured '
-          f'by plane axis x/y/z; predicted normals in nx/ny/nz)')
+          f'({n_bad} bad loops all red: {reasons}; the rest coloured by plane '
+          f'axis x/y/z; predicted normals in nx/ny/nz)')
     print(f'  good and bad loops saved separately, where either holds any '
           f'-> {out / f"{stem}_good_loops.ply"}, {out / f"{stem}_bad_loops.ply"}')
 
@@ -1149,7 +1289,8 @@ def fit_loops(found, epochs=300, neurons=64, layers=2, align=0.0,
     ## the same results again one plane at a time, so a single slice can be
     ## loaded and judged without the rest of the run beside it
     save_plane_files(out, pc, pcn, found.slices, found.centres, loops, preds,
-                     p_normal, p_point, limit, large, pred_normals, normal_arrows)
+                     p_normal, p_point, limit, large, pred_normals, normal_arrows,
+                     write_files=plane_files)
     ## the slice and field artefacts were written for the planes the run started on,
     ## so they are written again for the planes it ended on: the extraction figures
     ## and the fit grid have to show the same planes, or the folder contradicts itself
@@ -1170,7 +1311,7 @@ def main(argv=None):
     ## extraction spends a minute producing loops nothing will be fitted to
     if args.train and args.warmup is not None and not os.path.isfile(args.warmup):
         raise SystemExit(f'--warmup: no checkpoint at {args.warmup}. Train one with '
-                         f'`python warmup_cube.py`, or pass --no-warmup to fit from '
+                         f'`python plc_model/warmup_cube.py`, or pass --no-warmup to fit from '
                          f'a blank network')
     if args.snapshot_every < 0:
         raise SystemExit(f'--snapshot-every must be 0 or a count of epochs, got '
@@ -1196,8 +1337,12 @@ def main(argv=None):
     if args.train:
         fit_loops(found, epochs=args.epochs, neurons=args.neurons,
                   layers=args.layers,
-                  align=args.align, max_err=args.max_err,
-                  large=args.large, normal_arrows=normal_arrows,
+                  align=args.align, match_angle=args.match_angle,
+                  max_err=args.max_err, max_align_err=args.max_align_err,
+                  bad_loop_err=args.bad_loop_err,
+                  large=args.large,
+                  normal_arrows=normal_arrows,
+                  plane_files=args.plane_files,
                   warmup=args.warmup,
                   snapshot_every=args.snapshot_every,
                   refine_every=args.refine_every, add_planes=args.add_planes,
@@ -1207,7 +1352,7 @@ def main(argv=None):
                   triplane_res=args.triplane_res,
                   triplane_channels=args.triplane_channels,
                   triplane_tv=args.triplane_tv,
-                  axis_condition=args.axis_condition,
+                  feature_pool=args.feature_pool,
                   freeze_f_epochs=args.freeze_f_epochs,
                   distill=args.distill, distill_warmup=args.distill_warmup,
                   seam_align=args.seam_align, seam_every=args.seam_every,

@@ -16,7 +16,6 @@ winding at every epoch (`_loop_winding.npz`); this reads those and draws
 Usage: python plc_utils/plot_y_orientation.py [run_dir] [stem]
 """
 import csv
-import re
 import sys
 from pathlib import Path
 
@@ -39,15 +38,6 @@ for row in rows:
                 'loss'):
         if row[key] != '':
             series[a].setdefault(key, []).append(float(row[key]))
-
-## the direction term's weight, as the epoch line printed it
-weights = {}
-log = RUN.parent / f'{RUN.name}.log'
-if log.exists():
-    for line in open(log):
-        hit = re.match(r'\s*(\d+) epoch:.*\(w ([0-9.]+)\)', line)
-        if hit:
-            weights[int(hit.group(1))] = float(hit.group(2))
 
 winding = np.load(RUN / f'{STEM}_loop_winding.npz')
 wind = winding['winding']
@@ -87,20 +77,6 @@ axes[1, 0].set_title(f'd  reversed loops, epochs 0-{ZOOM}')
 axes[1, 2].set_ylabel('angle spent / angle of one turn')
 axes[1, 2].set_title('f  foldover by axis (1 = one clean turn)')
 axes[1, 2].set_ylim(0.9, 2.2)
-
-## the term's weight on its own scale, so "it is on while y turns" is visible
-if weights:
-    ep = sorted(weights)
-    w = [weights[e] for e in ep]
-    for ax in (axes[0, 1], axes[0, 2]):
-        twin = ax.twinx()
-        twin.plot(ep, w, color='0.55', lw=1.0, ls='--', label='weight')
-        twin.set_ylabel('normal-term weight', color='0.45')
-        twin.tick_params(axis='y', colors='0.45')
-        twin.set_ylim(0, max(w) * 1.6)
-        twin.legend(loc='center right', frameon=False)
-        if ax is axes[0, 2]:
-            twin.set_xlim(0, ZOOM)
 
 if flip_lo is not None:
     for ax in (axes[0, 2], axes[1, 0]):
