@@ -7,6 +7,10 @@ losses plus Dirichlet-style distortion regularization ("seawall"). Training can 
 from a simple primitive (box or sphere) via a pretrain phase, and supports fixed
 atlasses (single/two/six-sheet) or an adaptive quadtree cube atlas.
 
+> Cross-device status: read [PROJECT_STATE.md](PROJECT_STATE.md) first. It records
+> the current branch, latest results, in-progress work and open items; agent
+> conventions are in [AGENTS.md](AGENTS.md).
+
 ## Setup
 
 ```bash

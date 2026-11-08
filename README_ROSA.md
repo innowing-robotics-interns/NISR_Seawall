@@ -4,6 +4,9 @@ Extract cross-section loops from a point cloud and fit them with the shared mini
 network. This is the small, self-contained pipeline behind the seam and
 orientation experiments; it is separate from `main.py` / `README.md`.
 
+Project-wide status — current branch, latest results, in-progress work and open
+items — is in [PROJECT_STATE.md](PROJECT_STATE.md).
+
 ## What it needs
 
 | file | role |
