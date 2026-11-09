@@ -1,11 +1,11 @@
-# rosa_main
+# plc_main
 
 Extract cross-section loops from a point cloud and fit them with the shared mini
 network. This is the small, self-contained pipeline behind the seam and
 orientation experiments; it is separate from `main.py` / `README.md`.
 
 Project-wide status — current branch, latest results, in-progress work and open
-items — is in [PROJECT_STATE.md](PROJECT_STATE.md).
+items — is in [plc_md/PROJECT_STATE.md](plc_md/PROJECT_STATE.md).
 
 ## What it needs
 
@@ -26,7 +26,7 @@ the plain `python` on this machine fails on `libcudnn.so.8`.
 Extraction only (no fitting):
 
 ```bash
-python rosa_main.py \
+python plc_main.py \
     --path normalized_shapes_cuboid/rocker-arm_points_cubic_lam3.ply \
     --samples 29
 ```
@@ -34,7 +34,7 @@ python rosa_main.py \
 Fit:
 
 ```bash
-python rosa_main.py \
+python plc_main.py \
     --path normalized_shapes_cuboid/rocker-arm_points_cubic_lam3.ply \
     --samples 29 --train --feature triplane \
     --epochs 1000 --normal 0.01 --triplane-tv 0.01 \
@@ -44,7 +44,7 @@ python rosa_main.py \
 Add seam distillation (teacher is the warm-up checkpoint):
 
 ```bash
-python rosa_main.py \
+python plc_main.py \
     --path normalized_shapes_cuboid/rocker-arm_points_cubic_lam3.ply \
     --samples 29 --train --feature triplane \
     --epochs 1000 --normal 0.01 --triplane-tv 0.01 \
@@ -54,7 +54,7 @@ python rosa_main.py \
 Frozen start — hold the shared MLP for the first 100 epochs, then fit as above:
 
 ```bash
-python rosa_main.py \
+python plc_main.py \
     --path normalized_shapes_cuboid/rocker-arm_points_cubic_lam3.ply \
     --samples 29 --train --feature triplane \
     --epochs 1000 --normal 0.01 --triplane-tv 0.01 \
@@ -123,17 +123,17 @@ turn-over returns.
 
 ## Clustering the loop codes
 
-`code_clusters.py` reads a run's `<stem>_triplane.npz` and clusters the 48-D
+`plc_utils/code_clusters.py` reads a run's `<stem>_triplane.npz` and clusters the 48-D
 triplane code at each loop query (cosine average linkage). k defaults to the
 silhouette choice; `--k 10` makes shapes comparable.
 
 ```bash
 # final state of a run
-python code_clusters.py \
+python plc_utils/code_clusters.py \
     log/axis_frz100_rocker-arm/rocker-arm_points_cubic_lam3_triplane.npz --k 10
 
 # an early state, saved by a replay at epoch 100
-python code_clusters.py \
+python plc_utils/code_clusters.py \
     log/axis_frz100_rocker-arm/rocker-arm_points_cubic_lam3_triplane.npz \
     --state log/frz100_replay/rocker-arm/state_e100.pt --tag e0100 --k 10
 ```
@@ -198,14 +198,22 @@ rewrites only the split artefacts.
 
 ## More
 
-The runtime files above and `code_clusters.py` stay at the repository root.
+The layout after the plc move:
+
+| path | contents |
+|---|---|
+| `plc_main.py` | command line and the run (only runtime file left at the root) |
+| `plc_model/` | `loop_extraction.py`, `warmup_cube.py` and the `mini_nn/` package |
+| `plc_utils/` | analysis scripts, including `code_clusters.py` |
+| `plc_md/` | these documents, `todo.md` and `PROJECT_STATE.md` |
+
 Follow-up readings of a finished run — `seam_check.py`,
 `loop_propagation.py`, the `plot_*` scripts and the probes — live in
 [plc_utils](plc_utils/) and run as `python plc_utils/<script>.py` or
 `python -m plc_utils.<script>`.
 
-Design and measurements are in [WORKFLOW.md](WORKFLOW.md): §2.3–2.4 for the
-loss terms, the cube warm-up, the six-shape distillation table and the
+Design and measurements are in [plc_md/WORKFLOW.md](plc_md/WORKFLOW.md): §2.3–2.4
+for the loss terms, the cube warm-up, the six-shape distillation table and the
 eight-shape frozen panel; §4 for feature clustering and the loop tools. The open
 items, including the seeded repeats on dancing children and laurent hand and the
-direction-weight floor, are in [todo.md](todo.md).
+direction-weight floor, are in [plc_md/todo.md](plc_md/todo.md).

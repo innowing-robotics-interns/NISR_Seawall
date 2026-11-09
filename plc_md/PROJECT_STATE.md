@@ -5,33 +5,38 @@ tracked in git on purpose: pull the repository and read this file before
 starting work. Details stay in the linked documents; this file is the summary
 and the reading order.
 
-- Last updated: 2026-11-08
-- Branch: `polycube` (`origin` on GitHub); last code commit `a0b778f`, this
-  file added on top (check `git log -1` for the current tip)
+- Last updated: 2026-11-09
+- Branch: `polycube` (`origin` on GitHub), synced at `7661a95 overhaul; cleaning`
 - Detailed experiment log: [todo.md](todo.md); method: [WORKFLOW.md](WORKFLOW.md)
 
 ## What the project is
 
 `NISR_Seawall` is a neural implicit atlas reconstruction pipeline, documented in
-[README.md](README.md) and driven by `main.py`. The loop/orientation work is a
-separate, self-contained pipeline documented in [README_ROSA.md](README_ROSA.md):
+[README.md](../README.md) and driven by `main.py`. The loop/orientation work is a
+separate, self-contained pipeline documented in
+[README_PLC.md](../README_PLC.md). Since the 2026-11-08 overhaul every file it
+needs lives under a `plc_*` name:
 
 ```
 point cloud with normals
-  -> cross-section loops            loop_extraction.py
-  -> one shared MLP fitted per loop mini_nn.py, rosa_main.py
-  -> seam / orientation / codes     plc_utils/*, code_clusters.py
+  -> cross-section loops            plc_model/loop_extraction.py
+  -> one shared MLP fitted per loop plc_model/mini_nn/, plc_main.py
+  -> seam / orientation / codes     plc_utils/*, plc_utils/code_clusters.py
+  -> documents and this file        plc_md/
 ```
+
+Only `plc_main.py` stays at the repository root; `main.py`, `model/` and `utils/`
+are the unrelated NISR atlas pipeline.
 
 ## Current state
 
-Committed unless marked; the 2026-11-08 warm-up/pooling/default changes are still
-in the working tree and are listed again under "In progress" below.
+Committed through `7661a95` unless marked; the only uncommitted work is the
+`--cycle` / `--repel` pair described under "In progress" below.
 
 - **Input data.** `normalized_shapes_cuboid/*_cubic_lam3.ply` (89 shapes) is
   `normalized_shapes/*.ply` passed through cubic ARAP stylization (Liu &
   Jacobson 2019), lambda 3, kNN k = 8, 60 iterations. The generator is restored
-  at [plc_utils/cubic_stylize_points.py](plc_utils/cubic_stylize_points.py);
+  at [plc_utils/cubic_stylize_points.py](../plc_utils/cubic_stylize_points.py);
   parameters and per-shape metrics are in
   `normalized_shapes_cuboid/manifest.json`.
 - **Warm-up.** The default checkpoint is `warmup/cube_warmup_random_ranges.pt`
@@ -61,7 +66,7 @@ in the working tree and are listed again under "In progress" below.
   100 epochs so only the triplane grid trains; the field then places each loop
   while `f` keeps the warm-up's map. This is a placement initialiser, not a
   different fit: the rest of the run is the ordinary objective.
-- **Code clustering.** [code_clusters.py](code_clusters.py) clusters the 48-D
+- **Code clustering.** [plc_utils/code_clusters.py](../plc_utils/code_clusters.py) clusters the 48-D
   loop codes with cosine average linkage; use `--k 10` for cross-shape
   comparison, `--state` to read a replayed early checkpoint.
 
@@ -89,31 +94,35 @@ item 4); the four-shape aggregate did not rank the warm-ups.
 - Training is not bit-reproducible (about 4e-5 in weights); discrete winding
   counts move run to run, so read direction and magnitude, not exact counts.
 
-## In progress on the authoring device (not pushed as of 2026-11-08)
+## In progress on the authoring device (not pushed as of 2026-11-09)
 
-The working tree has uncommitted changes (about 805 inserted lines) adding an
-`occupied_cells` footprint read of the triplane field, random-cube warm-up
-batches, and the default switch described above:
+The working tree adds two optional loss terms, both defaulting to 0, so
+committed runs are unchanged by the code. Neither has a run or a `todo.md` entry
+yet:
 
-- `--feature-pool {centroid,occupied_cells}`: pool the grid nodes a loop covers
-  instead of one bilinear sample at its centroid, so adjacent loops in the same
-  cell get different codes. `occupied_cells` is now the default.
-- `--match-angle`: gate chamfer pairs by the angle between the implied and
-  target normals.
-- `--save-plane-files`: write per-plane artefacts only when requested.
-- `warmup_cube.py --cubes N`: train the warm-up on a fresh batch of random-size,
-  random-place cubes per step; `--cube-half-min/--cube-half-max` and
-  `--resample-every` control the batch. Defaults now reproduce
-  `warmup/cube_warmup_random_ranges.pt` (8 cubes, half-sides 0.05-0.45,
-  `occupied_cells`, no axis input).
-- `rosa_main.py` defaults now load that checkpoint, pool `occupied_cells` and
-  run `--no-axis-condition`. Axis-conditioned/centroid runs must pass
-  `--axis-condition --feature-pool centroid --warmup warmup/cube_warmup_axis.pt`
-  explicitly.
+- `--cycle W`: the network now also returns `z_pred`, a reading of the
+  parameter back from a point on the curve and its condition. The term is the
+  mean squared error against `z`; the curve branch is detached inside `forward`,
+  so it trains the inverse map and the condition, not the fit. A curve that
+  folds two distant parameters onto one point cannot be inverted.
+- `--repel W --repel-gap F --repel-samples K`: anchors spread around the loop
+  are charged when a non-neighbour pair lands closer than `F` times the target's
+  own RMS radius. Unlike `cycle` this acts on the points, so the fit feels it.
 
-Files touched: `mini_nn.py`, `rosa_main.py`, `warmup_cube.py`,
-`loop_extraction.py`, `plc_utils/loop_propagation.py`, `todo.md`,
-`WORKFLOW.md`, `README_ROSA.md`, `WARMUP.md`.
+Supporting changes: `miniNN.forward` returns `(curve, z_pred)`, so every caller
+unpacks `[0]`; checkpoints are loaded with `strict=False` so pre-inverse
+checkpoints still load. The touched runtime files are `plc_main.py` and
+`plc_model/mini_nn/{network,trainer,warmup}.py`; the `plc_utils` plotting and
+probe scripts were updated for the tuple return. The package compiles and
+`plc_main.py --help` lists the new flags.
+
+Files touched: `plc_main.py`, `plc_model/mini_nn/network.py`,
+`plc_model/mini_nn/trainer.py`, `plc_model/mini_nn/warmup.py`,
+`plc_utils/plot_axis_epochs.py`, `plc_utils/plot_epoch_matching.py`,
+`plc_utils/plot_first_iteration.py`, `plc_utils/plot_loop_matching.py`,
+`plc_utils/reclassify_run.py`, `plc_utils/seam_check.py`,
+`plc_utils/warmup_normal_probe.py`. Untracked and unrelated to PLC:
+`model/parameterization.py`.
 Run `git status` and `git log` before relying on these; they are not in the
 pushed state described above.
 
@@ -121,24 +130,24 @@ pushed state described above.
 
 ```bash
 # environment (plain python fails on libcudnn.so.8)
-conda run -n seawall python rosa_main.py --help
+conda run -n seawall python plc_main.py --help
 
 # fit one shape, triplane + seam distillation
-conda run -n seawall python rosa_main.py \
+conda run -n seawall python plc_main.py \
     --path normalized_shapes_cuboid/horse_points_cubic_lam3.ply \
     --samples 29 --train --feature triplane --epochs 1000 \
     --normal 0.01 --triplane-tv 0.01 --snapshot-every 0 \
     --distill 10 --out log/axis_seam10_horse
 
 # frozen start
-conda run -n seawall python rosa_main.py \
+conda run -n seawall python plc_main.py \
     --path normalized_shapes_cuboid/horse_points_cubic_lam3.ply \
     --samples 29 --train --feature triplane --epochs 1000 \
     --normal 0.01 --triplane-tv 0.01 --snapshot-every 0 \
     --distill 10 --freeze-f-epochs 100 --out log/axis_frz100_horse
 
 # cluster a finished run's loop codes
-conda run -n seawall python code_clusters.py \
+conda run -n seawall python plc_utils/code_clusters.py \
     log/axis_frz100_horse/horse_points_cubic_lam3_triplane.npz --k 10
 
 # rebuild a cubic target from a normalized cloud
@@ -157,11 +166,11 @@ conda run -n seawall python plc_utils/cubic_stylize_points.py \
   pair is needed for the old recipe). `*.ply`,
   `*.pt` and `log/` are gitignored, so a new device must copy the data, the
   warm-up checkpoint and any run folders it needs separately. The warm-up can be
-  regenerated with `warmup_cube.py`, but only such a checkpoint reproduces the
-  warm-up exactly. Each run's outputs are listed in
-  [README_ROSA.md](README_ROSA.md) and [WORKFLOW.md](WORKFLOW.md) §2.7.
-- The full reading order for a new device: this file, `README_ROSA.md`,
-  `WORKFLOW.md` §2.3-2.4 and §6, then the tail of `todo.md`.
+  regenerated with `plc_model/warmup_cube.py`, but only such a checkpoint
+  reproduces the warm-up exactly. Each run's outputs are listed in
+  [README_PLC.md](../README_PLC.md) and [WORKFLOW.md](WORKFLOW.md) §2.7.
+- The full reading order for a new device: this file,
+  `../README_PLC.md`, `WORKFLOW.md` §2.3-2.4 and §6, then the tail of `todo.md`.
 
 ## Open items
 
@@ -177,6 +186,10 @@ conda run -n seawall python plc_utils/cubic_stylize_points.py \
    and more bad loops for the random-cube arms, but that aggregate covers every
    extracted loop, including loops not intended as fit targets, so it does not
    rank the warm-ups; score the panel on the intended loop set.
+5. Finish the `--cycle` / `--repel` work: one short fit per term to prove the
+   terms are wired (loss printed, fit not degraded), then a matched A/B on
+   shapes that fold or turn over, and a `todo.md` entry with the command and
+   the numbers. Decide whether either default should move off 0.
 
 ## How to update this file
 

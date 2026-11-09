@@ -7,8 +7,10 @@ losses plus Dirichlet-style distortion regularization ("seawall"). Training can 
 from a simple primitive (box or sphere) via a pretrain phase, and supports fixed
 atlasses (single/two/six-sheet) or an adaptive quadtree cube atlas.
 
-> Cross-device status: read [PROJECT_STATE.md](PROJECT_STATE.md) first. It records
-> the current branch, latest results, in-progress work and open items.
+> Cross-device status: read [plc_md/PROJECT_STATE.md](plc_md/PROJECT_STATE.md)
+> first. It records the current branch, latest results, in-progress work and open
+> items. The loop/orientation pipeline moved under `plc_*`; its entry point is
+> [plc_main.py](plc_main.py) and its docs are in [plc_md/](plc_md/).
 
 ## Setup
 
