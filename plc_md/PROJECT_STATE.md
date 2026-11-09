@@ -6,7 +6,8 @@ starting work. Details stay in the linked documents; this file is the summary
 and the reading order.
 
 - Last updated: 2026-11-09
-- Branch: `polycube` (`origin` on GitHub), synced at `7661a95 overhaul; cleaning`
+- Branch: `polycube` (`origin` on GitHub), synced at `b01a260`; the overhaul
+  landed in `7661a95 overhaul; cleaning`
 - Detailed experiment log: [todo.md](todo.md); method: [WORKFLOW.md](WORKFLOW.md)
 
 ## What the project is
@@ -27,6 +28,33 @@ point cloud with normals
 
 Only `plc_main.py` stays at the repository root; `main.py`, `model/` and `utils/`
 are the unrelated NISR atlas pipeline.
+
+## Layout after the 2026-11-08 overhaul
+
+Commit `7661a95` moved the old flat ROSA files under `plc_*` and split the
+2059-line `mini_nn.py` into one class per module. Verified after the move:
+`plc_main.py --help` runs, the package compiles, and every forward call site
+unpacks the new tuple return.
+
+| before | after |
+|---|---|
+| `rosa_main.py` | [plc_main.py](../plc_main.py), the only runtime file left at the root |
+| `mini_nn.py` | [plc_model/mini_nn/](../plc_model/mini_nn): `network`, `trainer`, `chamfer`, `curves`, `cubes`, `square`, `triplane`, `data`, `warmup` |
+| `loop_extraction.py` | [plc_model/loop_extraction.py](../plc_model/loop_extraction.py) |
+| `warmup_cube.py` | [plc_model/warmup_cube.py](../plc_model/warmup_cube.py) |
+| `code_clusters.py` and root analysis scripts | [plc_utils/](../plc_utils) |
+| `README_ROSA.md`, `WORKFLOW.md`, `todo.md`, reports | [plc_md/](.) (this file included) |
+
+The same commit changed the run defaults: random-cube warm-up
+`warmup/cube_warmup_random_ranges.pt`, `--feature-pool occupied_cells`, axis off
+and `--distill 0`. Axis-on/centroid runs must name the old checkpoint, pooling
+and `--axis-condition` explicitly.
+
+Doc drift left by the move was fixed in `b01a260`: `README.md`,
+`README_PLC.md` and this file now point at `plc_main.py`, `plc_utils/` and
+`plc_md/`. `WORKFLOW.md`, `CUBE_WARMUP_REPORT.md` and `LOOP_ANCHOR_PLAN.md`
+still quote old module names and line numbers; treat those as historical
+references and update them as each is touched.
 
 ## Current state
 
