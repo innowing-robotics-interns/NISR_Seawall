@@ -6,7 +6,7 @@ starting work. Details stay in the linked documents; this file is the summary
 and the reading order.
 
 - Last updated: 2026-11-09
-- Branch: `polycube` (`origin` on GitHub), synced at `b01a260`; the overhaul
+- Branch: `polycube` (`origin` on GitHub), synced at `41d88e4`; the overhaul
   landed in `7661a95 overhaul; cleaning`
 - Detailed experiment log: [todo.md](todo.md); method: [WORKFLOW.md](WORKFLOW.md)
 
