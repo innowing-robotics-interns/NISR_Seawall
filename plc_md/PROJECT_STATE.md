@@ -97,6 +97,16 @@ Committed through `7661a95` unless marked; the only uncommitted work is the
 - **Code clustering.** [plc_utils/code_clusters.py](../plc_utils/code_clusters.py) clusters the 48-D
   loop codes with cosine average linkage; use `--k 10` for cross-shape
   comparison, `--state` to read a replayed early checkpoint.
+- **Chamfer pairing audit.** [plc_utils/plot_rerouted_matching.py](../plc_utils/plot_rerouted_matching.py)
+  reads a finished run's pairing as the loss does: it rebuilds the run's
+  `occupied_cells` feature (checked against the checkpoint's `cell_counts`),
+  verifies the curves against `*_loop_errors.csv` (2.5e-6 worst), and draws
+  rerouted against unchanged pairs while printing matched/unmatched and the CD
+  with and without the normal gate. On armadillo at the 150 deg default: 0.59%
+  of pairs rerouted, none unmatched, CD x1.035; the run's one reversed loop
+  carries 297 of the 822 reroutes and doubles its CD. `CD_Loss` itself was
+  audited with no defect found; the angle sweep and reading are in
+  [todo.md](todo.md) ("Chamfer pairing audit").
 
 ## Results snapshot
 
@@ -218,6 +228,10 @@ conda run -n seawall python plc_utils/cubic_stylize_points.py \
    terms are wired (loss printed, fit not degraded), then a matched A/B on
    shapes that fold or turn over, and a `todo.md` entry with the command and
    the numbers. Decide whether either default should move off 0.
+6. A/B the chamfer normal gate: same warm-up, seed and epochs, `--match-angle
+   150` against 90, comparing fit error and reversed-loop count. The armadillo
+   sweep is post hoc on one finished fit; it shows the loss would change (that
+   run's reversed loop reads CD x13 at 90), not what the fit would do.
 
 ## How to update this file
 

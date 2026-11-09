@@ -860,3 +860,51 @@ on — one axis-aligned cube grid, or one box per cluster merged afterwards.
   that takes a run's loop PLYs plus `*_triplane.npz`, predicts a cube occupancy
   grid, and is scored with the same volume IoU / Chamfer / manifold checks as the
   raster route; test on horse and dancing children first.
+## Chamfer pairing audit: the normal gate reroutes, it does not repair a reversal
+
+Checked `CD_Loss` and drew the pairing it actually uses, 2026-11-09, on
+`log/20261109_armadillo_1000ep` (162 loops, 139,320 predicted points, 150 deg
+default). The loss is squared distance in each direction, `loss_1 + loss_2`,
+each a mean over the points whose pair the normal test accepted. A pair is
+allowed when `cos >= cos(match_angle)`; a forbidden nearest is replaced by the
+closest allowed target (a reroute), and a point with no allowed target keeps
+the plain nearest as its index but a zero weight. Audited against a synthetic
+case and, per loop, against the module's own `near`/`near_ok`, with no
+disagreement: no implementation defect found.
+
+The armadillo reading (curves reproduce `*_loop_errors.csv` to 2.5e-6, so the
+pairing is read on the run's own fit):
+
+| match angle | rerouted | unmatched | gated / plain CD | worst loop rerouted |
+|---:|---:|---:|---:|---:|
+| 90 | 3.38% | 0.00% | 1.417 | 60.8% |
+| 120 | 1.63% | 0.00% | 1.102 | 51.4% |
+| 150 (default) | 0.59% | 0.00% | 1.035 | 34.5% |
+| 180 (off) | 0.00% | 0.00% | 1.000 | 0.0% |
+
+- Loop 0 (x -0.60, align 1.22, the run's only reversed loop) carries 297 of the
+  822 reroutes at 150 deg: 34.5% of its points, CD x2.68 (x13.04 at 90 deg).
+  Forward loops reroute 0.38% of their points and pay x1.01-1.10. Correlation
+  of per-loop align error and reroute fraction is 0.75.
+- The replacement pair on a reversed loop is still disagreeing: at 150 deg the
+  gate only forbids cos < -0.866, so it rejects the near-side nearest (cos
+  ~ -1) and lands on a farther target with cos still negative (median -0.32
+  over the loop). The gate is a pairing guard against a wrong-side nearest, not
+  an orientation fix; the direction term is what must make the loop run the
+  right way.
+- The unmatched branch is never exercised by this shape at any tested angle:
+  an in-plane contour supplies some allowed target normal for every predicted
+  direction. Only the synthetic case has covered a point losing all partners.
+- Figures: `log/20261109_armadillo_1000ep/matching_rerouted.png` (12 loops with
+  the most reroutes) and `.../matching_rerouted_worst.png` (loop 0, every point
+  linked). Script: `plc_utils/plot_rerouted_matching.py`; it rebuilds the
+  run's `occupied_cells` feature and checks the checkpoint's `cell_counts`
+  before drawing, so it is not the centroid-sample `fitted()` helper.
+
+- [ ] A/B the gate itself: same warm-up, seed and epochs, `--match-angle 150`
+  against 90, and compare the fit error and the reversed-loop count. The table
+  above is post hoc on a finished fit; it shows the loss surface would move
+  (loop 0 x13 at 90), not what the fit would do under it.
+- [ ] Find a real loop where a predicted point loses every partner (a crossing
+  thin sheet is the candidate) so the unmatched path is exercised end to end
+  in training, not only in the synthetic check.
